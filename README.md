@@ -18,8 +18,8 @@ Early stage. Most of the system is specified but not yet built.
 | Crawling with spider-rs: scope rules, page cap, live progress | Done |
 | Postgres 18 + pgvector, one schema and role per service | Done |
 | Crawler page storage: title, main text, and content hash in `crawler.pages` | Done |
+| `llm-router` service: tier contract, fallback, request log | Done — crawler enrichment not wired yet |
 | Enrichment, embeddings, search, `CacheStore` | Next |
-| `llm-router` service | Specified in its README |
 
 ## Architecture
 

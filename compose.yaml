@@ -76,6 +76,30 @@ services:
     mem_limit: 32m
     memswap_limit: 32m
 
+  llm-router:
+    build:
+      dockerfile: services/llm-router/Dockerfile
+    develop: *rebuild-on-save
+    environment:
+      # The only service given the provider key.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set it in .env, see .env.example}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_LOW_PRIMARY:
+      LLM_LOW_BACKUP:
+      LLM_MEDIUM_PRIMARY:
+      LLM_MEDIUM_BACKUP:
+      LLM_HIGH_PRIMARY:
+      LLM_HIGH_BACKUP:
+      DATABASE_URL: postgres://llm_router_user:${LLM_ROUTER_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 96m
+    memswap_limit: 96m
+
   gateway:
     build:
       dockerfile: services/gateway/Dockerfile

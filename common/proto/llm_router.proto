@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package llm_router.v1;
+
+service LlmRouterService {
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  // The contract of every tier: what a caller may send, what it may ask back, and what to expect in return.
+  rpc DescribeTiers(DescribeTiersRequest) returns (DescribeTiersResponse);
+}
+
+enum QualityTier {
+  QUALITY_TIER_UNSPECIFIED = 0;
+  QUALITY_TIER_LOW = 1;
+  QUALITY_TIER_MEDIUM = 2;
+  QUALITY_TIER_HIGH = 3;
+}
+
+enum ResponseFormat {
+  RESPONSE_FORMAT_UNSPECIFIED = 0;
+  RESPONSE_FORMAT_TEXT = 1;
+  RESPONSE_FORMAT_JSON_OBJECT = 2;
+}
+
+enum ReasoningMode {
+  REASONING_MODE_UNSPECIFIED = 0;
+  REASONING_MODE_OFF = 1;
+  REASONING_MODE_ON = 2;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_CONTENT_FILTER = 3;
+  FINISH_REASON_TOOL_CALLS = 4;
+}
+
+message TierContract {
+  QualityTier tier = 1;
+  int32 max_input_tokens = 2;
+  int32 max_output_tokens = 3;
+  ReasoningMode reasoning = 4;
+  repeated ResponseFormat response_formats = 5;
+}
+
+message DescribeTiersRequest {}
+
+message DescribeTiersResponse {
+  repeated TierContract tiers = 1;
+}
+
+// The OpenAI chat-completions settings. An unset field is left out of the provider call, so the model's own default applies.
+message Sampling {
+  optional double temperature = 1;
+  optional double top_p = 2;
+  optional int32 max_tokens = 3;
+  repeated string stop = 4;
+  optional double frequency_penalty = 5;
+  optional double presence_penalty = 6;
+  optional int32 seed = 7;
+  map<string, double> logit_bias = 8;
+  optional bool logprobs = 9;
+  optional int32 top_logprobs = 10;
+  optional ResponseFormat response_format = 11;
+}
+
+message CompleteRequest {
+  QualityTier tier = 1;
+  string system_prompt = 2;
+  string user_prompt = 3;
+  Sampling sampling = 4;
+}
+
+message CompleteResponse {
+  string content = 1;
+  string model_used = 2;
+  int32 tokens_in = 3;
+  int32 tokens_out = 4;
+  bool used_backup = 5;
+  FinishReason finish_reason = 6;
+}

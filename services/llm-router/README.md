@@ -16,6 +16,31 @@ Each tier has a primary and a backup model, set in config; on timeout, rate limi
 
 Model slugs move. Re-verify against the [DeepSeek hub](https://openrouter.ai/deepseek) before pinning a new one.
 
+## The Tier Contract Lives in `common`
+
+[`common/src/llm.rs`](../../common/src/llm.rs) publishes what a tier accepts and promises, so a caller can check a request before sending it and this service enforces the same numbers:
+
+- `SERVED_TIERS` — the tiers a caller may ask for.
+- `limits(tier)` — `max_input_tokens`, `max_output_tokens`, and whether the tier reasons.
+- `Sampling` — the settings a caller may set.
+- `fit_to_limits` — rejects a prompt or an output request that exceeds the tier, and fills an unset `max_tokens` with the tier maximum, so a fallback never breaks the promise.
+
+`DescribeTiers` returns the same contract over the wire for callers in other languages.
+
+Limits belong to the contract, not to deployment: `.env` holds only which model serves each tier.
+
+## Settings Follow the OpenAI Standard
+
+`Sampling` carries the OpenAI chat-completions settings — `temperature`, `top_p`, `max_tokens`, `stop`, `frequency_penalty`, `presence_penalty`, `seed`, `logit_bias`, `logprobs`, `top_logprobs`, `response_format`. A setting the caller leaves unset is left out of the provider call entirely, so the model's own default applies.
+
+Everything with a fixed set of values is an enum: `QualityTier`, `ResponseFormat`, `ReasoningMode`, and `FinishReason` — the caller sees what to expect rather than parsing provider strings.
+
+## One Adapter per Provider
+
+Integrating a provider means writing an adapter: a type implementing `Provider` in [`src/adapters/`](src/adapters/). The router itself knows only tiers, fallback, and the contract.
+
+`openai_compatible` serves any provider speaking the OpenAI chat-completions API — OpenRouter today, another base URL tomorrow.
+
 ## Config
 
 Keys: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, and `LLM_<TIER>_PRIMARY` / `LLM_<TIER>_BACKUP` for `LOW`, `MEDIUM`, and `HIGH`. Values live in `.env` (gitignored); [`.env.example`](../../.env.example) holds the defaults.
@@ -32,38 +57,17 @@ Reasoning models spend the completion budget on hidden reasoning tokens before e
 
 Never treat an empty `content` as a model failure without checking `usage.completion_tokens_details.reasoning_tokens` first.
 
+`{"reasoning": {"enabled": false}}` and `{"reasoning": {"effort": "none"}}` were both checked live against `deepseek/deepseek-v4-flash`: each answered with `reasoning_tokens: 0`.
+
 ## gRPC API
 
-`common/proto/llm_router.proto` — `Complete(CompleteRequest) → CompleteResponse`. Streaming is future work.
+[`common/proto/llm_router.proto`](../../common/proto/llm_router.proto) — `Complete` and `DescribeTiers`. Streaming and tool calling are future work.
 
-```protobuf
-enum QualityTierEnum { LOW = 0; MEDIUM = 1; HIGH = 2; }
-
-message CompleteRequest {
-  QualityTierEnum tier = 1;
-  string system_prompt = 2;
-  string user_prompt = 3;
-  float temperature = 4;
-  int32 max_tokens = 5;
-}
-
-message CompleteResponse {
-  string content = 1;
-  string model_used = 2;
-  int32 tokens_in = 3;
-  int32 tokens_out = 4;
-  bool used_backup = 5;
-}
-```
-
-`POST /complete` exists for manual testing only. `GET /health` also checks OpenRouter connectivity.
+`POST /complete` exists for manual testing only. `GET /health` reports that this service is up; it does not call the provider, because a health check that spends money and depends on a third party stops being a health check. The key is verified once at startup instead, so a bad key fails the container rather than the first user request.
 
 ## Schema (`llm_router`)
 
-- `requests` — id, tier, model_used, tokens_in, tokens_out, latency_ms, status, created_at
+Two tables, two lifetimes:
 
-Usage metrics only. Prompts and responses are not stored.
-
-## Adding a Provider
-
-Add the client, map tiers to its models in config. Calling services keep sending `QualityTierEnum`.
+- `requests` — tier, model_used, used_backup, tokens_in, tokens_out, latency_ms, outcome, finish_reason, created_at. Statistics, kept for the long run.
+- `request_payloads` — the full jsonb `sent` and `received` for one request. Kept 30 days, for taking a recent call apart; pruned after that.
