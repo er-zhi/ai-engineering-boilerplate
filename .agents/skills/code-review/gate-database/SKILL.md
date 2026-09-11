@@ -37,6 +37,18 @@ Entity field types must match the chosen Postgres types — entities drive dev s
 
 Prefer in-memory processing. If temporary rows are unavoidable: `expires_at timestamptz NOT NULL`, a per-table TTL, and `DELETE WHERE expires_at < now()` on startup plus a periodic interval. No temporary table without a cleanup path.
 
+## Queries
+
+ORM only. Service and test code reads and writes through SeaORM entities and the query builder (`Entity::find`, `insert`, `update`, `on_conflict`) and never through hand-written SQL. Raw SQL bypasses the entity types the schema is synced from, so a renamed column or changed type stops failing at compile time.
+
+| Found in code | Use instead |
+|---|---|
+| `Statement::from_string`, `query_*_raw`, `execute_raw`, `execute_unprepared`, `sqlx::query` | The entity or query-builder equivalent |
+| SQL assembled with `format!` | The query builder, with bound values |
+| Tests reading `information_schema` or `pg_catalog` | Assert the behavior the schema guarantees through the ORM: a too-long value or a duplicate key is rejected |
+
+The only exception is database bootstrap the ORM can't express (roles, schemas, extensions), and it lives only in `infra/postgres/`. Tests get the same bootstrap by running that script, not by repeating its SQL.
+
 ## Schema Isolation
 
 Each service uses only its own schema, enforced by Postgres roles rather than discipline. Setup SQL and verification: [schema-isolation.md](schema-isolation.md).

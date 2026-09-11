@@ -35,6 +35,7 @@ Product-ready Rust codebase optimized for **speed to develop and ship** on a loc
 - **Schema isolation is enforced** — each service connects with its own DB role granted access only to its schema. Postgres denies cross-schema access; it is not a convention.
 - **Smallest correct column type** per column.
 - **No logs in DB** — stdout only. **No permanent raw data** — store extracted content. Temporary raw needs `expires_at` + cleanup.
+- **ORM only, no raw SQL** — services and tests read and write through SeaORM entities and its query builder, never hand-written SQL strings. Raw SQL bypasses the entity types the schema is synced from, so a renamed column or changed type stops failing at compile time. The one exception is database bootstrap the ORM can't express (roles, schemas, extensions), which lives only in `infra/postgres/`.
 
 See [gate-database](.agents/skills/code-review/gate-database/SKILL.md).
 
