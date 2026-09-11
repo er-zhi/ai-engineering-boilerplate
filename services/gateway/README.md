@@ -2,7 +2,7 @@
 
 The only externally reachable service. Clients hit Gateway over the Connect protocol; Gateway reaches internal services over gRPC. No internal service is published to the host.
 
-Gateway owns no business logic and no markup — it validates input, routes, and maps responses. Page routes are proxied to [Frontend](../frontend/README.md); RPC paths it answers itself. WebSocket entrypoints come later.
+Gateway owns no business logic and no markup — it routes requests and maps responses. Each service validates what it receives at its own API boundary: Crawler rejects a bad `baseUrl`, and Gateway passes that error through. Page routes are proxied to [Frontend](../frontend/README.md); RPC paths it answers itself. WebSocket entrypoints come later.
 
 ## Why Connect and not REST
 
@@ -12,11 +12,7 @@ One `connectrpc` server speaks Connect, gRPC, and gRPC-Web on a single port, so 
 
 ## Security
 
-Single entry point, input validated at the boundary, CORS only where a dev client needs it. Rate limiting and auth are future work.
-
-## Schema (`gateway`)
-
-- `crawl_jobs` — job_id, base_url, include_patterns, exclude_patterns, include_urls, exclude_urls, status, created_at
+Single entry point. Rate limiting and auth are future work.
 
 ## API
 
@@ -43,7 +39,7 @@ curl -X POST localhost:8080/crawler.v1.CrawlerService/StartCrawl \
 
 Errors arrive as a Connect error body with a real HTTP status — `404` with `{"code":"not_found"}` for an unknown job, `400` with `{"code":"invalid_argument"}` for a missing `baseUrl`. Unlike gRPC-over-HTTP/2, the status code is meaningful to browsers and proxies.
 
-`baseUrl` is the crawl root. `scope` glob patterns filter discovered URLs; the explicit URL lists override them. A URL is indexed when it passes the exclude checks and either matches an include pattern or appears in `includeUrls`.
+`baseUrl` is the crawl root; what `scope` does is described in [Crawler's README](../crawler/README.md#scope).
 
 ## Page Proxying
 

@@ -13,7 +13,7 @@ Not this gate's scope: ad-hoc proof that a change works by hand belongs to [gate
 
 ## Running
 
-Prefer `cargo nextest`. It prints each test's wall-clock time in brackets and marks anything over 60s `SLOW`, which is exactly the data this gate reports.
+Run the suite the way [cargo-nextest](https://nexte.st/) documents it. It prints each test's wall-clock time in brackets and marks anything over 60s `SLOW`, which is exactly the data this gate reports.
 
 ```bash
 cargo nextest run --workspace           # whole suite
@@ -21,11 +21,7 @@ cargo nextest run -p crawler            # one service
 cargo nextest run --status-level slow   # surface slow tests during the run
 ```
 
-There is no Rust toolchain on the host, so run tests inside the container:
-
-```bash
-docker compose exec crawler cargo nextest run -p crawler
-```
+Storage tests start their own Postgres through testcontainers, so Docker must be running. Never wrap these commands in a script — see [gate-architecture](../gate-architecture/SKILL.md#docker--compose).
 
 Do not reach for `cargo test -- --report-time`. That flag is nightly-only and needs `-Zunstable-options`; on stable it fails with `the "report-time" flag is only accepted on the nightly compiler`. Plain `cargo test` is the fallback when nextest is unavailable, and it gives no per-test timing.
 
@@ -54,9 +50,17 @@ One test owning most of the runtime is the finding. Name it and say why it is sl
 | Unit test takes seconds | Real network or real DB | Not a unit test — move it or fake the boundary |
 | Suite slower than the sum of its tests | Shared mutable DB state forcing serial runs | Isolate per-test data so it runs parallel |
 
-## Quality Checks
+## Layers
 
-Per [goal.md](../../../goal.md): meaningful, fast, reliable — not coverage theater.
+Meaningful, fast, reliable — not coverage theater.
+
+| Layer | Covers |
+|---|---|
+| Unit | Domain logic, mappers, pure functions — nothing outside the process |
+| Integration | Storage against a real Postgres through testcontainers; HTTP and gRPC against servers the test starts on `127.0.0.1`, never the internet |
+| Contract | Proto compatibility between services |
+
+## Quality Checks
 
 - Diff changes behavior but adds no test → Critical
 - Test asserts a mock was called rather than a real outcome → Warning

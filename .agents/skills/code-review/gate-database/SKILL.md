@@ -1,13 +1,13 @@
 ---
 name: gate-database
-description: Use when creating tables, entity fields, or migrations in this boilerplate, or when the user mentions column types, database size, UUID vs bigint, data retention, cleanup, or storing logs and raw files.
+description: Use when creating tables, entity fields, queries, or migrations in this boilerplate, or when the user mentions column types, database size, UUID vs bigint, raw SQL, schema isolation, database roles, data retention, cleanup, or storing logs and raw files.
 ---
 
 # Database Design
 
 Smallest correct type per column. Size grows with row count, so a wasteful type multiplies fast.
 
-Entity field types must match the chosen Postgres types — entities drive dev schema sync, so a wrong entity type produces a wrong table. Report findings using the template in [code-review](../SKILL.md).
+Entities are the source of truth: schema sync builds the tables from them on startup in dev, and prod gets migration files, each reversible or shipped with a documented rollback. Entity field types must match the chosen Postgres types, so a wrong entity type produces a wrong table. Report findings using the template in [code-review](../SKILL.md).
 
 ## Column Types
 
@@ -24,7 +24,7 @@ Entity field types must match the chosen Postgres types — entities drive dev s
 | Money, exact decimals | `numeric(p,s)` | `float`, `double` |
 | Queryable fields | typed columns | one `jsonb` blob |
 
-`text` and `varchar` store identically in Postgres — use `varchar(n)` as a validation boundary. `NOT NULL` unless the field is genuinely optional. Index only what you actually query; every index costs writes and disk.
+`text` and `varchar` store identically in Postgres; `varchar(n)` makes the length a schema guarantee. The code enforces the same limit where the value enters ([gate-code-quality](../gate-code-quality/SKILL.md#boundaries-and-limits)), so the database never has to reject it. `NOT NULL` unless the field is genuinely optional. Index only what you actually query; every index costs writes and disk.
 
 ## Storage Rules
 
@@ -47,13 +47,14 @@ ORM only. Service and test code reads and writes through SeaORM entities and the
 | SQL assembled with `format!` | The query builder, with bound values |
 | Tests reading `information_schema` or `pg_catalog` | Assert the behavior the schema guarantees through the ORM: a too-long value or a duplicate key is rejected |
 
-The only exception is database bootstrap the ORM can't express (roles, schemas, extensions), and it lives only in `infra/postgres/`. Tests get the same bootstrap by running that script, not by repeating its SQL.
+The only exception is database bootstrap the ORM can't express (roles, schemas, extensions), and it lives only in the `postgres-bootstrap` config in `compose.yaml`. A test container that needs a service role creates it with the same statements.
 
 ## Schema Isolation
 
-Each service uses only its own schema, enforced by Postgres roles rather than discipline. Setup SQL and verification: [schema-isolation.md](schema-isolation.md).
+Each service uses only its own schema, enforced by Postgres roles rather than discipline. Bootstrap and verification: [schema-isolation.md](schema-isolation.md).
 
-Cross-service data goes over gRPC — never cross-schema SQL. Cache tables live in the service's own schema.
+- The service connects as its own role — never the superuser or a shared role.
+- Every entity sets `schema_name` to the service's schema; nothing lives in `public`.
 
 ## Example
 

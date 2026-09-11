@@ -9,12 +9,13 @@ Orchestrates the review gates. Each gate is one skill in this folder, one concer
 
 | Gate | Skill | Applies to |
 |---|---|---|
-| Architecture | [gate-architecture](gate-architecture/SKILL.md) | Service code, Dockerfile, Compose, migrations |
+| Architecture | [gate-architecture](gate-architecture/SKILL.md) | Service code, Dockerfile, Compose, proto contracts |
 | Code quality | [gate-code-quality](gate-code-quality/SKILL.md) | Any Rust change |
+| Bug fix | [gate-bug-fix](gate-bug-fix/SKILL.md) | A diff that fixes a bug, crash, or wrong result |
 | Types | [gate-common](gate-common/SKILL.md) | Entities, proto, shared code |
-| Database | [gate-database](gate-database/SKILL.md) | Schema, entity fields, migrations |
+| Database | [gate-database](gate-database/SKILL.md) | Schema, entity fields, queries, migrations |
 | Testing | [gate-testing](gate-testing/SKILL.md) | Any Rust change — runs the suite, reports timing |
-| Facts | [gate-facts](gate-facts/SKILL.md) | External APIs, crates, model names, docs claims |
+| Facts | [gate-facts](gate-facts/SKILL.md) | External APIs, crates, model names, docs claims, how a tool is used |
 | Evidence | [gate-evidence](gate-evidence/SKILL.md) | Any behavior change — proof it ran |
 | Second opinion | [gate-second-opinion](gate-second-opinion/SKILL.md) | Architecture, concurrency, hard-to-reverse choices |
 
@@ -33,35 +34,31 @@ Works in any agent runtime. Use whichever mechanism the host provides:
 
 | Runtime | Mechanism |
 |---|---|
-| Claude Code | `Task` tool — one call per gate, all in a single message |
+| Claude Code | `Agent` tool (named `Task` in older versions) — one call per gate, all in a single message |
 | Codex | Parallel agent calls in one turn |
 | Either, as fallback | One `SKILL.md` read per gate in sequence, findings kept separate |
 
 Two rules hold regardless of runtime:
 
-- **One gate per agent.** A single agent reading all eight skills defeats the purpose — findings blur and the context budget goes to rules instead of the diff.
+- **One gate per agent.** A single agent reading every gate skill defeats the purpose — findings blur and the context budget goes to rules instead of the diff.
 - **Never chain gates.** They share no state. Waiting for one before starting the next only adds latency.
 
 If the runtime has no subagent mechanism, the sequential fallback still works — just keep each gate's pass isolated so one gate's conclusions don't color the next.
 
 ## Timing
 
-Every gate reports its own duration. The review is only as fast as its slowest gate, so that gate is the only one worth optimizing.
+Every gate reports its own wall-clock seconds, and the report shows them.
 
-- Record each gate's wall-clock seconds and put them in the report.
-- Total is the **slowest gate**, not the sum — they ran in parallel. If total ≈ sum, they did not actually run in parallel; say so.
-- Flag any gate over 60s, and name what made it slow.
-- A gate that reads files is seconds. A gate that runs tests or calls another model is tens of seconds — that is expected, not a defect.
+- Total is the **slowest gate**, not the sum — the gates ran in parallel. If total ≈ sum, they did not; say so.
+- Flag any gate over 60s and name what made it slow.
 
-A single run cannot tell a chronically slow gate from a one-off spike, so every review appends a line to `logs/runs.jsonl` and the last 10 are kept. Read that history before optimizing anything — format, rotation, and the queries that rank gates by cost live in [run-log.md](run-log.md).
-
-Recurring slow gates are a signal to fix the underlying cost, not to drop the gate: see [gate-testing](gate-testing/SKILL.md) for the test-suite case.
+One run cannot tell a chronically slow gate from a one-off spike. Read the history in [run-log.md](run-log.md) before optimizing anything.
 
 ## Report Format
 
 Every gate reports findings as `file:line — issue → fix`, grouped by severity. This is the only output template; gate skills do not define their own.
 
-Three exceptions: Testing attaches its suite timing block, Evidence attaches commands and their real output instead of `file:line`, and Second opinion attributes each finding to the model that raised it.
+Four exceptions: Testing attaches its suite timing block, Evidence attaches commands and their real output instead of `file:line`, Facts names the source beside each claim, and Second opinion attributes each finding to the model that raised it.
 
 ```markdown
 ## Review: <scope>
@@ -73,6 +70,7 @@ Three exceptions: Testing attaches its suite timing block, Evidence attaches com
 |---|---|---|---|---|
 | Architecture | ✅/❌ | N | N | 4s |
 | Code quality | ✅/❌ | N | N | 5s |
+| Bug fix | ✅/❌ | N | N | 4s |
 | Types | ✅/❌ | N | N | 3s |
 | Database | ✅/❌ | N | N | 3s |
 | Testing | ✅/❌ | N | N | 34s |
@@ -93,7 +91,7 @@ Three exceptions: Testing attaches its suite timing block, Evidence attaches com
 ## Verdict Rules
 
 - Any Critical finding → **Request changes**
-- Only suggestions → **Approve with nits**
+- Warnings or suggestions, no Critical → **Approve with nits**
 - Nothing found → **Approve**
 
 Adding a gate: new folder `gate-<name>/SKILL.md` here, plus a row in both tables.

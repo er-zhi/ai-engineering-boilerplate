@@ -7,24 +7,7 @@ description: Use when adding entities, proto messages, shared errors, test helpe
 
 Types gate. One canonical definition per concept; compose from what exists.
 
-Conventions and the `CacheStore` trait live in [common/README.md](../../../common/README.md). Report findings using the template in [code-review](../SKILL.md).
-
-## Where Code Belongs
-
-```
-Used by 2+ services?  → common/ (proto | errors | cache | test | utils)
-Crosses a boundary?   → common/proto/
-Persists to DB?       → entity in the owning service
-Otherwise             → stays in that service
-```
-
-## Rules
-
-1. Entity is canonical within a service; proto is canonical across services.
-2. New types wrap or reference existing ones — never redefine the same fields.
-3. Use the generated connectrpc/buffa types, never a hand-written mirror struct.
-4. New `.proto` files `import` existing messages instead of copying field blocks.
-5. One mapper module per service for entity ↔ proto.
+The rules — where shared code goes, the type chain, proto reuse, and the `CacheStore` trait — live in [common/README.md](../../../../common/README.md); this gate checks a diff against them. Report findings using the template in [code-review](../SKILL.md).
 
 ## Critical Findings
 
@@ -40,10 +23,9 @@ Otherwise             → stays in that service
 ## Example
 
 ```rust
-// Good — entity flows through every layer
-pub async fn get_page(&self, url: &str) -> Result<PageEntity, ServiceError> {
+pub async fn fetch_page_by_url(&self, url: &str) -> Result<PageEntity, ServiceError> {
     self.repository.find_by_url(url).await
 }
-
-// Bad — PageDto restates every entity field, then copies them by hand
 ```
+
+The entity flows through every layer inside the service, and the mapper turns it into proto at the boundary, so callers never see the row. The version to reject declares a `PageDto` that restates every entity field and copies them over by hand.

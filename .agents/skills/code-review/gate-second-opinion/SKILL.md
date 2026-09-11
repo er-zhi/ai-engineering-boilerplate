@@ -7,7 +7,7 @@ description: Use when reviewing a diff in this boilerplate and independent judgm
 
 Other models reviewing the same diff. Not another checklist — the other gates cover the rules. This one exists because models trained differently disagree in useful ways, and the disagreement is the signal.
 
-Always ask **two** models: the other Western agent, and GLM. Run them in parallel — they do not depend on each other. Report using the template in [code-review](../SKILL.md).
+When this gate runs, ask **two** models: the other Western agent, and GLM. Run them in parallel — they do not depend on each other. Report using the template in [code-review](../SKILL.md).
 
 ## Invocation
 
@@ -33,7 +33,7 @@ claude -p --model sonnet "<same prompt>" < /dev/null
 
 Send all of them the *same* prompt. Differing answers to one question are the point; differing answers to different questions prove nothing.
 
-Once this project is a git repo, feed the diff instead — `codex review --uncommitted "<instructions>"` (also takes `--base <branch>` or `--commit <sha>`) and `git diff | claude -p "<instructions>"`. Until then name the paths in the prompt.
+Feed Codex and Claude the diff rather than a list of paths — `codex review --uncommitted "<instructions>"` (also takes `--base <branch>` or `--commit <sha>`) and `git diff | claude -p "<instructions>"`. For `zcode`, name the changed paths in the prompt.
 
 ## Command Constraints
 

@@ -1,11 +1,11 @@
 ---
 name: gate-facts
-description: Use when a change relies on an external API, crate, model name, config key, or documented behavior, or when the user asks to verify facts, check official docs, or confirm something is real.
+description: Use when a change relies on an external API, crate, model name, config key, or documented behavior, or works around a tool instead of using it the documented way, or when the user asks to verify facts, check official docs, confirm something is real, or mentions a workaround, hack, or shell script.
 ---
 
 # Fact Check
 
-Every external claim must trace to an official source. Training data goes stale; memory invents plausible APIs that do not exist.
+Every external claim must trace to an official source, and every tool is used the way its official docs describe. Training data goes stale; memory invents plausible APIs that do not exist.
 
 Report findings using the template in [code-review](../SKILL.md).
 
@@ -28,6 +28,17 @@ Project-internal code needs no external source; read the repo instead.
 
 Blog posts, forum answers, and AI-generated summaries are leads to confirm, not evidence.
 
+## Documented Way, Not a Workaround
+
+When a tool, crate, or image documents a way to do something, the change uses that way. A workaround is allowed only when the official docs offer none, and then the change links the docs that show it.
+
+| Workaround | Documented way |
+|---|---|
+| Shell script or Makefile wrapping a tool | The tool's own command; for Docker and Compose, see [gate-architecture](../gate-architecture/SKILL.md#docker--compose) |
+| `sleep` until something is ready | The tool's readiness check: Compose `depends_on` with `condition: service_healthy`, a testcontainers wait strategy |
+| Retry loop around a client that has retry and timeout settings | Those settings |
+| Forked or vendored copy of a crate, made to change its behavior | The crate's feature flag or config; otherwise fix it upstream |
+
 ## Workflow
 
 1. List every external claim the change depends on.
@@ -41,6 +52,8 @@ Blog posts, forum answers, and AI-generated summaries are leads to confirm, not 
 |---|---|
 | Critical | Claim contradicts the official source, or the API, crate, or model does not exist |
 | Critical | Change depends on an external claim nobody verified |
+| Critical | A workaround where the official docs describe a standard way |
+| Warning | A workaround the docs leave no alternative to, but the change does not link them |
 | Warning | Source found but ambiguous, or the docs cover a different version than the one pinned |
 | Suggestion | Verified, but a newer documented approach is now preferred |
 

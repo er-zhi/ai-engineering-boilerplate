@@ -1,23 +1,17 @@
-FROM rust:1.98-alpine3.24 AS dev
-RUN apk add --no-cache musl-dev build-base protoc protobuf-dev watchexec
-WORKDIR /w
-CMD ["watchexec", "--restart", "--watch", "common", "--watch", "services/crawler", "--watch", "Cargo.toml", "--watch", "Cargo.lock", "--", "cargo", "run", "-p", "crawler"]
-
-FROM rust:1.98-alpine3.24 AS builder
-RUN apk add --no-cache musl-dev build-base protoc protobuf-dev
-WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY common common
-COPY services services
-# Cache mounts keep the cargo registry and target/ between builds, so only changed crates recompile.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release -p crawler \
-    && cp target/release/crawler /usr/local/bin/crawler
+# Crawler image: compiles the crawler with cached dependencies and ships the static binary alone on Alpine.
+FROM rust:1.98-alpine3.24 AS build
+RUN apk add --no-cache protoc
+WORKDIR /app
+ENV CARGO_HOME=/var/cache/cargo CARGO_TARGET_DIR=/var/cache/target
+RUN --mount=type=bind,target=. \
+    --mount=type=cache,target=/var/cache/cargo \
+    --mount=type=cache,target=/var/cache/target \
+    cargo build --locked --release --package crawler \
+    && cp /var/cache/target/release/crawler /usr/local/bin/
 
 FROM alpine:3.24
-RUN apk add --no-cache ca-certificates && adduser -D -u 10001 app
-COPY --from=builder /usr/local/bin/crawler /usr/local/bin/crawler
-USER app
+COPY --from=build /usr/local/bin/crawler /usr/local/bin/
+USER 10001:10001
 EXPOSE 8081
+HEALTHCHECK --interval=5s CMD ["wget", "-qO-", "http://127.0.0.1:8081/health"]
 CMD ["crawler"]

@@ -1,6 +1,6 @@
 # AI Engineering Boilerplate
 
-A Rust microservice boilerplate for AI products, built to go from code change to running service in seconds on a local machine. Infrastructure stays lean (one Postgres, Docker Compose, no Kafka or Kubernetes) until the product proves itself, and the service boundaries are clean enough to move to the cloud later without a rewrite.
+A Rust microservice boilerplate for AI products, built to go from code change to running service in seconds on a local machine. Prototyping now, scaling later: the code holds up in production, while infrastructure stays lean (one Postgres, Docker Compose, no Kafka or Kubernetes) until the product proves itself. Service boundaries are clean enough to move to the cloud later without a rewrite.
 
 It ships with a crawler that indexes websites for semantic search, an LLM router that picks models by quality tier, and a set of code-review skills that AI agents run in parallel.
 
@@ -15,9 +15,10 @@ Early stage. Most of the system is specified but not yet built.
 | Code-review skills (`.agents/skills/code-review/`) | Done |
 | `crawler` and `gateway` services, end to end over Connect + gRPC | Done — job tracking is in memory |
 | Docker Compose with hot reload | Done |
-| Crawling with spider-rs: scope rules, page cap, live progress | Done — page counts only, nothing stored |
-| Postgres 18 + pgvector, one schema and role per service | Done — no service reads from it yet |
-| Page storage, enrichment, embeddings, `CacheStore` | Next |
+| Crawling with spider-rs: scope rules, page cap, live progress | Done |
+| Postgres 18 + pgvector, one schema and role per service | Done |
+| Crawler page storage: title, main text, and content hash in `crawler.pages` | Done |
+| Enrichment, embeddings, search, `CacheStore` | Next |
 | `llm-router` service | Specified in its README |
 
 ## Architecture
@@ -34,38 +35,37 @@ flowchart LR
   llm --- pg
 ```
 
-- **Gateway** is the only service reachable from outside. It validates input and routes requests; it holds no business logic.
+- **Gateway** is the only service reachable from outside. It routes requests and holds no business logic; each service validates what it receives at its own API boundary.
 - The browser loads the page and calls RPCs from the same origin, so there is no CORS anywhere in the system. Gateway proxies page routes to Frontend and answers every Connect path itself.
 - Services talk to each other over gRPC only. Shared contracts live in `common/proto/`.
-- Each service connects to Postgres with its own role, and that role can only access the service's own schema. Postgres enforces the isolation.
+- Each service connects to Postgres with its own role, and that role can only access the service's own schema. Postgres enforces the isolation — see [schema-isolation.md](.agents/skills/code-review/gate-database/schema-isolation.md).
 
 ## Stack
 
 | Use | Tool |
 |---|---|
 | Language | Rust (edition 2024, 1.98+) |
-| Inter-service | gRPC via [connectrpc](https://crates.io/crates/connectrpc) and [buffa](https://crates.io/crates/buffa) |
-| External API | Connect via Gateway ([axum](https://crates.io/crates/axum)) — proto-defined RPC callable from plain `fetch` |
-| Database | PostgreSQL, one instance, schema per service, pgvector |
-| Cache | PostgreSQL behind a `CacheStore` trait, swappable for Redis later |
+| Inter-service | gRPC via [connectrpc](https://crates.io/crates/connectrpc) and [buffa](https://crates.io/crates/buffa), contracts in `common/proto/` |
+| External API | Connect via Gateway ([axum](https://crates.io/crates/axum)) — proto-defined RPC callable from plain `fetch`, no REST |
+| Database | PostgreSQL 18, one instance, schema per service, pgvector, through [SeaORM](https://crates.io/crates/sea-orm) entities |
+| Cache | PostgreSQL behind the `CacheStore` trait in `common/cache/`, swappable for Redis later |
 | LLM | [OpenRouter](https://openrouter.ai/), reached through the LLM Router |
 | Runtime | Docker Compose, one Dockerfile per service, Alpine base with static musl binaries |
 
-See [goal.md](goal.md) for the full rules on dev velocity, data, and testing.
+**Not now:** Redis, Kafka, Kubernetes, cloud tooling, a second database, heavy frameworks. Need a cache? Postgres behind `CacheStore`. Cloud scaling comes later, on top of this codebase — not inside it.
 
 ## Layout
 
 ```
 .
-├── Cargo.toml            # workspace
-├── goal.md               # goals, stack, rules
-├── common/               # shared crate: proto contracts + generated stubs
+├── Cargo.toml                    # workspace
+├── compose.yaml                  # the whole stack: images, resource limits, Postgres bootstrap
+├── common/                       # shared crate: proto contracts + generated stubs
 ├── services/
-│   ├── crawler/          # crawl, enrich, embed, search
-│   ├── frontend/         # web UI: pages, styles, client-side logic
-│   ├── gateway/          # public Connect API, proxies page routes to frontend
-│   └── llm-router/       # LLM calls by quality tier, with fallback
-├── infra/postgres/       # first-start bootstrap: pgvector, one schema + role per service
+│   ├── crawler/                  # crawl, enrich, embed, search
+│   ├── frontend/                 # web UI: pages, styles, client-side logic
+│   ├── gateway/                  # public Connect API, proxies page routes to frontend
+│   └── llm-router/               # LLM calls by quality tier, with fallback
 └── .agents/skills/code-review/   # review gates for AI agents
 ```
 
@@ -80,26 +80,26 @@ See [goal.md](goal.md) for the full rules on dev velocity, data, and testing.
 
 Shared code rules are in [common/README.md](common/README.md).
 
+## Rules
+
+Each rule is enforced by a code-review gate, which holds the details.
+
+- **Self-documenting code, no comments** — names carry the meaning; a one-line summary at the top of a file is the only comment. [gate-code-quality](.agents/skills/code-review/gate-code-quality/SKILL.md)
+- **Check input once, at the entry** — every outside value is validated where it enters and every size has a named limit, so the code behind the entry stays thin. [gate-code-quality](.agents/skills/code-review/gate-code-quality/SKILL.md#boundaries-and-limits)
+- **Fix bugs at their origin** — never with a new condition for the one reported case. [gate-bug-fix](.agents/skills/code-review/gate-bug-fix/SKILL.md)
+- **One service per capability**, in `services/<name>/`, talking to other services over gRPC only. [gate-architecture](.agents/skills/code-review/gate-architecture/SKILL.md)
+- **Callers see what, not how** — a contract exposes the capability, never the storage layout, library type, or vendor behind it. [gate-architecture](.agents/skills/code-review/gate-architecture/SKILL.md#contracts)
+- **No workarounds** — every tool is used the way its official docs describe, so no shell scripts around `docker compose` or `cargo`. [gate-facts](.agents/skills/code-review/gate-facts/SKILL.md#documented-way-not-a-workaround)
+- **Entities drive the schema** — sync on startup in dev, migration files for prod. Schema isolation enforced by Postgres roles, the smallest correct column type, ORM only, no logs or permanent raw HTML in the database. [gate-database](.agents/skills/code-review/gate-database/SKILL.md)
+- **Tests are meaningful, fast, and reliable** — parallel, no network in unit tests, the whole suite under 2 minutes. [gate-testing](.agents/skills/code-review/gate-testing/SKILL.md)
+
 ## Code Review Skills
 
-`.agents/skills/code-review/` holds agent skills that work in both Claude Code and Codex. A review runs up to eight gates in parallel, one agent per gate, and each gate reports how long it took so the slowest one can be optimized.
-
-| Gate | Checks |
-|---|---|
-| [architecture](.agents/skills/code-review/gate-architecture/SKILL.md) | Service boundaries, Docker, schema isolation |
-| [code-quality](.agents/skills/code-review/gate-code-quality/SKILL.md) | Durability, naming, minimalism |
-| [common](.agents/skills/code-review/gate-common/SKILL.md) | Type chain, shared code |
-| [database](.agents/skills/code-review/gate-database/SKILL.md) | Column types, storage rules |
-| [testing](.agents/skills/code-review/gate-testing/SKILL.md) | Runs the suite, reports failures and slow tests |
-| [facts](.agents/skills/code-review/gate-facts/SKILL.md) | External claims checked against official docs |
-| [evidence](.agents/skills/code-review/gate-evidence/SKILL.md) | Proof the change actually ran |
-| [second-opinion](.agents/skills/code-review/gate-second-opinion/SKILL.md) | Independent review from other models |
-
-Start with [.agents/skills/code-review/SKILL.md](.agents/skills/code-review/SKILL.md).
+Agent skills live in `.agents/skills/`, grouped by purpose, and work in both Claude Code and Codex. Code review is the first group: a review runs its gates in parallel, one agent per gate, and each gate reports how long it took so the slowest one can be optimized. Start with [SKILL.md](.agents/skills/code-review/SKILL.md), which lists every gate.
 
 ## Getting Started
 
-Requires Rust 1.98 or newer and `protoc` on your `PATH`, which `connectrpc-build` uses to compile the proto files (`brew install protobuf` on macOS, `apt install protobuf-compiler` on Debian/Ubuntu).
+Running the stack needs only Docker with Compose v2.23 or newer, the version that reads the Postgres bootstrap `compose.yaml` carries inline. Nothing runs through a wrapper script: every command below is the tool's own, as its documentation describes.
 
 ```bash
 git clone https://github.com/er-zhi/ai-engineering-boilerplate.git
@@ -108,11 +108,19 @@ cp .env.example .env   # then replace the change-me passwords: openssl rand -hex
 docker compose up
 ```
 
-Then open <http://localhost:8080> for the web UI. Compose picks up `docker-compose.override.yml` automatically, which mounts the source and runs `watchexec`, so a save rebuilds and restarts only the service whose code (or `common/`) changed. Only Gateway is published to the host; Crawler and Frontend stay on the internal network.
+Then open <http://localhost:8080> for the web UI. Only Gateway is published to the host; Crawler and Frontend stay on the internal network, and Postgres is published on `127.0.0.1` alone.
+
+While developing, start the same stack with [Compose Watch](https://docs.docker.com/compose/how-tos/file-watch/):
+
+```bash
+docker compose up --watch
+```
+
+Saving a file rebuilds that service's image and replaces its container. Development and production run the very same image, under the resource limits `compose.yaml` sets for every service.
 
 ### Database
 
-In dev, Postgres listens on `127.0.0.1:5432`. Connect any client (psql, the Database Client extension in VS Code or Cursor, DBeaver) with:
+In dev, Postgres listens on `127.0.0.1:5432`, never on the network. Connect any client (psql, the Database Client extension in VS Code or Cursor, DBeaver) with:
 
 | Setting | Value |
 |---|---|
@@ -123,15 +131,30 @@ In dev, Postgres listens on `127.0.0.1:5432`. Connect any client (psql, the Data
 | Username | `postgres` (superuser), or `crawler_user` / `gateway_user` / `llm_router_user` to see exactly what one service sees |
 | Password | the matching value from `.env` |
 
-`infra/postgres/init.sh` creates the schemas and roles only on the first start, when the `pgdata` volume is empty. To apply changed passwords, remove that volume (`docker volume ls | grep pgdata`, then `docker volume rm <name>`), which deletes all data.
+The `postgres-bootstrap` config in `compose.yaml` creates the schemas and roles only on the first start, when the `pgdata` volume is empty. To apply changed passwords, remove that volume (`docker volume ls | grep pgdata`, then `docker volume rm <name>`), which deletes all data.
 
-To work without Docker you need Rust 1.98+ and `protoc`, then `cargo build` and run the three binaries, pointing Gateway at the other two:
+### Tests
 
 ```bash
-./target/debug/crawler &
-./target/debug/frontend &
-CRAWLER_URL=http://127.0.0.1:8081 FRONTEND_URL=http://127.0.0.1:8082 ./target/debug/gateway
+cargo nextest run --workspace
 ```
+
+This is the standard [cargo-nextest](https://nexte.st/) runner; `cargo test --workspace` also works, without per-test timing. It needs Rust 1.98+ and `protoc` (see below), plus a running Docker: the storage tests start their own Postgres through testcontainers.
+
+### On the Host
+
+The services also run outside Docker. You need Rust 1.98+ and `protoc` on your `PATH`, which `connectrpc-build` uses to compile the proto files (`brew install protobuf` on macOS, `apt install protobuf-compiler` on Debian/Ubuntu). Keep Postgres in Compose and start each service in its own terminal:
+
+```bash
+docker compose up -d postgres
+DATABASE_URL=postgres://crawler_user:<CRAWLER_DB_PASSWORD>@127.0.0.1:5432/app cargo run -p crawler
+cargo run -p frontend
+cargo run -p gateway
+```
+
+Replace `<CRAWLER_DB_PASSWORD>` with the value from `.env`. Gateway finds Crawler and Frontend on `127.0.0.1:8081` and `127.0.0.1:8082` by default.
+
+### Calling the API
 
 Calling an RPC takes no client library — the Connect protocol is a `POST` with a JSON body:
 

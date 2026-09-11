@@ -13,7 +13,7 @@ Report findings using the template in [code-review](../SKILL.md).
 
 | Change | Evidence |
 |---|---|
-| Logic, mapper, pure function | `cargo test` output with the new test passing |
+| Logic, mapper, pure function | `cargo nextest run` output with the new test passing |
 | Endpoint or handler | `curl` against the running service, request and response both shown |
 | Service startup, Compose, Dockerfile | `docker compose up` log lines plus a `/health` response |
 | Schema, entity, migration | `\d schema.table` or a query result showing the real column types |
@@ -27,17 +27,16 @@ Report findings using the template in [code-review](../SKILL.md).
 1. **Paste real output.** Copied terminal text or an attached image — never a description of what it printed.
 2. **Show the changed behavior.** A green build proves compilation, not the feature. Exercise the specific path the diff touched.
 3. **Include the command.** The reader must be able to rerun it verbatim.
-4. **Reproduce failures first.** For a fix, the pre-fix error is half the evidence.
-5. **Say so when you cannot.** "Not verified — no OpenRouter key locally" is an honest, acceptable finding. Silence is not.
+4. **Say so when you cannot.** "Not verified — no OpenRouter key locally" is an honest, acceptable finding. Silence is not.
 
 ## Keep It Cheap
 
 One command, one paste. Evidence that takes a long setup won't get produced, so prefer:
 
 ```bash
-cargo test -p crawler extract_main_content # narrow, seconds
+cargo nextest run -p crawler extract       # narrow, seconds
 curl -s localhost:8080/health              # already running
-docker compose logs gateway | tail -5      # no restart needed
+docker compose logs --tail 5 gateway       # no restart needed
 ```
 
 Reach for testcontainers or a full stack boot only when nothing smaller can show the behavior.
@@ -62,6 +61,6 @@ $ curl -s -XPOST localhost:8080/crawler.v1.CrawlerService/StartCrawl \
     -d '{"baseUrl":"https://example.com","scope":{"excludePatterns":["*/admin/*"]}}'
 {"jobId":"job-1","status":"CRAWL_STATUS_QUEUED"}
 
-Critical: services/crawler/src/denoise.rs — nav-stripping rewritten, no test run.
-Expected `cargo test -p crawler denoise` output.
+Critical: services/crawler/src/extract.rs — nav-stripping rewritten, no test run.
+Expected `cargo nextest run -p crawler extract` output.
 ```

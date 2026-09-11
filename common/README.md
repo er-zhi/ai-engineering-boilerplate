@@ -11,7 +11,16 @@ common/
 └── utils/    # pure helpers, no domain logic
 ```
 
-Goes here only if 2+ services use it. Service-specific code stays in the service.
+Today only `proto/` exists; the other folders appear when a second service first needs them.
+
+## Where Code Belongs
+
+```
+Used by 2+ services?  → common/ (proto | errors | cache | test | utils)
+Crosses a boundary?   → common/proto/
+Persists to DB?       → entity in the owning service
+Otherwise             → stays in that service
+```
 
 ## Type Chain
 

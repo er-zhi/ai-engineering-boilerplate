@@ -12,21 +12,13 @@ Provider: [OpenRouter](https://openrouter.ai/).
 | `medium` | Summaries, moderate reasoning |
 | `high` | Complex or multi-step reasoning |
 
-Every tier starts on DeepSeek V4 Flash — OpenRouter slug `deepseek/deepseek-v4-flash`, verified against [its model page](https://openrouter.ai/deepseek/deepseek-v4-flash). Each tier has a primary and a backup model; on timeout, rate limit, or 5xx the router retries the backup, then returns an error. Remapping a tier is a config change — callers are unaffected.
+Each tier has a primary and a backup model, set in config; on timeout, rate limit, or 5xx the router retries the backup, then returns an error. Remapping a tier is a config change — callers are unaffected. `low` starts on DeepSeek V4 Flash — OpenRouter slug `deepseek/deepseek-v4-flash`, verified against [its model page](https://openrouter.ai/deepseek/deepseek-v4-flash).
 
 Model slugs move. Re-verify against the [DeepSeek hub](https://openrouter.ai/deepseek) before pinning a new one.
 
 ## Config
 
-Values live in `.env` (gitignored); see [`.env.example`](../../.env.example) for the full list.
-
-```env
-OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-LLM_LOW_PRIMARY=deepseek/deepseek-v4-flash
-LLM_LOW_BACKUP=z-ai/glm-4.7-flash
-# same pattern for MEDIUM and HIGH
-```
+Keys: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, and `LLM_<TIER>_PRIMARY` / `LLM_<TIER>_BACKUP` for `LOW`, `MEDIUM`, and `HIGH`. Values live in `.env` (gitignored); [`.env.example`](../../.env.example) holds the defaults.
 
 A backup on the same vendor as its primary is not a backup — it shares the outage. Each tier's backup is therefore a different vendor.
 

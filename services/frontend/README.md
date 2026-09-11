@@ -8,7 +8,7 @@ Frontend is internal. It is not published to the host and never talks to Crawler
 
 The browser must load the page and call RPCs from a single origin, otherwise every Connect call pays a CORS preflight — Connect sends `connect-protocol-version`, a custom header, so no call qualifies as a simple request.
 
-Keeping Gateway as the only published port preserves that single origin and keeps one external entry point for the system. The cost is one internal HTTP hop for page loads, which are rare compared to RPCs.
+Keeping Gateway as the browser's only way in preserves that single origin and keeps one external entry point for the system. The cost is one internal HTTP hop for page loads, which are rare compared to RPCs.
 
 ## Pages
 
@@ -21,7 +21,7 @@ Keeping Gateway as the only published port preserves that single origin and keep
 
 `client/index.html` is one static file with no build step, compiled into the binary with `include_str!`. A single self-contained file means the release image is a binary and nothing else, with no asset paths to get wrong at runtime.
 
-`include_str!` registers the file as a rebuild dependency, so editing markup in dev triggers a `watchexec` rebuild the same way editing Rust does. Once the UI outgrows one file, swap the handler for `ServeDir` and copy `client/` into the image.
+`include_str!` registers the file as a rebuild dependency, so editing markup under `docker compose up --watch` rebuilds the image the same way editing Rust does. Once the UI outgrows one file, swap the handler for `ServeDir` and copy `client/` into the image.
 
 ## Talking to the Backend
 

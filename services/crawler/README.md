@@ -4,13 +4,15 @@ Crawls websites and indexes their content for hybrid semantic search. Crawler li
 
 ## What Runs Today
 
-The first slice crawls for real but stores nothing yet:
+Crawls for real and stores what it finds:
 
 - `StartCrawl` checks that `base_url` is an absolute http(s) URL, returns `QUEUED`, and crawls in the background with spider-rs `crawl()` — plain HTTP, no Chromium.
-- The job moves `QUEUED → RUNNING → DONE`, and `pages_crawled` rises as pages arrive. It ends `FAILED` when not a single page could be fetched.
+- The job moves `QUEUED → RUNNING → DONE`. It ends `FAILED` when not a single page could be fetched.
+- Each counted page is saved to `crawler.pages`: the title, the main text (dom_smoothie strips nav, ads, and footers), a SHA-256 of that text, the HTTP status, and the time. Crawling a URL again updates its row instead of adding one.
+- `pages_crawled` rises as rows are written. A failed write goes to stderr and is skipped; the job still finishes.
 - One host only, `robots.txt` respected, 15 s per request, at most `CRAWL_MAX_PAGES` fetched pages per crawl (default 100).
-- `pages_skipped` stays `0` until the skip ladder below exists; it counts unchanged pages, which needs storage.
-- Jobs live in memory and vanish on restart. Nothing past **Fetch** in the pipeline below runs yet.
+- `pages_skipped` stays `0` until the skip ladder below exists; it counts unchanged pages.
+- Jobs still live in memory and vanish on restart. Schema sync creates missing tables and columns on every start; replace it with migrations before the data matters. **Denoise** and **Store** run; **Enrich**, **Embed**, and **Search** do not yet.
 
 ### Scope
 
@@ -21,7 +23,7 @@ The first slice crawls for real but stores nothing yet:
 
 Both include lists empty means every fetched page counts. `*` matches any run of characters. A pattern starting with `/` matches from the URL path (`/docs/*`); any other pattern must match the whole URL (`*/admin/*`). `*_urls` entries match exactly.
 
-Tests: `cargo nextest run -p crawler`. Crawl tests run against a local site on `127.0.0.1`, never the internet.
+Tests: `cargo nextest run -p crawler`. Crawl tests use a local site on `127.0.0.1`, never the internet. Storage tests start their own Postgres through testcontainers, bootstrapped with the crawler's role and schema the way `compose.yaml` bootstraps the stack, so Docker must be running.
 
 ## Pipeline
 
@@ -70,9 +72,11 @@ Chromium dominates crawl cost, so treat it as an escalation and never a default.
 
 ## Schema (`crawler`)
 
-- `pages` — url, title, main_content, page_type, keywords, summary, metadata, content_hash, crawled_at
+- `pages` today — `url`, `title`, `main_text`, `content_hash`, `http_status`, `crawled_at`; column types live in [the entity](src/entity/page.rs)
+- `pages` with enrichment — `page_type`, `keywords`, `summary`, `metadata`
 - `pages` freshness — `etag varchar(256)`, `last_modified timestamptz`, `needs_js boolean`, `unchanged_streak smallint`, `next_crawl_at timestamptz`
 - `page_embeddings` — page_id, embedding, model_version
+- `crawl_jobs` — once jobs are persisted; today they live in memory
 
 `etag` and `last_modified` are nullable — plenty of servers send neither, and those pages fall back to the hash check.
 
