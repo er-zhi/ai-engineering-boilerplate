@@ -16,7 +16,8 @@ Early stage. Most of the system is specified but not yet built.
 | `crawler` and `gateway` services, end to end over Connect + gRPC | Done — job tracking is in memory |
 | Docker Compose with hot reload | Done |
 | Crawling with spider-rs: scope rules, page cap, live progress | Done — page counts only, nothing stored |
-| Postgres schemas, page storage, enrichment, embeddings, `CacheStore` | Next |
+| Postgres 18 + pgvector, one schema and role per service | Done — no service reads from it yet |
+| Page storage, enrichment, embeddings, `CacheStore` | Next |
 | `llm-router` service | Specified in its README |
 
 ## Architecture
@@ -64,6 +65,7 @@ See [goal.md](goal.md) for the full rules on dev velocity, data, and testing.
 │   ├── frontend/         # web UI: pages, styles, client-side logic
 │   ├── gateway/          # public Connect API, proxies page routes to frontend
 │   └── llm-router/       # LLM calls by quality tier, with fallback
+├── infra/postgres/       # first-start bootstrap: pgvector, one schema + role per service
 └── .agents/skills/code-review/   # review gates for AI agents
 ```
 
@@ -102,10 +104,26 @@ Requires Rust 1.98 or newer and `protoc` on your `PATH`, which `connectrpc-build
 ```bash
 git clone https://github.com/er-zhi/ai-engineering-boilerplate.git
 cd ai-engineering-boilerplate
+cp .env.example .env   # then replace the change-me passwords: openssl rand -hex 24
 docker compose up
 ```
 
 Then open <http://localhost:8080> for the web UI. Compose picks up `docker-compose.override.yml` automatically, which mounts the source and runs `watchexec`, so a save rebuilds and restarts only the service whose code (or `common/`) changed. Only Gateway is published to the host; Crawler and Frontend stay on the internal network.
+
+### Database
+
+In dev, Postgres listens on `127.0.0.1:5432`. Connect any client (psql, the Database Client extension in VS Code or Cursor, DBeaver) with:
+
+| Setting | Value |
+|---|---|
+| Server type | PostgreSQL |
+| Host | `127.0.0.1` |
+| Port | `5432` |
+| Database | `app` |
+| Username | `postgres` (superuser), or `crawler_user` / `gateway_user` / `llm_router_user` to see exactly what one service sees |
+| Password | the matching value from `.env` |
+
+`infra/postgres/init.sh` creates the schemas and roles only on the first start, when the `pgdata` volume is empty. To apply changed passwords, remove that volume (`docker volume ls | grep pgdata`, then `docker volume rm <name>`), which deletes all data.
 
 To work without Docker you need Rust 1.98+ and `protoc`, then `cargo build` and run the three binaries, pointing Gateway at the other two:
 

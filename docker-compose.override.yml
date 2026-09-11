@@ -1,5 +1,10 @@
 # Dev mode: source is mounted and watchexec rebuilds on save. Applied automatically by `docker compose up`.
 services:
+  postgres:
+    # Dev only, so a local DB client can connect. Bound to 127.0.0.1, never to the network.
+    ports:
+      - "127.0.0.1:5432:5432"
+
   crawler:
     build:
       target: dev

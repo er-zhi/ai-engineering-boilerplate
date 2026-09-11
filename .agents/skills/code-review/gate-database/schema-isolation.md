@@ -10,18 +10,15 @@ One Postgres instance, one schema and role per service. A role cannot reach anot
 
 ## Bootstrap
 
-Per service, substituting the schema and role names:
+[`infra/postgres/init.sh`](../../../../infra/postgres/init.sh) runs on Postgres's first start and does this per service:
 
 ```sql
-CREATE SCHEMA crawler;
-CREATE ROLE crawler_user LOGIN PASSWORD '${CRAWLER_DB_PASSWORD}';
-
-GRANT USAGE ON SCHEMA crawler TO crawler_user;
-GRANT ALL ON ALL TABLES IN SCHEMA crawler TO crawler_user;
-GRANT ALL ON ALL SEQUENCES IN SCHEMA crawler TO crawler_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA crawler GRANT ALL ON TABLES TO crawler_user;
-ALTER ROLE crawler_user SET search_path TO crawler;
+CREATE ROLE crawler_user LOGIN PASSWORD '<CRAWLER_DB_PASSWORD>';
+CREATE SCHEMA crawler AUTHORIZATION crawler_user;
+ALTER ROLE crawler_user SET search_path TO crawler, public;
 ```
+
+The role owns its schema, so it can create and alter its own tables and has no rights in any other schema. `public` stays on the search path only so the pgvector type resolves.
 
 Each service's `.env` uses its own credentials:
 
