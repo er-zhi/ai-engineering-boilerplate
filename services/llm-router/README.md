@@ -18,13 +18,27 @@ Model slugs move. Re-verify against the [DeepSeek hub](https://openrouter.ai/dee
 
 ## Config
 
+Values live in `.env` (gitignored); see [`.env.example`](../../.env.example) for the full list.
+
 ```env
-OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 LLM_LOW_PRIMARY=deepseek/deepseek-v4-flash
-LLM_LOW_BACKUP=deepseek/deepseek-v4-flash
+LLM_LOW_BACKUP=z-ai/glm-4.7-flash
 # same pattern for MEDIUM and HIGH
 ```
+
+A backup on the same vendor as its primary is not a backup — it shares the outage. Each tier's backup is therefore a different vendor.
+
+This service is the only one given `OPENROUTER_API_KEY`. Callers reach it over gRPC and never see provider credentials, so the key stays out of Crawler and Gateway entirely.
+
+## Reasoning Must Be Off for `low` and `medium`
+
+Send `"reasoning": {"enabled": false}` on every `low` and `medium` request. Leave it on for `high` — that tier exists for it.
+
+Reasoning models spend the completion budget on hidden reasoning tokens before emitting any content. On a one-word classification, `z-ai/glm-4.7-flash` consumed all 300 allowed tokens as `reasoning_tokens`, returned empty content, and stopped with `finish_reason: length`. With reasoning disabled the same prompt answered in 2 tokens. The failure bills normally and returns nothing, so it looks like a parsing bug rather than a config one.
+
+Never treat an empty `content` as a model failure without checking `usage.completion_tokens_details.reasoning_tokens` first.
 
 ## gRPC API
 

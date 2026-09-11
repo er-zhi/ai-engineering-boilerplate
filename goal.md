@@ -7,18 +7,18 @@ Product-ready Rust codebase optimized for **speed to develop and ship** on a loc
 | Use | Tool |
 |---|---|
 | Language | Rust |
-| Runtime | Docker Compose (one Dockerfile per service) |
+| Runtime | Docker Compose (one Dockerfile per service, Alpine + static musl) |
 | Database | PostgreSQL — one instance, schema-per-service, pgvector |
 | Cache | PostgreSQL behind `CacheStore` trait in `common/cache/` |
 | Inter-service | gRPC, proto in `common/proto/` |
-| External API | REST via Gateway |
+| External API | Connect via Gateway — proto-defined RPC, browser-callable, no REST |
 | LLM | OpenRouter via LLM Router |
 
 **Not now:** Redis, Kafka, K8s, cloud tooling, second DB, heavy frameworks. Need a cache? Postgres + wrapper. Cloud scaling comes later, on top of this codebase — not inside it.
 
 ## Dev Velocity
 
-- **Hot reload** — source volume-mounted, `cargo watch` restarts on change. Prod Dockerfile separate; dev overrides in `docker-compose.override.yml`.
+- **Hot reload** — source volume-mounted, `watchexec` restarts on change. Prod Dockerfile separate; dev overrides in `docker-compose.override.yml`.
 - **Entity-driven schema** — entities are the source of truth, schema auto-syncs on startup in dev. Migration files only for prod.
 - **One command** — `docker compose up` brings up the full stack with health checks.
 - Target: code change → running service in seconds.
@@ -36,7 +36,7 @@ Product-ready Rust codebase optimized for **speed to develop and ship** on a loc
 - **Smallest correct column type** per column.
 - **No logs in DB** — stdout only. **No permanent raw data** — store extracted content. Temporary raw needs `expires_at` + cleanup.
 
-See [gate-database](skills/code-review/gate-database/SKILL.md).
+See [gate-database](.agents/skills/code-review/gate-database/SKILL.md).
 
 ## Testing
 
@@ -54,20 +54,21 @@ Meaningful, fast, reliable — not coverage theater.
 | Service | Role |
 |---|---|
 | [crawler](services/crawler/README.md) | Crawl sites, extract content, LLM enrichment, vector search; skips unchanged pages |
-| [gateway](services/gateway/README.md) | External REST API, routes to internal services, dev HTML client |
+| [frontend](services/frontend/README.md) | Web UI — all markup, styles, and client-side logic; reached through Gateway |
+| [gateway](services/gateway/README.md) | External Connect API, routes to internal services over gRPC, proxies page routes to Frontend |
 | [llm-router](services/llm-router/README.md) | LLM abstraction by quality tier with fallback |
 
 ## Skills
 
-Agent skills live in `skills/`, grouped by purpose, and are runtime-agnostic — they work in both Claude Code and Codex. Code review is one group and runs its gates in parallel, one agent per gate, each reporting its own duration so the slowest gate can be optimized — see [skills/code-review/SKILL.md](skills/code-review/SKILL.md).
+Agent skills live in `.agents/skills/`, grouped by purpose, and are runtime-agnostic — they work in both Claude Code and Codex. Code review is one group and runs its gates in parallel, one agent per gate, each reporting its own duration so the slowest gate can be optimized — see [.agents/skills/code-review/SKILL.md](.agents/skills/code-review/SKILL.md).
 
 | Gate | Checks |
 |---|---|
-| [gate-architecture](skills/code-review/gate-architecture/SKILL.md) | Boundaries, Docker, schema isolation |
-| [gate-code-quality](skills/code-review/gate-code-quality/SKILL.md) | Durability, naming, minimalism |
-| [gate-common](skills/code-review/gate-common/SKILL.md) | Type chain, shared code |
-| [gate-database](skills/code-review/gate-database/SKILL.md) | Column types, storage rules |
-| [gate-testing](skills/code-review/gate-testing/SKILL.md) | Runs the suite, reports pass/fail and slowest tests |
-| [gate-facts](skills/code-review/gate-facts/SKILL.md) | External claims verified against official docs |
-| [gate-evidence](skills/code-review/gate-evidence/SKILL.md) | Proof the change ran — terminal output, screenshots |
-| [gate-second-opinion](skills/code-review/gate-second-opinion/SKILL.md) | Cross-model judgment — GLM plus Codex or Claude, in parallel |
+| [gate-architecture](.agents/skills/code-review/gate-architecture/SKILL.md) | Boundaries, Docker, schema isolation |
+| [gate-code-quality](.agents/skills/code-review/gate-code-quality/SKILL.md) | Durability, naming, minimalism |
+| [gate-common](.agents/skills/code-review/gate-common/SKILL.md) | Type chain, shared code |
+| [gate-database](.agents/skills/code-review/gate-database/SKILL.md) | Column types, storage rules |
+| [gate-testing](.agents/skills/code-review/gate-testing/SKILL.md) | Runs the suite, reports pass/fail and slowest tests |
+| [gate-facts](.agents/skills/code-review/gate-facts/SKILL.md) | External claims verified against official docs |
+| [gate-evidence](.agents/skills/code-review/gate-evidence/SKILL.md) | Proof the change ran — terminal output, screenshots |
+| [gate-second-opinion](.agents/skills/code-review/gate-second-opinion/SKILL.md) | Cross-model judgment — GLM plus Codex or Claude, in parallel |

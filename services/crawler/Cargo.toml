@@ -1,0 +1,17 @@
+[package]
+name = "crawler"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+common = { workspace = true }
+connectrpc = { workspace = true, features = ["axum"] }
+buffa = { workspace = true }
+axum = { workspace = true }
+regex = { workspace = true }
+spider = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time"] }

@@ -1,0 +1,39 @@
+services:
+  crawler:
+    build:
+      context: .
+      dockerfile: services/crawler/Dockerfile
+    environment:
+      CRAWL_MAX_PAGES: ${CRAWL_MAX_PAGES:-100}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 300s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: services/frontend/Dockerfile
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 300s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      CRAWLER_URL: ${CRAWLER_URL:-http://crawler:8081}
+      FRONTEND_URL: ${FRONTEND_URL:-http://frontend:8082}
+    depends_on:
+      crawler:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy

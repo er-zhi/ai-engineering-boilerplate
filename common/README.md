@@ -4,7 +4,7 @@ Cross-service shared code. Services depend on `common/` — never on each other'
 
 ```
 common/
-├── proto/    # gRPC contracts (tonic/prost)
+├── proto/    # Connect + gRPC contracts (connectrpc/buffa)
 ├── errors/   # shared error codes + gRPC status mapping
 ├── cache/    # CacheStore trait: Postgres now, Redis later
 ├── test/     # fixtures, mock builders, testcontainers setup

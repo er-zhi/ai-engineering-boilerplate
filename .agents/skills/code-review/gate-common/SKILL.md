@@ -22,7 +22,7 @@ Otherwise             → stays in that service
 
 1. Entity is canonical within a service; proto is canonical across services.
 2. New types wrap or reference existing ones — never redefine the same fields.
-3. Use generated tonic/prost types, never a hand-written mirror struct.
+3. Use the generated connectrpc/buffa types, never a hand-written mirror struct.
 4. New `.proto` files `import` existing messages instead of copying field blocks.
 5. One mapper module per service for entity ↔ proto.
 

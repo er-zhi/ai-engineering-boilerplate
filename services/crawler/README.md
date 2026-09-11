@@ -2,6 +2,27 @@
 
 Crawls websites and indexes their content for hybrid semantic search. Crawler library: [spider-rs](https://github.com/spider-rs/spider).
 
+## What Runs Today
+
+The first slice crawls for real but stores nothing yet:
+
+- `StartCrawl` checks that `base_url` is an absolute http(s) URL, returns `QUEUED`, and crawls in the background with spider-rs `crawl()` — plain HTTP, no Chromium.
+- The job moves `QUEUED → RUNNING → DONE`, and `pages_crawled` rises as pages arrive. It ends `FAILED` when not a single page could be fetched.
+- One host only, `robots.txt` respected, 15 s per request, at most `CRAWL_MAX_PAGES` fetched pages per crawl (default 100).
+- `pages_skipped` stays `0` until the skip ladder below exists; it counts unchanged pages, which needs storage.
+- Jobs live in memory and vanish on restart. Nothing past **Fetch** in the pipeline below runs yet.
+
+### Scope
+
+| Field | Effect |
+|---|---|
+| `exclude_patterns`, `exclude_urls` | Never fetched, so links on those pages are never followed either |
+| `include_patterns`, `include_urls` | Decide which fetched pages count. They do not limit link-following, so in-scope pages reachable only through other pages are still found |
+
+Both include lists empty means every fetched page counts. `*` matches any run of characters. A pattern starting with `/` matches from the URL path (`/docs/*`); any other pattern must match the whole URL (`*/admin/*`). `*_urls` entries match exactly.
+
+Tests: `cargo nextest run -p crawler`. Crawl tests run against a local site on `127.0.0.1`, never the internet.
+
 ## Pipeline
 
 1. **Plan** — split URLs into known revisits and new discoveries; drop any whose sitemap `lastmod` predates `crawled_at`
@@ -71,6 +92,9 @@ Enrichment result per page:
 
 ## API
 
-- `POST /crawl` — submit URLs to crawl and index
-- `GET /search?q=&type=&keywords=` — semantic similarity plus lexical and type filters
-- `GET /health`
+Defined in [`common/proto/crawler.proto`](../../common/proto/crawler.proto) and served over both Connect and gRPC; Gateway reaches it over gRPC.
+
+- `StartCrawl` — submit a base URL and scope to crawl and index
+- `GetCrawlJob` — job status and page counts
+- `Search` — semantic similarity plus lexical and type filters (not yet implemented)
+- `GET /health` — plain-HTTP liveness for Compose

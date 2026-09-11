@@ -1,0 +1,12 @@
+[package]
+name = "gateway"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+common = { workspace = true }
+connectrpc = { workspace = true, features = ["axum", "client"] }
+axum = { workspace = true }
+hyper-util = { workspace = true }
+tokio = { workspace = true }

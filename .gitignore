@@ -2,4 +2,7 @@ target/
 .env
 .env.*
 !.env.example
-skills/code-review/logs/
+.agents/skills/code-review/logs/
+
+
+.temp

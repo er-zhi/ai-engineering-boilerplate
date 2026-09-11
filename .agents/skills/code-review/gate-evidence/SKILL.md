@@ -56,10 +56,11 @@ Never block on evidence that the environment genuinely cannot produce. Record th
 ## Example
 
 ```
-Verified: POST /api/crawl accepts pattern filters
-$ curl -s -XPOST localhost:8080/api/crawl -H 'content-type: application/json' \
-    -d '{"base_url":"https://example.com","exclude_patterns":["*/admin/*"]}'
-{"job_id":"01JB...","status":"queued"}
+Verified: StartCrawl accepts scope filters through the gateway
+$ curl -s -XPOST localhost:8080/crawler.v1.CrawlerService/StartCrawl \
+    -H 'content-type: application/json' -H 'connect-protocol-version: 1' \
+    -d '{"baseUrl":"https://example.com","scope":{"excludePatterns":["*/admin/*"]}}'
+{"jobId":"job-1","status":"CRAWL_STATUS_QUEUED"}
 
 Critical: services/crawler/src/denoise.rs — nav-stripping rewritten, no test run.
 Expected `cargo test -p crawler denoise` output.

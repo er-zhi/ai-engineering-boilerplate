@@ -2,7 +2,7 @@
 
 One line per review, last 10 kept. Its only job is to show which gate is *chronically* slow, so optimization effort lands where it changes the wall clock.
 
-Path: `skills/code-review/logs/runs.jsonl`
+Path: `.agents/skills/code-review/logs/runs.jsonl`
 
 ## Format
 
@@ -19,7 +19,7 @@ One JSON object per line. Record only the gates that actually ran — a skipped 
 Append, then truncate to the last 10. One command, no script to maintain:
 
 ```bash
-mkdir -p skills/code-review/logs && L=skills/code-review/logs/runs.jsonl && \
+mkdir -p .agents/skills/code-review/logs && L=.agents/skills/code-review/logs/runs.jsonl && \
   echo '<json line>' >> "$L" && tail -n 10 "$L" > "$L.tmp" && mv "$L.tmp" "$L"
 ```
 
@@ -31,7 +31,7 @@ jq -s '
   | group_by(.key)
   | map({gate: .[0].key, runs: length, avg_s: ((map(.value) | add) / length | .*10|round/10), max_s: (map(.value) | max)})
   | sort_by(-.avg_s)
-' skills/code-review/logs/runs.jsonl
+' .agents/skills/code-review/logs/runs.jsonl
 ```
 
 ```json
@@ -49,7 +49,7 @@ A review whose elapsed time approaches the sum of its gates was not parallel, an
 ```bash
 jq -r '([.gates[]] | add) as $sum |
   "\(.ts)  elapsed=\(.elapsed_s)s  sum=\($sum)s  \(if .elapsed_s >= $sum * 0.9 then "SERIAL" else "parallel ok" end)"
-' skills/code-review/logs/runs.jsonl
+' .agents/skills/code-review/logs/runs.jsonl
 ```
 
 ## Acting on It

@@ -1,0 +1,96 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Crawler</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; margin-bottom: 1.5rem; }
+  label { display: block; margin-top: 1rem; font-weight: 600; }
+  input, textarea { width: 100%; padding: .5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }
+  textarea { min-height: 4rem; resize: vertical; }
+  small { color: #666; font-weight: 400; }
+  button { margin-top: 1.5rem; padding: .6rem 1.2rem; font: inherit; cursor: pointer; }
+  pre { background: #f5f5f5; padding: 1rem; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; }
+  .error { color: #b00; }
+</style>
+
+<h1>Crawler</h1>
+
+<label>Base URL
+  <input id="baseUrl" value="https://example.com" placeholder="https://example.com">
+</label>
+
+<label>Include patterns <small>one per line, empty means everything</small>
+  <textarea id="includePatterns" placeholder="/docs/*"></textarea>
+</label>
+
+<label>Exclude patterns <small>one per line</small>
+  <textarea id="excludePatterns" placeholder="*/admin/*"></textarea>
+</label>
+
+<label>Only these URLs <small>one per line, overrides discovery</small>
+  <textarea id="includeUrls"></textarea>
+</label>
+
+<label>Never these URLs <small>one per line</small>
+  <textarea id="excludeUrls"></textarea>
+</label>
+
+<button id="start">Start crawl</button>
+
+<pre id="output">Idle.</pre>
+
+<script>
+  const SERVICE = "/crawler.v1.CrawlerService";
+  const output = document.getElementById("output");
+
+  // Connect protocol: unary RPC is a POST to /<proto package>.<Service>/<Method> carrying a JSON message.
+  async function call(method, message) {
+    const res = await fetch(`${SERVICE}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "connect-protocol-version": "1" },
+      body: JSON.stringify(message),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.message || `${method} failed with ${res.status}`);
+    return body;
+  }
+
+  const lines = (id) =>
+    document.getElementById(id).value.split("\n").map((line) => line.trim()).filter(Boolean);
+
+  let pollTimer;
+
+  async function showJob(jobId) {
+    const job = await call("GetCrawlJob", { jobId });
+    output.textContent = JSON.stringify(job, null, 2);
+    if (job.status === "CRAWL_STATUS_QUEUED" || job.status === "CRAWL_STATUS_RUNNING") {
+      pollTimer = setTimeout(() => showJob(jobId).catch(fail), 1000);
+    }
+  }
+
+  function fail(err) {
+    output.textContent = err.message;
+    output.className = "error";
+  }
+
+  document.getElementById("start").onclick = async () => {
+    clearTimeout(pollTimer);
+    output.className = "";
+    output.textContent = "Starting...";
+
+    try {
+      const { jobId } = await call("StartCrawl", {
+        baseUrl: document.getElementById("baseUrl").value.trim(),
+        scope: {
+          includePatterns: lines("includePatterns"),
+          excludePatterns: lines("excludePatterns"),
+          includeUrls: lines("includeUrls"),
+          excludeUrls: lines("excludeUrls"),
+        },
+      });
+      await showJob(jobId);
+    } catch (err) {
+      fail(err);
+    }
+  };
+</script>

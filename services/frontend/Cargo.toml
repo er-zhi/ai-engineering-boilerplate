@@ -1,0 +1,9 @@
+[package]
+name = "frontend"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
