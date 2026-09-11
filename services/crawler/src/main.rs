@@ -1,9 +1,13 @@
 // Crawl job service. Accepts crawl requests over Connect and gRPC, crawls in the background, and reports progress.
 
 mod crawl;
+mod entity;
 mod extract;
 mod jobs;
 mod scope;
+mod store;
+#[cfg(test)]
+mod test_db;
 #[cfg(test)]
 mod test_site;
 
@@ -79,7 +83,6 @@ impl CrawlerService for Crawler {
     }
 }
 
-/// The crawler can only fetch absolute http(s) URLs that name a host.
 fn validate_base_url(raw: &str) -> Result<(), ConnectError> {
     if raw.is_empty() {
         return Err(ConnectError::invalid_argument("base_url is required"));

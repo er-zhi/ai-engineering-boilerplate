@@ -12,8 +12,11 @@ axum = { workspace = true }
 regex = { workspace = true }
 dom_smoothie = { workspace = true }
 sha2 = { workspace = true }
+chrono = { workspace = true }
+sea-orm = { workspace = true }
 spider = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["time"] }
+testcontainers = { workspace = true }

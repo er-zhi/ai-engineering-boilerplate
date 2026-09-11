@@ -18,6 +18,10 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 regex = "1"
 dom_smoothie = "0.18"
 sha2 = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Entity-first: schema sync creates missing tables and columns from the entities on startup.
+sea-orm = { version = "2.0", default-features = false, features = ["macros", "with-chrono", "sqlx-postgres", "runtime-tokio-rustls", "schema-sync", "entity-registry"] }
+testcontainers = "0.28"
 # Plain HTTP crawling only: rustls instead of OpenSSL, and none of the default io_uring/disk/browser extras.
 spider = { version = "2.53", default-features = false, features = ["sync", "regex", "reqwest_rustls_tls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
