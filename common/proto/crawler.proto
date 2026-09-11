@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package crawler.v1;
+
+service CrawlerService {
+  rpc StartCrawl(StartCrawlRequest) returns (StartCrawlResponse);
+  rpc GetCrawlJob(GetCrawlJobRequest) returns (GetCrawlJobResponse);
+}
+
+enum CrawlStatus {
+  CRAWL_STATUS_UNSPECIFIED = 0;
+  CRAWL_STATUS_QUEUED = 1;
+  CRAWL_STATUS_RUNNING = 2;
+  CRAWL_STATUS_DONE = 3;
+  CRAWL_STATUS_FAILED = 4;
+}
+
+message CrawlScope {
+  repeated string include_patterns = 1;
+  repeated string exclude_patterns = 2;
+  repeated string include_urls = 3;
+  repeated string exclude_urls = 4;
+}
+
+message StartCrawlRequest {
+  string base_url = 1;
+  CrawlScope scope = 2;
+}
+
+message StartCrawlResponse {
+  string job_id = 1;
+  CrawlStatus status = 2;
+}
+
+message GetCrawlJobRequest {
+  string job_id = 1;
+}
+
+message GetCrawlJobResponse {
+  string job_id = 1;
+  string base_url = 2;
+  CrawlStatus status = 3;
+  uint32 pages_crawled = 4;
+  uint32 pages_skipped = 5;
+}
