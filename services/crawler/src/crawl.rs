@@ -22,13 +22,22 @@ pub struct Limits {
 #[derive(Debug, PartialEq)]
 pub struct Unreachable;
 
+/// A fetched page the scope counts, handed to the caller as soon as it arrives.
+// Only tests read the fields until jobs start storing pages; remove this allow then.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct CountedPage {
+    pub url: String,
+    pub html: String,
+    pub status: u16,
+}
+
 /// Crawls from `base_url` on the same host, never requesting URLs the scope blocks, and calls
-/// `on_counted` with the URL of each successfully fetched page the scope counts.
+/// `on_counted` with each successfully fetched page the scope counts.
 pub async fn crawl(
     base_url: &str,
     scope: &Scope,
     limits: Limits,
-    mut on_counted: impl FnMut(&str) + Send,
+    mut on_counted: impl FnMut(CountedPage) + Send,
 ) -> Result<(), Unreachable> {
     let blacklist: Vec<CompactString> = scope
         .blacklist()
@@ -51,7 +60,11 @@ pub async fn crawl(
         if page.status_code.is_success() {
             any_fetched = true;
             if scope.counts(page.get_url()) {
-                on_counted(page.get_url());
+                on_counted(CountedPage {
+                    url: page.get_url().to_owned(),
+                    html: page.get_html(),
+                    status: page.status_code.as_u16(),
+                });
             }
         }
     };
@@ -121,8 +134,8 @@ mod tests {
         });
 
         let mut counted = Vec::new();
-        crawl(&site.url("/"), &scope, LIMITS, |url| {
-            counted.push(url.to_owned())
+        crawl(&site.url("/"), &scope, LIMITS, |page| {
+            counted.push(page.url)
         })
         .await
         .unwrap();
@@ -178,5 +191,24 @@ mod tests {
 
         assert_eq!(result, Err(Unreachable));
         assert_eq!(counted, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn counted_pages_carry_their_html_and_status() {
+        let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
+
+        let mut pages = Vec::new();
+        crawl(&site.url("/"), &everything(), LIMITS, |page| {
+            pages.push(page)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.status == 200 && page.html.contains(r#"<a href="/docs/a">"#)),
+            "no counted page carried the root's HTML"
+        );
     }
 }
