@@ -1,5 +1,4 @@
 // Turns fetched HTML into what the crawler keeps: a title, the main text, and a hash of that text.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use dom_smoothie::Readability;
 use sha2::{Digest, Sha256};

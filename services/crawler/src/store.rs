@@ -1,5 +1,4 @@
 // Persists counted pages: extracts the main text, then inserts or updates the row for the URL.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;

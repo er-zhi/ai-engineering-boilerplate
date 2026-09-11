@@ -25,14 +25,17 @@ use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
 };
 
+use sea_orm::Database;
+
 use crate::crawl::Limits;
 use crate::jobs::Jobs;
 use crate::scope::Scope;
+use crate::store::PgPages;
 
 const DEFAULT_MAX_PAGES: u32 = 100;
 
 struct Crawler {
-    jobs: Jobs,
+    jobs: Jobs<PgPages>,
     limits: Limits,
 }
 
@@ -106,8 +109,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(value) => value.parse()?,
         Err(_) => DEFAULT_MAX_PAGES,
     };
+    let database_url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
+    let db = Database::connect(&database_url).await?;
+    db.get_schema_registry("crawler::entity::*")
+        .sync(&db)
+        .await?;
+
     let crawler = Crawler {
-        jobs: Jobs::default(),
+        jobs: Jobs::new(PgPages::new(db)),
         limits: Limits {
             max_pages,
             request_timeout: Duration::from_secs(15),

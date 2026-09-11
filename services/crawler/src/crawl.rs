@@ -21,7 +21,6 @@ pub struct Limits {
 #[derive(Debug, PartialEq)]
 pub struct Unreachable;
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct CountedPage {
     pub url: String,
     pub html: String,
