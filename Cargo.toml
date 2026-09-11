@@ -16,6 +16,8 @@ serde = { version = "1", features = ["derive"] }
 axum = "0.8"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 regex = "1"
+dom_smoothie = "0.18"
+sha2 = "0.11"
 # Plain HTTP crawling only: rustls instead of OpenSSL, and none of the default io_uring/disk/browser extras.
 spider = { version = "2.53", default-features = false, features = ["sync", "regex", "reqwest_rustls_tls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }

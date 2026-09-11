@@ -1,6 +1,7 @@
 // Crawl job service. Accepts crawl requests over Connect and gRPC, crawls in the background, and reports progress.
 
 mod crawl;
+mod extract;
 mod jobs;
 mod scope;
 #[cfg(test)]

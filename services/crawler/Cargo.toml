@@ -10,6 +10,8 @@ connectrpc = { workspace = true, features = ["axum"] }
 buffa = { workspace = true }
 axum = { workspace = true }
 regex = { workspace = true }
+dom_smoothie = { workspace = true }
+sha2 = { workspace = true }
 spider = { workspace = true }
 tokio = { workspace = true }
 
