@@ -89,8 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frontend_url =
         std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://127.0.0.1:8082".into());
 
-    // Browsers reach this service over Connect; every internal hop is gRPC with binary protobuf.
-    // gRPC carries its status in HTTP/2 trailers, so the internal client must be h2c.
     let gateway = Gateway {
         crawler: CrawlerServiceClient::new(
             HttpClient::plaintext_http2_only(),
@@ -107,8 +105,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let connect = ConnectRouter::new().add_service(Arc::new(gateway));
 
-    // Only page routes are listed here. Every Connect path falls through to the RPC router,
-    // so adding a service to the proto never means touching this table.
     let app = axum::Router::new()
         .route("/", get(page))
         .route("/health", get(|| async { "OK" }))

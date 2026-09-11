@@ -28,6 +28,7 @@ Product-ready Rust codebase optimized for **speed to develop and ship** on a loc
 - Each capability is an independent service in `services/<name>/` (no `-service` suffix).
 - Boundaries stay clean so a later move to cloud/K8s needs no rewrite.
 - Cross-service data flows through gRPC only.
+- **Self-documenting code, no comments** — names carry the meaning. The only comment allowed is a one-line summary at the top of a file. See [gate-code-quality](.agents/skills/code-review/gate-code-quality/SKILL.md).
 - Shared code lives in [common/](common/README.md) — proto, errors, cache, test helpers, utils.
 
 ## Data

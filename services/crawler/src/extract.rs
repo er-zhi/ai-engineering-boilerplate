@@ -1,23 +1,18 @@
 // Turns fetched HTML into what the crawler keeps: a title, the main text, and a hash of that text.
-// Raw HTML never leaves this module.
-// Only tests call this module until the page store uses it; remove this allow then.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use dom_smoothie::Readability;
 use sha2::{Digest, Sha256};
 
-/// `crawler.pages.title` is varchar(512).
-const MAX_TITLE_CHARS: usize = 512;
+const TITLE_COLUMN_MAX_CHARS: usize = 512;
 
 #[derive(Debug, PartialEq)]
 pub struct Extracted {
     pub title: String,
     pub main_text: String,
-    /// Lowercase hex SHA-256 of `main_text`.
     pub content_hash: String,
 }
 
-/// Pages without a recognizable article keep their `<title>` and get empty text.
 pub fn extract(url: &str, html: &str) -> Extracted {
     let (title, text) = match Readability::new(html, Some(url), None) {
         Ok(mut readability) => {
@@ -29,17 +24,16 @@ pub fn extract(url: &str, html: &str) -> Extracted {
         }
         Err(_) => (String::new(), String::new()),
     };
-    let main_text = tidy(&text);
+    let main_text = trim_lines_and_drop_blank(&text);
 
     Extracted {
-        title: title.trim().chars().take(MAX_TITLE_CHARS).collect(),
+        title: title.trim().chars().take(TITLE_COLUMN_MAX_CHARS).collect(),
         content_hash: sha256_hex(&main_text),
         main_text,
     }
 }
 
-/// Trims each line and drops blank ones, so whitespace churn alone doesn't change the hash.
-fn tidy(text: &str) -> String {
+fn trim_lines_and_drop_blank(text: &str) -> String {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -57,6 +51,10 @@ fn sha256_hex(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHA256_OF_EMPTY_STRING: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const SHA256_OF_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     const ARTICLE_PAGE: &str = r#"<!doctype html><html><head><title>Rust Ownership Guide</title></head><body>
 <nav><a href="/">Home</a> <a href="/pricing">Pricing</a> Sign in</nav>
@@ -105,15 +103,11 @@ mod tests {
 
     #[test]
     fn content_hash_is_the_sha256_of_the_main_text() {
-        // Published SHA-256 test vectors, so the expected values don't come from our own code.
         assert_eq!(
             extract("https://example.com/", EMPTY_PAGE).content_hash,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            SHA256_OF_EMPTY_STRING
         );
-        assert_eq!(
-            sha256_hex("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
+        assert_eq!(sha256_hex("abc"), SHA256_OF_ABC);
     }
 
     #[test]

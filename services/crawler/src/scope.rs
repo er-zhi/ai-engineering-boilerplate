@@ -1,7 +1,4 @@
 // Crawl scope: which URLs are never fetched and which fetched pages count toward a job.
-//
-// Patterns are globs where `*` matches any run of characters, including `/`. A pattern that starts
-// with `/` is matched from the URL's path onward; any other pattern must match the whole URL.
 
 use common::proto::crawler::v1::CrawlScope;
 use regex::Regex;
@@ -16,20 +13,26 @@ pub struct Scope {
 impl Scope {
     pub fn new(rules: &CrawlScope) -> Self {
         Self {
-            include: rules.include_patterns.iter().map(|p| glob(p)).collect(),
-            exclude: rules.exclude_patterns.iter().map(|p| glob(p)).collect(),
+            include: rules
+                .include_patterns
+                .iter()
+                .map(|p| regex_from_glob(p))
+                .collect(),
+            exclude: rules
+                .exclude_patterns
+                .iter()
+                .map(|p| regex_from_glob(p))
+                .collect(),
             include_urls: rules.include_urls.clone(),
             exclude_urls: rules.exclude_urls.clone(),
         }
     }
 
-    /// Whether the URL must never be fetched.
     pub fn blocks(&self, url: &str) -> bool {
         self.exclude_urls.iter().any(|excluded| excluded == url)
             || self.exclude.iter().any(|pattern| pattern.is_match(url))
     }
 
-    /// Whether a fetched page counts toward the job. With no includes at all, every unblocked page counts.
     pub fn counts(&self, url: &str) -> bool {
         if self.blocks(url) {
             return false;
@@ -41,7 +44,6 @@ impl Scope {
             || self.include.iter().any(|pattern| pattern.is_match(url))
     }
 
-    /// Regexes for spider's blacklist, so blocked URLs are never requested.
     pub fn blacklist(&self) -> Vec<String> {
         let patterns = self
             .exclude
@@ -55,8 +57,7 @@ impl Scope {
     }
 }
 
-/// `/docs/*` becomes `^[^:/]+://[^/]+/docs/.*$` (anchored at the path); `*/admin/*` becomes `^.*/admin/.*$`.
-fn glob(pattern: &str) -> Regex {
+fn regex_from_glob(pattern: &str) -> Regex {
     let body = pattern
         .split('*')
         .map(regex::escape)

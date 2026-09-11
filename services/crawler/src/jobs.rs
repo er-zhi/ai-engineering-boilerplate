@@ -24,7 +24,6 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// Registers a queued job and returns its id.
     pub fn create(&self, base_url: &str) -> String {
         let job_id = format!("job-{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
         let job = CrawlJob {
@@ -41,7 +40,6 @@ impl Jobs {
         self.jobs.lock().unwrap().get(job_id).cloned()
     }
 
-    /// Crawls for the job: RUNNING while it runs, DONE when it finishes, FAILED if the site is unreachable.
     pub async fn run(&self, job_id: &str, base_url: &str, scope: Scope, limits: Limits) {
         self.update(job_id, |job| job.status = CrawlStatus::Running);
 
@@ -136,8 +134,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn job_is_running_with_a_partial_count_while_the_crawl_is_in_progress() {
-        // Every response takes 200 ms, so the job stays mid-crawl long enough to observe.
-        let site = TestSite::start_with_delay(
+        let slow_enough_to_see_the_job_mid_crawl = Duration::from_millis(200);
+        let site = TestSite::start_with_response_delay(
             [
                 ("/", "/p/1 /p/2 /p/3 /p/4 /p/5"),
                 ("/p/1", ""),
@@ -146,7 +144,7 @@ mod tests {
                 ("/p/4", ""),
                 ("/p/5", ""),
             ],
-            Duration::from_millis(200),
+            slow_enough_to_see_the_job_mid_crawl,
         )
         .await;
         let jobs = Jobs::default();

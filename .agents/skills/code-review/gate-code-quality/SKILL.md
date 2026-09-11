@@ -11,7 +11,7 @@ Report findings using the template in [code-review](../SKILL.md). For deletion-o
 
 ## Style Rules
 
-1. **No comments** — the only exception is one summary line at line 1 of a file: `// Fetches and stores page embeddings.` States what the file does, not how.
+1. **No comments** — the only exception is one summary line at line 1 of a file: `// Fetches and stores page embeddings.` States what the file does, not how. `///` doc comments, test comments, and comments explaining an `allow` count too. When a comment seems needed, move its meaning into a name: a constant, a function, or a variable.
 2. **Self-documenting names** — a reader needs no explanation beyond the identifier.
 3. **Minimal files** — under ~200 lines; split only when a file does two distinct jobs. Functions under ~60 lines.
 4. **No dead weight** — no unused imports, no speculative abstractions, no wrapper that only delegates.

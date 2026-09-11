@@ -5,6 +5,7 @@ use std::time::Duration;
 use spider::compact_str::CompactString;
 use spider::page::Page;
 use spider::website::Website;
+use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::scope::Scope;
@@ -13,17 +14,13 @@ const USER_AGENT: &str = "ai-engineering-boilerplate-crawler/0.1";
 
 #[derive(Clone, Copy)]
 pub struct Limits {
-    /// Most pages fetched per crawl, in or out of scope.
     pub max_pages: u32,
     pub request_timeout: Duration,
 }
 
-/// Not a single page could be fetched: the site is down, unreachable, or refused every request.
 #[derive(Debug, PartialEq)]
 pub struct Unreachable;
 
-/// A fetched page the scope counts, handed to the caller as soon as it arrives.
-// Only tests read the fields until jobs start storing pages; remove this allow then.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct CountedPage {
     pub url: String,
@@ -31,8 +28,6 @@ pub struct CountedPage {
     pub status: u16,
 }
 
-/// Crawls from `base_url` on the same host, never requesting URLs the scope blocks, and calls
-/// `on_counted` with each successfully fetched page the scope counts.
 pub async fn crawl(
     base_url: &str,
     scope: &Scope,
@@ -69,7 +64,6 @@ pub async fn crawl(
         }
     };
 
-    // Pages are sent before crawl() returns, so drain the channel afterwards instead of waiting for it to close.
     let crawling = website.crawl();
     tokio::pin!(crawling);
     loop {
@@ -85,18 +79,25 @@ pub async fn crawl(
             },
         }
     }
+    drain_pages_sent_before_the_crawl_returned(&mut pages, &mut handle);
+
+    if any_fetched {
+        Ok(())
+    } else {
+        Err(Unreachable)
+    }
+}
+
+fn drain_pages_sent_before_the_crawl_returned(
+    pages: &mut Receiver<Page>,
+    mut handle: impl FnMut(Page),
+) {
     loop {
         match pages.try_recv() {
             Ok(page) => handle(page),
             Err(TryRecvError::Lagged(_)) => {}
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
-    }
-
-    if any_fetched {
-        Ok(())
-    } else {
-        Err(Unreachable)
     }
 }
 
@@ -143,7 +144,7 @@ mod tests {
         counted.sort();
         assert_eq!(counted, [site.url("/docs/a"), site.url("/docs/b")]);
 
-        let requested = site.requested();
+        let requested = site.requested_pages();
         assert!(requested.contains(&"/blog/x".to_owned()), "{requested:?}");
         assert!(
             !requested.contains(&"/admin/secret".to_owned()),
@@ -170,7 +171,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fetched = site.requested().len();
+        let fetched = site.requested_pages().len();
         assert!((1..=5).contains(&fetched), "fetched {fetched} pages");
         assert_eq!(counted, fetched);
     }

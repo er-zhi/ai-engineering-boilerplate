@@ -1,5 +1,4 @@
-// Test-only website on 127.0.0.1, so crawl tests never touch the internet.
-// It records every path requested, so tests can assert what the crawler actually fetched.
+// Test-only website on 127.0.0.1 that records every path the crawler requests.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,20 +13,17 @@ pub struct TestSite {
 }
 
 impl TestSite {
-    /// Serves one HTML page per `(path, links)` pair; `links` is a space-separated list of hrefs.
-    /// Any other path answers 404.
     pub async fn start<P, L>(pages: impl IntoIterator<Item = (P, L)>) -> Self
     where
         P: Into<String>,
         L: Into<String>,
     {
-        Self::start_with_delay(pages, Duration::ZERO).await
+        Self::start_with_response_delay(pages, Duration::ZERO).await
     }
 
-    /// Like `start`, but every response waits `delay` first, so a crawl stays in progress long enough to observe.
-    pub async fn start_with_delay<P, L>(
+    pub async fn start_with_response_delay<P, L>(
         pages: impl IntoIterator<Item = (P, L)>,
-        delay: Duration,
+        response_delay: Duration,
     ) -> Self
     where
         P: Into<String>,
@@ -36,7 +32,7 @@ impl TestSite {
         let pages: Arc<HashMap<String, String>> = Arc::new(
             pages
                 .into_iter()
-                .map(|(path, links)| (path.into(), page_linking_to(&links.into())))
+                .map(|(path, hrefs)| (path.into(), page_linking_to(&hrefs.into())))
                 .collect(),
         );
         let requested = Arc::new(Mutex::new(Vec::new()));
@@ -48,7 +44,7 @@ impl TestSite {
                 let requested = requested.clone();
                 async move {
                     requested.lock().unwrap().push(uri.path().to_owned());
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(response_delay).await;
                     match pages.get(uri.path()) {
                         Some(body) => Html(body.clone()).into_response(),
                         None => StatusCode::NOT_FOUND.into_response(),
@@ -71,8 +67,7 @@ impl TestSite {
         format!("{}{}", self.base_url, path)
     }
 
-    /// Page paths requested so far, not counting robots.txt.
-    pub fn requested(&self) -> Vec<String> {
+    pub fn requested_pages(&self) -> Vec<String> {
         self.requested
             .lock()
             .unwrap()
@@ -83,7 +78,6 @@ impl TestSite {
     }
 }
 
-/// A URL nothing listens on: bind a free port, then release it.
 pub async fn unreachable_url() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -91,8 +85,8 @@ pub async fn unreachable_url() -> String {
     format!("http://{address}/")
 }
 
-fn page_linking_to(links: &str) -> String {
-    let anchors: String = links
+fn page_linking_to(space_separated_hrefs: &str) -> String {
+    let anchors: String = space_separated_hrefs
         .split_whitespace()
         .map(|href| format!(r#"<a href="{href}">{href}</a>"#))
         .collect();
