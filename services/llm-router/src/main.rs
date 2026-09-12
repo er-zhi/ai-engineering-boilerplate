@@ -26,8 +26,8 @@ use connectrpc::{
 };
 use sea_orm::Database;
 
-use crate::adapters::openai_compatible::OpenAiCompatible;
-use crate::log::{PgRequestLog, RequestLog, payload_cutoff};
+use crate::adapters::openai_compatible::{KeyCheck, OpenAiCompatible};
+use crate::log::{PgRequestLog, RequestLog};
 use crate::service::Router;
 use crate::tiers::Tiers;
 use crate::wire::tier_contracts;
@@ -70,25 +70,29 @@ async fn prune_payloads_periodically(log: impl RequestLog) {
     let mut interval = tokio::time::interval(PAYLOAD_CLEANUP_INTERVAL);
     loop {
         interval.tick().await;
-        match log
-            .drop_payloads_before(payload_cutoff(chrono::Utc::now()))
-            .await
-        {
-            Ok(removed) if removed > 0 => println!("pruned {removed} expired llm request payloads"),
+        match log.drop_expired_payloads(chrono::Utc::now()).await {
+            Ok(removed) if removed > 0 => {
+                tracing::info!("pruned {removed} expired llm request payloads")
+            }
             Ok(_) => {}
-            Err(error) => eprintln!("could not prune expired llm request payloads: {error}"),
+            Err(error) => tracing::error!("could not prune expired llm request payloads: {error}"),
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    common::logging::init();
     let base_url = std::env::var("OPENROUTER_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_owned());
     let api_key = env("OPENROUTER_API_KEY")?;
     let provider = OpenAiCompatible::new(base_url, api_key, REQUEST_TIMEOUT)?;
-    if let Err(error) = provider.verify_key().await {
-        return Err(error.into());
+    match provider.verify_key().await {
+        Ok(()) => {}
+        Err(KeyCheck::Rejected) => return Err("the provider rejected OPENROUTER_API_KEY".into()),
+        Err(KeyCheck::Unreachable(reason)) => {
+            tracing::warn!("could not verify OPENROUTER_API_KEY at startup, continuing: {reason}");
+        }
     }
 
     let tiers = Tiers::from_vars(|name| std::env::var(name).ok())?;
@@ -113,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback_service(connect.into_axum_service());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8083").await?;
-    println!("llm-router listening on 0.0.0.0:8083");
+    tracing::info!("llm-router listening on 0.0.0.0:8083");
     axum::serve(listener, app).await?;
 
     Ok(())

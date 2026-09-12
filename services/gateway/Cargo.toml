@@ -10,3 +10,4 @@ connectrpc = { workspace = true, features = ["axum", "client"] }
 axum = { workspace = true }
 hyper-util = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }

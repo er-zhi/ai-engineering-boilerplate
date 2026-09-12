@@ -10,6 +10,14 @@ use crate::provider::{CallError, Completion, Prompt, Provider};
 
 const COMPLETIONS_PATH: &str = "/chat/completions";
 const KEY_PATH: &str = "/key";
+const TOO_MANY_REQUESTS: u16 = 429;
+const FIRST_SERVER_FAULT: u16 = 500;
+
+#[derive(Debug, PartialEq)]
+pub enum KeyCheck {
+    Rejected,
+    Unreachable(String),
+}
 
 pub struct OpenAiCompatible {
     http: reqwest::Client,
@@ -30,17 +38,17 @@ impl OpenAiCompatible {
         })
     }
 
-    pub async fn verify_key(&self) -> Result<(), String> {
+    pub async fn verify_key(&self) -> Result<(), KeyCheck> {
         let response = self
             .http
             .get(format!("{}{KEY_PATH}", self.base_url))
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|error| format!("could not reach the provider to verify the key: {error}"))?;
+            .map_err(|error| KeyCheck::Unreachable(error.to_string()))?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("the provider rejected this API key".to_owned());
+            return Err(KeyCheck::Rejected);
         }
         Ok(())
     }
@@ -75,9 +83,6 @@ impl Provider for OpenAiCompatible {
     }
 }
 
-const TOO_MANY_REQUESTS: u16 = 429;
-const FIRST_SERVER_FAULT: u16 = 500;
-
 pub fn request_body(model: &str, prompt: &Prompt) -> Value {
     let mut messages = Vec::new();
     if !prompt.system.is_empty() {
@@ -88,12 +93,12 @@ pub fn request_body(model: &str, prompt: &Prompt) -> Value {
     let mut body = json!({"model": model, "messages": messages});
     apply_sampling(&mut body, &prompt.sampling);
     if !reasoning_enabled(prompt.tier) {
-        body["reasoning"] = json!({"enabled": false});
+        body["reasoning"] = json!({"effort": "none"});
     }
     body
 }
 
-pub fn read_completion(body: &Value) -> Result<Completion, CallError> {
+fn read_completion(body: &Value) -> Result<Completion, CallError> {
     let Some(choice) = body["choices"].get(0) else {
         let detail = body["error"]["message"]
             .as_str()
@@ -103,7 +108,8 @@ pub fn read_completion(body: &Value) -> Result<Completion, CallError> {
 
     let content = choice["message"]["content"].as_str().unwrap_or_default();
     if content.is_empty() {
-        let reasoning_tokens = nested_count(body, "completion_tokens_details", "reasoning_tokens");
+        let reasoning_tokens =
+            as_count(&body["usage"]["completion_tokens_details"]["reasoning_tokens"]);
         return Err(if reasoning_tokens > 0 {
             CallError::Final(format!(
                 "the model spent {reasoning_tokens} completion tokens on reasoning and returned no content"
@@ -132,7 +138,7 @@ fn finish_reason_from(reported: &str) -> FinishReason {
     }
 }
 
-pub fn error_for_status(status: u16) -> CallError {
+fn error_for_status(status: u16) -> CallError {
     let message = format!("the provider answered {status}");
     if status == TOO_MANY_REQUESTS || status >= FIRST_SERVER_FAULT {
         CallError::WorthRetrying(message)
@@ -142,14 +148,14 @@ pub fn error_for_status(status: u16) -> CallError {
 }
 
 fn apply_sampling(body: &mut Value, sampling: &Sampling) {
-    set(body, "temperature", sampling.temperature);
-    set(body, "top_p", sampling.top_p);
-    set(body, "max_tokens", sampling.max_tokens);
-    set(body, "frequency_penalty", sampling.frequency_penalty);
-    set(body, "presence_penalty", sampling.presence_penalty);
-    set(body, "seed", sampling.seed);
-    set(body, "logprobs", sampling.logprobs);
-    set(body, "top_logprobs", sampling.top_logprobs);
+    set_if_present(body, "temperature", sampling.temperature);
+    set_if_present(body, "top_p", sampling.top_p);
+    set_if_present(body, "max_tokens", sampling.max_tokens);
+    set_if_present(body, "frequency_penalty", sampling.frequency_penalty);
+    set_if_present(body, "presence_penalty", sampling.presence_penalty);
+    set_if_present(body, "seed", sampling.seed);
+    set_if_present(body, "logprobs", sampling.logprobs);
+    set_if_present(body, "top_logprobs", sampling.top_logprobs);
 
     if !sampling.stop.is_empty() {
         body["stop"] = json!(sampling.stop);
@@ -167,7 +173,7 @@ fn apply_sampling(body: &mut Value, sampling: &Sampling) {
     }
 }
 
-fn set(body: &mut Value, field: &str, value: Option<impl Into<Value>>) {
+fn set_if_present(body: &mut Value, field: &str, value: Option<impl Into<Value>>) {
     if let Some(value) = value {
         body[field] = value.into();
     }
@@ -175,10 +181,6 @@ fn set(body: &mut Value, field: &str, value: Option<impl Into<Value>>) {
 
 fn usage_count(body: &Value, field: &str) -> i32 {
     as_count(&body["usage"][field])
-}
-
-fn nested_count(body: &Value, group: &str, field: &str) -> i32 {
-    as_count(&body["usage"][group][field])
 }
 
 fn as_count(value: &Value) -> i32 {
@@ -232,7 +234,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].authorization, format!("Bearer {TEST_KEY}"));
         assert_eq!(seen[0].body["model"], json!("deepseek/deepseek-v4-flash"));
-        assert_eq!(seen[0].body["reasoning"]["enabled"], json!(false));
+        assert_eq!(seen[0].body["reasoning"]["effort"], json!("none"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -240,9 +242,7 @@ mod tests {
         let stub = TestProvider::answering_key(StatusCode::UNAUTHORIZED).await;
         let adapter = adapter_for(&stub, PATIENT_ENOUGH).await;
 
-        let error = adapter.verify_key().await.unwrap_err();
-
-        assert!(error.contains("key"), "{error}");
+        assert_eq!(adapter.verify_key().await, Err(KeyCheck::Rejected));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -324,7 +324,7 @@ mod tests {
     fn cheap_tiers_turn_reasoning_off() {
         let body = request_body("deepseek/deepseek-v4-flash", &prompt(QualityTier::Low));
 
-        assert_eq!(body["reasoning"]["enabled"], json!(false));
+        assert_eq!(body["reasoning"]["effort"], json!("none"));
         assert_eq!(body["model"], json!("deepseek/deepseek-v4-flash"));
         assert_eq!(body["messages"][0]["role"], json!("system"));
         assert_eq!(body["messages"][1]["content"], json!("https://example.com"));

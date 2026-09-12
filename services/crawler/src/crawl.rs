@@ -50,7 +50,7 @@ pub async fn crawl(
     let mut pages = website.subscribe(0);
 
     let mut any_fetched = false;
-    let mut handle = |page: Page| {
+    let mut count_fetched_page = |page: Page| {
         if page.status_code.is_success() {
             any_fetched = true;
             if scope.counts(page.get_url()) {
@@ -69,7 +69,7 @@ pub async fn crawl(
         tokio::select! {
             () = &mut crawling => break,
             received = pages.recv() => match received {
-                Ok(page) => handle(page),
+                Ok(page) => count_fetched_page(page),
                 Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => {
                     crawling.as_mut().await;
@@ -78,7 +78,7 @@ pub async fn crawl(
             },
         }
     }
-    drain_pages_sent_before_the_crawl_returned(&mut pages, &mut handle);
+    drain_pages_sent_before_the_crawl_returned(&mut pages, &mut count_fetched_page);
 
     if any_fetched {
         Ok(())
@@ -89,11 +89,11 @@ pub async fn crawl(
 
 fn drain_pages_sent_before_the_crawl_returned(
     pages: &mut Receiver<Page>,
-    mut handle: impl FnMut(Page),
+    mut count_fetched_page: impl FnMut(Page),
 ) {
     loop {
         match pages.try_recv() {
-            Ok(page) => handle(page),
+            Ok(page) => count_fetched_page(page),
             Err(TryRecvError::Lagged(_)) => {}
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }

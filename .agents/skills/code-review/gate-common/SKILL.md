@@ -18,7 +18,7 @@ The rules — where shared code goes, the type chain, proto reuse, and the `Cach
 | Copied field block in a new proto | `import` the existing message |
 | Same struct defined in two services | Move to `common/` or route via proto |
 | Service importing a sibling's module | gRPC + `common/` |
-| Test setup copy-pasted across services | Extract to `common/test/` |
+| Test setup copy-pasted across services | Extract to `common/src/test_db.rs` behind the `test-support` feature |
 
 ## Example
 

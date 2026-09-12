@@ -1,74 +1,226 @@
-// In-memory crawl jobs: registers them, runs them, and keeps their status and page counts current.
+// Crawl jobs: rows in crawler.crawl_jobs, run under a concurrency cap, with page counts kept current as pages are stored.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use chrono::Utc;
 use common::proto::crawler::v1::CrawlStatus;
-use tokio::sync::mpsc;
+use sea_orm::ActiveValue::Set;
+use sea_orm::sea_query::{Expr, ExprTrait};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::crawl::{self, CountedPage, Limits, Unreachable};
+use crate::entity::crawl_job::{self, Status};
 use crate::scope::Scope;
 use crate::store::PageStore;
 
-#[derive(Clone, Debug)]
+const JOB_ID_PREFIX: &str = "job-";
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CrawlJob {
+    pub id: i64,
     pub base_url: String,
     pub status: CrawlStatus,
     pub pages_crawled: u32,
     pub pages_skipped: u32,
 }
 
-#[derive(Clone)]
-pub struct Jobs<S> {
-    jobs: Arc<Mutex<HashMap<String, CrawlJob>>>,
-    next_id: Arc<AtomicU64>,
-    store: S,
+impl CrawlJob {
+    pub fn public_id(&self) -> String {
+        format!("{JOB_ID_PREFIX}{}", self.id)
+    }
 }
 
-impl<S: PageStore> Jobs<S> {
-    pub fn new(store: S) -> Self {
+pub fn parse_job_id(public_id: &str) -> Option<i64> {
+    public_id.strip_prefix(JOB_ID_PREFIX)?.parse().ok()
+}
+
+pub trait JobStore: Clone + Send + Sync + 'static {
+    fn create(
+        &self,
+        base_url: &str,
+        idempotency_key: Option<&str>,
+    ) -> impl Future<Output = Result<CrawlJob, DbErr>> + Send;
+    fn find_by_key(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<CrawlJob>, DbErr>> + Send;
+    fn get(&self, id: i64) -> impl Future<Output = Result<Option<CrawlJob>, DbErr>> + Send;
+    fn set_status(
+        &self,
+        id: i64,
+        status: CrawlStatus,
+    ) -> impl Future<Output = Result<(), DbErr>> + Send;
+    fn add_crawled_page(&self, id: i64) -> impl Future<Output = Result<(), DbErr>> + Send;
+    fn fail_unfinished(&self) -> impl Future<Output = Result<u64, DbErr>> + Send;
+}
+
+#[derive(Clone)]
+pub struct PgJobs {
+    db: DatabaseConnection,
+}
+
+impl PgJobs {
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self { db }
+    }
+}
+
+fn job_from(row: crawl_job::Model) -> CrawlJob {
+    CrawlJob {
+        id: row.id,
+        base_url: row.base_url,
+        status: row.status.into(),
+        pages_crawled: u32::try_from(row.pages_crawled).unwrap_or_default(),
+        pages_skipped: u32::try_from(row.pages_skipped).unwrap_or_default(),
+    }
+}
+
+impl JobStore for PgJobs {
+    async fn create(
+        &self,
+        base_url: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<CrawlJob, DbErr> {
+        let now = Utc::now();
+        let row = crawl_job::ActiveModel {
+            base_url: Set(base_url.to_owned()),
+            status: Set(Status::Queued),
+            pages_crawled: Set(0),
+            pages_skipped: Set(0),
+            idempotency_key: Set(idempotency_key.map(str::to_owned)),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?;
+        Ok(job_from(row))
+    }
+
+    async fn find_by_key(&self, key: &str) -> Result<Option<CrawlJob>, DbErr> {
+        crawl_job::Entity::find()
+            .filter(crawl_job::Column::IdempotencyKey.eq(key))
+            .one(&self.db)
+            .await
+            .map(|row| row.map(job_from))
+    }
+
+    async fn get(&self, id: i64) -> Result<Option<CrawlJob>, DbErr> {
+        crawl_job::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .map(|row| row.map(job_from))
+    }
+
+    async fn set_status(&self, id: i64, status: CrawlStatus) -> Result<(), DbErr> {
+        crawl_job::Entity::update_many()
+            .col_expr(crawl_job::Column::Status, Expr::value(Status::from(status)))
+            .col_expr(crawl_job::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(crawl_job::Column::Id.eq(id))
+            .exec(&self.db)
+            .await
+            .map(|_| ())
+    }
+
+    async fn add_crawled_page(&self, id: i64) -> Result<(), DbErr> {
+        crawl_job::Entity::update_many()
+            .col_expr(
+                crawl_job::Column::PagesCrawled,
+                Expr::col(crawl_job::Column::PagesCrawled).add(1),
+            )
+            .col_expr(crawl_job::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(crawl_job::Column::Id.eq(id))
+            .exec(&self.db)
+            .await
+            .map(|_| ())
+    }
+
+    async fn fail_unfinished(&self) -> Result<u64, DbErr> {
+        crawl_job::Entity::update_many()
+            .col_expr(crawl_job::Column::Status, Expr::value(Status::Failed))
+            .col_expr(crawl_job::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(crawl_job::Column::Status.is_in([Status::Queued, Status::Running]))
+            .exec(&self.db)
+            .await
+            .map(|updated| updated.rows_affected)
+    }
+}
+
+#[derive(Clone)]
+pub struct Jobs<S, J> {
+    pages: S,
+    jobs: J,
+    running: Arc<Semaphore>,
+}
+
+impl<S: PageStore, J: JobStore> Jobs<S, J> {
+    pub fn new(pages: S, jobs: J, max_concurrent_crawls: usize) -> Self {
         Self {
-            jobs: Arc::default(),
-            next_id: Arc::default(),
-            store,
+            pages,
+            jobs,
+            running: Arc::new(Semaphore::new(max_concurrent_crawls)),
         }
     }
 
-    pub fn create(&self, base_url: &str) -> String {
-        let job_id = format!("job-{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
-        let job = CrawlJob {
-            base_url: base_url.to_owned(),
-            status: CrawlStatus::Queued,
-            pages_crawled: 0,
-            pages_skipped: 0,
-        };
-        self.jobs.lock().unwrap().insert(job_id.clone(), job);
-        job_id
+    pub async fn create(
+        &self,
+        base_url: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<(CrawlJob, bool), DbErr> {
+        if let Some(key) = idempotency_key
+            && let Some(existing) = self.jobs.find_by_key(key).await?
+        {
+            return Ok((existing, false));
+        }
+        match self.jobs.create(base_url, idempotency_key).await {
+            Ok(job) => Ok((job, true)),
+            Err(insert_failed) => match idempotency_key {
+                Some(key) => match self.jobs.find_by_key(key).await? {
+                    Some(raced_in_first) => Ok((raced_in_first, false)),
+                    None => Err(insert_failed),
+                },
+                None => Err(insert_failed),
+            },
+        }
     }
 
-    pub fn get(&self, job_id: &str) -> Option<CrawlJob> {
-        self.jobs.lock().unwrap().get(job_id).cloned()
+    pub async fn get(&self, id: i64) -> Result<Option<CrawlJob>, DbErr> {
+        self.jobs.get(id).await
     }
 
-    pub async fn run(&self, job_id: &str, base_url: &str, scope: Scope, limits: Limits) {
-        self.update(job_id, |job| job.status = CrawlStatus::Running);
+    pub async fn fail_unfinished(&self) -> Result<u64, DbErr> {
+        self.jobs.fail_unfinished().await
+    }
 
-        let (counted, mut to_store) = mpsc::unbounded_channel::<CountedPage>();
+    pub async fn run(&self, id: i64, base_url: &str, scope: Scope, limits: Limits) {
+        let _permit = self
+            .running
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the crawl semaphore is never closed");
+        self.set_status(id, CrawlStatus::Running).await;
+
+        let (counted, mut to_store) = mpsc::channel::<CountedPage>(limits.max_pages as usize);
         let crawling = async move {
             crawl::crawl(base_url, &scope, limits, move |page| {
-                counted
-                    .send(page)
-                    .expect("the store loop runs until the crawl ends");
+                if let Err(error) = counted.try_send(page) {
+                    tracing::warn!(job = id, "dropped a counted page: {error}");
+                }
             })
             .await
         };
         let storing = async {
             while let Some(page) = to_store.recv().await {
                 let url = page.url.clone();
-                match self.store.save(page).await {
-                    Ok(()) => self.update(job_id, |job| job.pages_crawled += 1),
-                    Err(error) => eprintln!("crawler: could not store {url}: {error}"),
+                match self.pages.save(page).await {
+                    Ok(()) => {
+                        if let Err(error) = self.jobs.add_crawled_page(id).await {
+                            tracing::error!(job = id, "could not count a stored page: {error}");
+                        }
+                    }
+                    Err(error) => tracing::error!(job = id, "could not store {url}: {error}"),
                 }
             }
         };
@@ -78,22 +230,24 @@ impl<S: PageStore> Jobs<S> {
             Ok(()) => CrawlStatus::Done,
             Err(Unreachable) => CrawlStatus::Failed,
         };
-        self.update(job_id, |job| job.status = status);
+        self.set_status(id, status).await;
     }
 
-    fn update(&self, job_id: &str, change: impl FnOnce(&mut CrawlJob)) {
-        if let Some(job) = self.jobs.lock().unwrap().get_mut(job_id) {
-            change(job);
+    async fn set_status(&self, id: i64, status: CrawlStatus) {
+        if let Err(error) = self.jobs.set_status(id, status).await {
+            tracing::error!(job = id, "could not mark the job {status:?}: {error}");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use common::proto::crawler::v1::CrawlScope;
-    use sea_orm::{DbErr, EntityTrait};
+    use sea_orm::EntityTrait;
 
     use super::*;
     use crate::crawl::CountedPage;
@@ -106,6 +260,7 @@ mod tests {
         max_pages: 50,
         request_timeout: Duration::from_secs(5),
     };
+    const ONE_AT_A_TIME: usize = 1;
 
     #[derive(Clone, Default)]
     struct MemoryPages(Arc<Mutex<Vec<String>>>);
@@ -126,23 +281,120 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_jobs_are_queued_under_distinct_ids() {
-        let jobs = Jobs::new(MemoryPages::default());
+    type KeyedJob = (CrawlJob, Option<String>);
 
-        let first = jobs.create("https://a.example");
-        let second = jobs.create("https://b.example");
+    #[derive(Clone, Default)]
+    struct MemoryJobs {
+        rows: Arc<Mutex<HashMap<i64, KeyedJob>>>,
+    }
 
-        assert_ne!(first, second);
-        let job = jobs.get(&second).unwrap();
-        assert_eq!(job.status, CrawlStatus::Queued);
-        assert_eq!(job.base_url, "https://b.example");
-        assert_eq!(job.pages_crawled, 0);
+    impl JobStore for MemoryJobs {
+        async fn create(&self, base_url: &str, key: Option<&str>) -> Result<CrawlJob, DbErr> {
+            let mut rows = self.rows.lock().unwrap();
+            if key.is_some() && rows.values().any(|(_, k)| k.as_deref() == key) {
+                return Err(DbErr::Custom("duplicate idempotency key".into()));
+            }
+            let job = CrawlJob {
+                id: rows.len() as i64 + 1,
+                base_url: base_url.to_owned(),
+                status: CrawlStatus::Queued,
+                pages_crawled: 0,
+                pages_skipped: 0,
+            };
+            rows.insert(job.id, (job.clone(), key.map(str::to_owned)));
+            Ok(job)
+        }
+
+        async fn find_by_key(&self, key: &str) -> Result<Option<CrawlJob>, DbErr> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .find(|(_, k)| k.as_deref() == Some(key))
+                .map(|(job, _)| job.clone()))
+        }
+
+        async fn get(&self, id: i64) -> Result<Option<CrawlJob>, DbErr> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|(job, _)| job.clone()))
+        }
+
+        async fn set_status(&self, id: i64, status: CrawlStatus) -> Result<(), DbErr> {
+            if let Some((job, _)) = self.rows.lock().unwrap().get_mut(&id) {
+                job.status = status;
+            }
+            Ok(())
+        }
+
+        async fn add_crawled_page(&self, id: i64) -> Result<(), DbErr> {
+            if let Some((job, _)) = self.rows.lock().unwrap().get_mut(&id) {
+                job.pages_crawled += 1;
+            }
+            Ok(())
+        }
+
+        async fn fail_unfinished(&self) -> Result<u64, DbErr> {
+            Ok(0)
+        }
+    }
+
+    fn in_memory(pages: impl PageStore) -> Jobs<impl PageStore, MemoryJobs> {
+        Jobs::new(pages, MemoryJobs::default(), ONE_AT_A_TIME)
+    }
+
+    async fn job(jobs: &Jobs<impl PageStore, impl JobStore>, id: i64) -> CrawlJob {
+        jobs.get(id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_jobs_are_queued_under_distinct_ids() {
+        let jobs = in_memory(MemoryPages::default());
+
+        let (first, _) = jobs.create("https://a.example", None).await.unwrap();
+        let (second, _) = jobs.create("https://b.example", None).await.unwrap();
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.public_id(), format!("job-{}", second.id));
+        let found = job(&jobs, second.id).await;
+        assert_eq!(found.status, CrawlStatus::Queued);
+        assert_eq!(found.base_url, "https://b.example");
+        assert_eq!(found.pages_crawled, 0);
+    }
+
+    #[tokio::test]
+    async fn the_same_idempotency_key_returns_the_first_job_instead_of_a_second_crawl() {
+        let jobs = in_memory(MemoryPages::default());
+
+        let (first, created) = jobs.create("https://a.example", Some("k1")).await.unwrap();
+        let (again, created_again) = jobs.create("https://a.example", Some("k1")).await.unwrap();
+
+        assert!(created);
+        assert!(!created_again);
+        assert_eq!(again, first);
     }
 
     #[test]
-    fn unknown_job_is_absent() {
-        assert!(Jobs::new(MemoryPages::default()).get("job-404").is_none());
+    fn public_ids_round_trip_and_garbage_does_not_parse() {
+        assert_eq!(parse_job_id("job-42"), Some(42));
+        for garbage in ["42", "job-", "job-x", "", "job-1-2"] {
+            assert_eq!(parse_job_id(garbage), None, "{garbage}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_job_is_absent() {
+        assert!(
+            in_memory(MemoryPages::default())
+                .get(404)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -154,32 +406,32 @@ mod tests {
             ("/blog/x", ""),
         ])
         .await;
-        let jobs = Jobs::new(MemoryPages::default());
-        let id = jobs.create(&site.url("/"));
+        let jobs = in_memory(MemoryPages::default());
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
         let scope = Scope::new(&CrawlScope {
             include_patterns: vec!["/docs/*".into()],
             ..Default::default()
         });
 
-        jobs.run(&id, &site.url("/"), scope, LIMITS).await;
+        jobs.run(created.id, &site.url("/"), scope, LIMITS).await;
 
-        let job = jobs.get(&id).unwrap();
-        assert_eq!(job.status, CrawlStatus::Done);
-        assert_eq!(job.pages_crawled, 2);
+        let finished = job(&jobs, created.id).await;
+        assert_eq!(finished.status, CrawlStatus::Done);
+        assert_eq!(finished.pages_crawled, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unreachable_site_fails_the_job() {
         let url = unreachable_url().await;
-        let jobs = Jobs::new(MemoryPages::default());
-        let id = jobs.create(&url);
+        let jobs = in_memory(MemoryPages::default());
+        let (created, _) = jobs.create(&url, None).await.unwrap();
 
-        jobs.run(&id, &url, Scope::new(&CrawlScope::default()), LIMITS)
+        jobs.run(created.id, &url, Scope::new(&CrawlScope::default()), LIMITS)
             .await;
 
-        let job = jobs.get(&id).unwrap();
-        assert_eq!(job.status, CrawlStatus::Failed);
-        assert_eq!(job.pages_crawled, 0);
+        let finished = job(&jobs, created.id).await;
+        assert_eq!(finished.status, CrawlStatus::Failed);
+        assert_eq!(finished.pages_crawled, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -197,21 +449,21 @@ mod tests {
             slow_enough_to_see_the_job_mid_crawl,
         )
         .await;
-        let jobs = Jobs::new(MemoryPages::default());
-        let id = jobs.create(&site.url("/"));
+        let jobs = in_memory(MemoryPages::default());
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
 
         let crawl = tokio::spawn({
-            let (jobs, id, url) = (jobs.clone(), id.clone(), site.url("/"));
+            let (jobs, id, url) = (jobs.clone(), created.id, site.url("/"));
             async move {
-                jobs.run(&id, &url, Scope::new(&CrawlScope::default()), LIMITS)
+                jobs.run(id, &url, Scope::new(&CrawlScope::default()), LIMITS)
                     .await
             }
         });
 
         let mut seen_mid_crawl = false;
         while !crawl.is_finished() {
-            let job = jobs.get(&id).unwrap();
-            if job.status == CrawlStatus::Running && (1..6).contains(&job.pages_crawled) {
+            let current = job(&jobs, created.id).await;
+            if current.status == CrawlStatus::Running && (1..6).contains(&current.pages_crawled) {
                 seen_mid_crawl = true;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -222,9 +474,49 @@ mod tests {
             seen_mid_crawl,
             "never saw RUNNING with a partial page count"
         );
-        let job = jobs.get(&id).unwrap();
-        assert_eq!(job.status, CrawlStatus::Done);
-        assert_eq!(job.pages_crawled, 6);
+        let finished = job(&jobs, created.id).await;
+        assert_eq!(finished.status, CrawlStatus::Done);
+        assert_eq!(finished.pages_crawled, 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_crawl_waits_in_the_queue_while_the_cap_is_taken() {
+        let slow = Duration::from_millis(200);
+        let site = TestSite::start_with_response_delay([("/", "/p/1"), ("/p/1", "")], slow).await;
+        let jobs = in_memory(MemoryPages::default());
+        let (first, _) = jobs.create(&site.url("/"), None).await.unwrap();
+        let (second, _) = jobs.create(&site.url("/"), None).await.unwrap();
+
+        let both = tokio::spawn({
+            let (jobs, url) = (jobs.clone(), site.url("/"));
+            async move {
+                tokio::join!(
+                    jobs.run(first.id, &url, Scope::new(&CrawlScope::default()), LIMITS),
+                    jobs.run(second.id, &url, Scope::new(&CrawlScope::default()), LIMITS),
+                )
+            }
+        });
+
+        let mut saw_one_running_one_queued = false;
+        while !both.is_finished() {
+            let statuses = (
+                job(&jobs, first.id).await.status,
+                job(&jobs, second.id).await.status,
+            );
+            if matches!(
+                statuses,
+                (CrawlStatus::Running, CrawlStatus::Queued)
+                    | (CrawlStatus::Queued, CrawlStatus::Running)
+            ) {
+                saw_one_running_one_queued = true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        both.await.unwrap();
+
+        assert!(saw_one_running_one_queued, "both crawls ran at once");
+        assert_eq!(job(&jobs, first.id).await.status, CrawlStatus::Done);
+        assert_eq!(job(&jobs, second.id).await.status, CrawlStatus::Done);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -237,53 +529,57 @@ mod tests {
         ])
         .await;
         let store = MemoryPages::default();
-        let jobs = Jobs::new(store.clone());
-        let id = jobs.create(&site.url("/"));
+        let jobs = in_memory(store.clone());
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
         let scope = Scope::new(&CrawlScope {
             include_patterns: vec!["/docs/*".into()],
             ..Default::default()
         });
 
-        jobs.run(&id, &site.url("/"), scope, LIMITS).await;
+        jobs.run(created.id, &site.url("/"), scope, LIMITS).await;
 
         let mut saved = store.0.lock().unwrap().clone();
         saved.sort();
         assert_eq!(saved, [site.url("/docs/a"), site.url("/docs/b")]);
-        assert_eq!(jobs.get(&id).unwrap().pages_crawled, 2);
+        assert_eq!(job(&jobs, created.id).await.pages_crawled, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pages_that_fail_to_store_are_not_counted_and_the_job_still_finishes() {
         let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
-        let jobs = Jobs::new(FailingPages);
-        let id = jobs.create(&site.url("/"));
+        let jobs = in_memory(FailingPages);
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
 
         jobs.run(
-            &id,
+            created.id,
             &site.url("/"),
             Scope::new(&CrawlScope::default()),
             LIMITS,
         )
         .await;
 
-        let job = jobs.get(&id).unwrap();
-        assert_eq!(job.status, CrawlStatus::Done);
-        assert_eq!(job.pages_crawled, 0);
+        let finished = job(&jobs, created.id).await;
+        assert_eq!(finished.status, CrawlStatus::Done);
+        assert_eq!(finished.pages_crawled, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn crawl_stores_exactly_the_in_scope_pages_in_postgres() {
+    async fn crawl_stores_the_in_scope_pages_and_the_job_row_in_postgres() {
         let test = test_db::start().await;
         let site =
             TestSite::start([("/", "/docs/a /blog/x"), ("/docs/a", ""), ("/blog/x", "")]).await;
-        let jobs = Jobs::new(PgPages::new(test.db.clone()));
-        let id = jobs.create(&site.url("/"));
+        let jobs = Jobs::new(
+            PgPages::new(test.db.clone()),
+            PgJobs::new(test.db.clone()),
+            ONE_AT_A_TIME,
+        );
+        let (created, _) = jobs.create(&site.url("/"), Some("k1")).await.unwrap();
         let scope = Scope::new(&CrawlScope {
             include_patterns: vec!["/docs/*".into()],
             ..Default::default()
         });
 
-        jobs.run(&id, &site.url("/"), scope, LIMITS).await;
+        jobs.run(created.id, &site.url("/"), scope, LIMITS).await;
 
         let urls: Vec<String> = page::Entity::find()
             .all(&test.db)
@@ -293,6 +589,32 @@ mod tests {
             .map(|row| row.url)
             .collect();
         assert_eq!(urls, [site.url("/docs/a")]);
-        assert_eq!(jobs.get(&id).unwrap().pages_crawled, 1);
+        let finished = job(&jobs, created.id).await;
+        assert_eq!(finished.status, CrawlStatus::Done);
+        assert_eq!(finished.pages_crawled, 1);
+        let (same, created_again) = jobs.create(&site.url("/"), Some("k1")).await.unwrap();
+        assert!(!created_again);
+        assert_eq!(same.id, created.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jobs_left_unfinished_by_a_restart_are_failed_on_startup() {
+        let test = test_db::start().await;
+        let jobs = Jobs::new(
+            PgPages::new(test.db.clone()),
+            PgJobs::new(test.db.clone()),
+            ONE_AT_A_TIME,
+        );
+        let (queued, _) = jobs.create("https://a.example", None).await.unwrap();
+        let (running, _) = jobs.create("https://b.example", None).await.unwrap();
+        jobs.set_status(running.id, CrawlStatus::Running).await;
+        let (done, _) = jobs.create("https://c.example", None).await.unwrap();
+        jobs.set_status(done.id, CrawlStatus::Done).await;
+
+        assert_eq!(jobs.fail_unfinished().await.unwrap(), 2);
+
+        assert_eq!(job(&jobs, queued.id).await.status, CrawlStatus::Failed);
+        assert_eq!(job(&jobs, running.id).await.status, CrawlStatus::Failed);
+        assert_eq!(job(&jobs, done.id).await.status, CrawlStatus::Done);
     }
 }

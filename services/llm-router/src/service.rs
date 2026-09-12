@@ -15,6 +15,11 @@ use crate::router;
 use crate::tiers::Tiers;
 use crate::wire::{known_tier, response_from, sampling_from};
 
+const NO_MODEL_ANSWERED: &str =
+    "no model on this tier answered; the request log holds the provider's reply";
+const PROVIDER_REFUSED: &str =
+    "the provider refused this request; the request log holds the provider's reply";
+
 pub struct Router<P: Provider, L: RequestLog> {
     provider: P,
     log: L,
@@ -98,9 +103,14 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
                 })
                 .await;
 
+                tracing::warn!(
+                    tier = ?tier,
+                    model = failed.model_used,
+                    "no answer: {message}"
+                );
                 Err(match failed.error {
-                    CallError::WorthRetrying(message) => ConnectError::unavailable(message),
-                    CallError::Final(message) => ConnectError::internal(message),
+                    CallError::WorthRetrying(_) => ConnectError::unavailable(NO_MODEL_ANSWERED),
+                    CallError::Final(_) => ConnectError::internal(PROVIDER_REFUSED),
                 })
             }
         }
@@ -108,7 +118,7 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
 
     async fn record(&self, attempt: Attempt) {
         if let Err(error) = self.log.record(attempt).await {
-            eprintln!("could not record an llm call: {error}");
+            tracing::error!("could not record an llm call: {error}");
         }
     }
 }
@@ -178,7 +188,7 @@ mod tests {
             Ok(())
         }
 
-        async fn drop_payloads_before(&self, _cutoff: DateTime<Utc>) -> Result<u64, DbErr> {
+        async fn drop_expired_payloads(&self, _now: DateTime<Utc>) -> Result<u64, DbErr> {
             Ok(0)
         }
     }
@@ -211,7 +221,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_answered_call_comes_back_with_its_model_and_is_recorded_with_both_payloads() {
         let provider = Scripted::new(vec![answered()]);
         let log = Recorded::new();
@@ -242,7 +252,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_call_no_model_could_answer_is_reported_and_recorded_as_failed() {
         let provider = Scripted::new(vec![
             Err(CallError::WorthRetrying("primary timed out".to_owned())),
@@ -256,9 +266,11 @@ mod tests {
             .await
             .unwrap_err();
 
+        let reported = format!("{error:?}");
+        assert!(reported.contains("no model"), "{reported}");
         assert!(
-            format!("{error:?}").contains("backup timed out"),
-            "{error:?}"
+            !reported.contains("backup timed out"),
+            "the provider's own words must stay in the log: {reported}"
         );
         let recorded = log.attempts.lock().unwrap();
         assert_eq!(recorded[0].outcome, Outcome::Failed);
@@ -272,7 +284,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_tier_the_router_does_not_serve_is_refused_before_any_model_is_called() {
         let provider = Scripted::new(vec![answered()]);
         let log = Recorded::new();
@@ -288,7 +300,7 @@ mod tests {
         assert_eq!(log.attempts(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_empty_prompt_is_refused_before_any_model_is_called() {
         let provider = Scripted::new(vec![answered()]);
         let log = Recorded::new();
@@ -304,7 +316,7 @@ mod tests {
         assert_eq!(log.attempts(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn asking_for_more_output_than_the_tier_allows_is_refused_with_the_limit_named() {
         let provider = Scripted::new(vec![answered()]);
         let log = Recorded::new();
@@ -335,7 +347,7 @@ mod tests {
         assert!(provider.asked().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_caller_that_names_no_output_limit_gets_the_tier_maximum() {
         let provider = Scripted::new(vec![answered()]);
         let log = Recorded::new();

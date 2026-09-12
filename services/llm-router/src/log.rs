@@ -3,13 +3,16 @@
 use chrono::{DateTime, Duration, Utc};
 use common::proto::llm_router::v1::{FinishReason, QualityTier};
 use sea_orm::ActiveValue::Set;
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
+    TransactionTrait,
+};
 use serde_json::Value;
 
 use crate::entity::request::Outcome;
 use crate::entity::{payload, request};
 
-pub const PAYLOAD_RETENTION_DAYS: i64 = 30;
+const PAYLOAD_RETENTION_DAYS: i64 = 30;
 
 pub struct Attempt {
     pub tier: QualityTier,
@@ -26,9 +29,9 @@ pub struct Attempt {
 
 pub trait RequestLog: Clone + Send + Sync + 'static {
     fn record(&self, attempt: Attempt) -> impl Future<Output = Result<(), DbErr>> + Send;
-    fn drop_payloads_before(
+    fn drop_expired_payloads(
         &self,
-        cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> impl Future<Output = Result<u64, DbErr>> + Send;
 }
 
@@ -46,19 +49,20 @@ impl PgRequestLog {
 impl RequestLog for PgRequestLog {
     async fn record(&self, attempt: Attempt) -> Result<(), DbErr> {
         let now = Utc::now();
+        let both_rows_or_neither = self.db.begin().await?;
         let statistics = request::ActiveModel {
-            tier: Set(tier_name(attempt.tier).to_owned()),
+            tier: Set(attempt.tier.into()),
             model_used: Set(attempt.model_used),
             used_backup: Set(attempt.used_backup),
             tokens_in: Set(attempt.tokens_in),
             tokens_out: Set(attempt.tokens_out),
             latency_ms: Set(attempt.latency_ms),
             outcome: Set(attempt.outcome),
-            finish_reason: Set(finish_reason_name(attempt.finish_reason).to_owned()),
+            finish_reason: Set(attempt.finish_reason.into()),
             created_at: Set(now),
             ..Default::default()
         }
-        .insert(&self.db)
+        .insert(&both_rows_or_neither)
         .await?;
 
         payload::ActiveModel {
@@ -66,44 +70,26 @@ impl RequestLog for PgRequestLog {
             sent: Set(attempt.sent),
             received: Set(attempt.received),
             created_at: Set(now),
+            expires_at: Set(payload_expiry(now)),
             ..Default::default()
         }
-        .insert(&self.db)
+        .insert(&both_rows_or_neither)
         .await?;
 
-        Ok(())
+        both_rows_or_neither.commit().await
     }
 
-    async fn drop_payloads_before(&self, cutoff: DateTime<Utc>) -> Result<u64, DbErr> {
+    async fn drop_expired_payloads(&self, now: DateTime<Utc>) -> Result<u64, DbErr> {
         payload::Entity::delete_many()
-            .filter(payload::Column::CreatedAt.lt(cutoff))
+            .filter(payload::Column::ExpiresAt.lt(now))
             .exec(&self.db)
             .await
             .map(|deleted| deleted.rows_affected)
     }
 }
 
-pub fn payload_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
-    now - Duration::days(PAYLOAD_RETENTION_DAYS)
-}
-
-pub fn tier_name(tier: QualityTier) -> &'static str {
-    match tier {
-        QualityTier::Unspecified => "unspecified",
-        QualityTier::Low => "low",
-        QualityTier::Medium => "medium",
-        QualityTier::High => "high",
-    }
-}
-
-pub fn finish_reason_name(reason: FinishReason) -> &'static str {
-    match reason {
-        FinishReason::Unspecified => "unspecified",
-        FinishReason::Stop => "stop",
-        FinishReason::Length => "length",
-        FinishReason::ContentFilter => "content_filter",
-        FinishReason::ToolCalls => "tool_calls",
-    }
+pub fn payload_expiry(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + Duration::days(PAYLOAD_RETENTION_DAYS)
 }
 
 #[cfg(test)]
@@ -111,6 +97,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::entity::request::{Finish, Tier};
     use crate::test_db;
 
     fn answered_attempt() -> Attempt {
@@ -135,8 +122,8 @@ mod tests {
             .with_timezone(&Utc);
 
         assert_eq!(
-            payload_cutoff(now).to_rfc3339(),
-            "2026-08-12T00:00:00+00:00"
+            payload_expiry(now).to_rfc3339(),
+            "2026-10-11T00:00:00+00:00"
         );
     }
 
@@ -149,13 +136,13 @@ mod tests {
 
         let rows = request::Entity::find().all(&test.db).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].tier, "low");
+        assert_eq!(rows[0].tier, Tier::Low);
         assert_eq!(rows[0].model_used, "deepseek/deepseek-v4-flash");
         assert_eq!(rows[0].tokens_in, 10);
         assert_eq!(rows[0].tokens_out, 2);
         assert_eq!(rows[0].latency_ms, 431);
         assert_eq!(rows[0].outcome, Outcome::Answered);
-        assert_eq!(rows[0].finish_reason, "stop");
+        assert_eq!(rows[0].finish_reason, Finish::Stop);
         assert!(!rows[0].used_backup);
 
         let payloads = payload::Entity::find().all(&test.db).await.unwrap();
@@ -185,7 +172,7 @@ mod tests {
 
         let rows = request::Entity::find().all(&test.db).await.unwrap();
         assert_eq!(rows[0].outcome, Outcome::Failed);
-        assert_eq!(rows[0].finish_reason, "unspecified");
+        assert_eq!(rows[0].finish_reason, Finish::Unspecified);
 
         let payloads = payload::Entity::find().all(&test.db).await.unwrap();
         assert_eq!(payloads[0].received["error"], "the provider answered 503");
@@ -203,12 +190,12 @@ mod tests {
         let payloads = payload::Entity::find().all(&test.db).await.unwrap();
         let aged: payload::ActiveModel = payload::ActiveModel {
             id: Set(payloads[0].id),
-            created_at: Set(now - Duration::days(PAYLOAD_RETENTION_DAYS + 1)),
+            expires_at: Set(now - Duration::seconds(1)),
             ..Default::default()
         };
         aged.update(&test.db).await.unwrap();
 
-        let removed = log.drop_payloads_before(payload_cutoff(now)).await.unwrap();
+        let removed = log.drop_expired_payloads(now).await.unwrap();
 
         assert_eq!(removed, 1);
         let left = payload::Entity::find().all(&test.db).await.unwrap();

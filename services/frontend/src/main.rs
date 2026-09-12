@@ -5,6 +5,7 @@ use axum::routing::get;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    common::logging::init();
     let app = axum::Router::new()
         .route(
             "/",
@@ -13,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(|| async { "OK" }));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8082").await?;
-    println!("frontend listening on 0.0.0.0:8082");
+    tracing::info!("frontend listening on 0.0.0.0:8082");
     axum::serve(listener, app).await?;
 
     Ok(())

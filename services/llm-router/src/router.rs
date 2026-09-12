@@ -1,7 +1,11 @@
 // Runs a prompt on its tier's primary model and falls back to the backup vendor when the failure is worth retrying.
 
+use std::time::Duration;
+
 use crate::provider::{CallError, Completion, Prompt, Provider};
 use crate::tiers::Tiers;
+
+const PAUSE_BEFORE_BACKUP: Duration = Duration::from_millis(250);
 
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -44,18 +48,21 @@ pub async fn complete(
             model_used: tier.primary.clone(),
             used_backup: false,
         }),
-        Err(CallError::WorthRetrying(_)) => match provider.complete(&tier.backup, prompt).await {
-            Ok(completion) => Ok(Answer {
-                completion,
-                model_used: tier.backup.clone(),
-                used_backup: true,
-            }),
-            Err(error) => Err(Failed {
-                error,
-                model_used: tier.backup.clone(),
-                used_backup: true,
-            }),
-        },
+        Err(CallError::WorthRetrying(_)) => {
+            tokio::time::sleep(PAUSE_BEFORE_BACKUP).await;
+            match provider.complete(&tier.backup, prompt).await {
+                Ok(completion) => Ok(Answer {
+                    completion,
+                    model_used: tier.backup.clone(),
+                    used_backup: true,
+                }),
+                Err(error) => Err(Failed {
+                    error,
+                    model_used: tier.backup.clone(),
+                    used_backup: true,
+                }),
+            }
+        }
     }
 }
 
@@ -121,7 +128,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_working_primary_is_the_only_model_asked() {
         let provider = Scripted::new(vec![answered("docs")]);
 
@@ -135,7 +142,7 @@ mod tests {
         assert_eq!(provider.asked(), ["deepseek/deepseek-v4-flash"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retryable_primary_failure_moves_to_the_backup_vendor() {
         let provider = Scripted::new(vec![
             Err(CallError::WorthRetrying(
@@ -156,7 +163,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_rejected_request_never_reaches_the_backup() {
         let provider = Scripted::new(vec![Err(CallError::Final(
             "the provider answered 400".to_owned(),
@@ -175,7 +182,7 @@ mod tests {
         assert_eq!(provider.asked(), ["deepseek/deepseek-v4-flash"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn when_both_models_fail_the_backup_failure_is_reported() {
         let provider = Scripted::new(vec![
             Err(CallError::WorthRetrying("primary timed out".to_owned())),
@@ -194,7 +201,7 @@ mod tests {
         assert!(failed.used_backup);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_unset_tier_asks_no_model() {
         let provider = Scripted::new(vec![answered("docs")]);
 

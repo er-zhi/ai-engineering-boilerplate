@@ -39,6 +39,10 @@ When a tool, crate, or image documents a way to do something, the change uses th
 | Retry loop around a client that has retry and timeout settings | Those settings |
 | Forked or vendored copy of a crate, made to change its behavior | The crate's feature flag or config; otherwise fix it upstream |
 
+## Budget
+
+A diff has a handful of claims and this gate finishes in under 30 s. A full-repo run has dozens (the first one made 67 lookups in 156 s), so split it by source: one agent for crates and Docker images, one for model slugs and provider endpoints, one for Compose and Postgres features. Batch lookups that share an index page (`crates.io/api/v1/crates/<name>`, `openrouter.ai/api/v1/models/<slug>/endpoints`) and never re-verify a claim unchanged since the last logged run.
+
 ## Workflow
 
 1. List every external claim the change depends on.

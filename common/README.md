@@ -5,18 +5,21 @@ Cross-service shared code. Services depend on `common/` — never on each other'
 ```
 common/
 ├── proto/    # Connect + gRPC contracts (connectrpc/buffa)
+├── src/
+│   ├── lib.rs      # generated stubs + module list
+│   ├── llm.rs      # LLM Router tier contract: limits, Sampling, fit_to_limits
+│   └── test_db.rs  # feature `test-support`: one pgvector testcontainer per service role and schema
 ├── errors/   # shared error codes + gRPC status mapping
 ├── cache/    # CacheStore trait: Postgres now, Redis later
-├── test/     # fixtures, mock builders, testcontainers setup
 └── utils/    # pure helpers, no domain logic
 ```
 
-Today only `proto/` exists; the other folders appear when a second service first needs them.
+Today only `proto/` and `src/` exist; the other folders appear when a second service first needs them. A service pulls the test helpers in as a dev-dependency: `common = { workspace = true, features = ["test-support"] }`.
 
 ## Where Code Belongs
 
 ```
-Used by 2+ services?  → common/ (proto | errors | cache | test | utils)
+Used by 2+ services?  → common/ (proto | src | errors | cache | utils)
 Crosses a boundary?   → common/proto/
 Persists to DB?       → entity in the owning service
 Otherwise             → stays in that service

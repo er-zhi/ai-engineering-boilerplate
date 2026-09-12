@@ -1,6 +1,7 @@
 // External entry point. Proxies page loads to Frontend and forwards the same Connect contract to internal services over gRPC.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -19,6 +20,9 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
+const CRAWLER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct Gateway {
     crawler: CrawlerServiceClient<HttpClient>,
 }
@@ -29,7 +33,8 @@ struct Frontend {
     base_url: String,
 }
 
-fn bad_gateway<E>(_: E) -> (StatusCode, &'static str) {
+fn bad_gateway(error: impl std::fmt::Display) -> (StatusCode, &'static str) {
+    tracing::error!("frontend page load failed: {error}");
     (StatusCode::BAD_GATEWAY, "frontend unreachable")
 }
 
@@ -46,7 +51,10 @@ async fn page(
         .body(Body::empty())
         .map_err(bad_gateway)?;
 
-    let response = frontend.http.request(request).await.map_err(bad_gateway)?;
+    let response = tokio::time::timeout(PAGE_LOAD_TIMEOUT, frontend.http.request(request))
+        .await
+        .map_err(bad_gateway)?
+        .map_err(bad_gateway)?;
 
     Ok(response.map(Body::new))
 }
@@ -84,6 +92,7 @@ impl CrawlerService for Gateway {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    common::logging::init();
     let crawler_url =
         std::env::var("CRAWLER_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into());
     let frontend_url =
@@ -94,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HttpClient::plaintext_http2_only(),
             ClientConfig::new(crawler_url.parse()?)
                 .with_protocol(Protocol::Grpc)
+                .with_default_timeout(CRAWLER_CALL_TIMEOUT)
                 .proto(),
         ),
     };
@@ -112,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback_service(connect.into_axum_service());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    println!(
+    tracing::info!(
         "gateway listening on 0.0.0.0:8080 -> crawler at {crawler_url}, frontend at {frontend_url}"
     );
     axum::serve(listener, app).await?;

@@ -19,6 +19,21 @@ Rust style and input checks belong to `gate-code-quality`; schema, roles, querie
 - Cross-service calls go through gRPC contracts, not DB or filesystem
 - No importing internal modules from a sibling service
 
+## Parallel Work
+
+Services are isolated so that several people or agents can each own one and never touch the same file. The rule is checked per diff: a change to service A that edits a file outside `services/a/` needs a reason.
+
+| Shared file | Who may edit it, and how |
+|---|---|
+| `common/proto/<service>.proto` (snake_case: `llm_router.proto`) | The service that serves it. Additive changes only: new fields get new numbers, nothing is renumbered or removed. A new service gets a new `.proto` file, never a block in an existing one |
+| `common/src/` | Contract types a service publishes for its callers (`llm.rs` is LLM Router's tier contract), or code two services already use; the diff names the consumers |
+| `Cargo.toml` (workspace) | Add a crate to `[workspace.dependencies]` once; each service's own `Cargo.toml` references it with `workspace = true` |
+| `compose.yaml` | Each service edits only its own block (including its `depends_on`) plus its bootstrap lines in `postgres-bootstrap` |
+| `.env.example` | Each service adds only its own keys, grouped under a comment naming the service |
+| `README.md` | The rows and sections that name the service: Status, Services, the diagram, Getting Started; no prose elsewhere |
+
+A service's own folder holds everything else it needs: source, entities, Dockerfile, README, tests. A branch that touches one service builds and tests alone — `cargo nextest run -p <service>` and `docker compose up <service>` are the whole loop — so branches merge without conflicts.
+
 ## Contracts
 
 - Stable request/response shapes at the public boundary

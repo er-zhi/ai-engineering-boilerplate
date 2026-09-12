@@ -15,6 +15,11 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     pub received: Json,
     pub created_at: DateTimeUtc,
+    #[sea_orm(
+        default_expr = "sea_orm::sea_query::Expr::current_timestamp()",
+        indexed
+    )]
+    pub expires_at: DateTimeUtc,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

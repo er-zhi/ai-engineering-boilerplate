@@ -37,4 +37,4 @@ fetch("/crawler.v1.CrawlerService/StartCrawl", {
 
 Never hardcode a host or port. Relative paths are what keep the single-origin property true in dev, in Compose, and behind a real domain later.
 
-Field names use protobuf canonical JSON, so `base_url` in the proto is `baseUrl` on the wire and enums are their value names, such as `CRAWL_STATUS_QUEUED`.
+Headers, field naming, and error shapes are described once, in [Gateway's README](../gateway/README.md#api).

@@ -16,7 +16,9 @@ chrono = { workspace = true }
 sea-orm = { workspace = true }
 spider = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["time"] }
-testcontainers = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+common = { workspace = true, features = ["test-support"] }

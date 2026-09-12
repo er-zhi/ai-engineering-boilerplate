@@ -26,5 +26,7 @@ sea-orm = { version = "2.0", default-features = false, features = ["macros", "wi
 testcontainers = "0.28"
 # Plain HTTP crawling only: rustls instead of OpenSSL, and none of the default io_uring/disk/browser extras.
 spider = { version = "2.53", default-features = false, features = ["sync", "regex", "reqwest_rustls_tls"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 common = { path = "common" }

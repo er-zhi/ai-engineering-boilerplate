@@ -21,7 +21,9 @@ Orchestrates the review gates. Each gate is one skill in this folder, one concer
 
 ## Workflow
 
-1. Pick the gates that apply to the diff; skip the rest.
+The unit of review is a scope: a diff by default, or the whole repository on a first run or after a long gap. Every gate takes the scope in its prompt and reads only that.
+
+1. Pick the gates that apply to the scope; skip the rest.
 2. Note the wall-clock time before dispatch.
 3. Dispatch **all** applicable gates at once, in parallel. Never run a gate serially.
 4. Collect each gate's findings and how long it took.
@@ -50,7 +52,8 @@ If the runtime has no subagent mechanism, the sequential fallback still works �
 Every gate reports its own wall-clock seconds, and the report shows them.
 
 - Total is the **slowest gate**, not the sum — the gates ran in parallel. If total ≈ sum, they did not; say so.
-- Flag any gate over 60s and name what made it slow.
+- Flag any gate over 60s and name what made it slow. Two gates are expected to exceed it: Second opinion (two external model calls, 5–10 min) and Facts on a full-repo scope (dozens of lookups). For those, compare against the run log, not the 60 s line.
+- Gate agents need the host toolchain: `cargo`, `cargo-nextest`, `protoc`, Docker. A gate that finds one missing reports BLOCKED in one line and stops; it does not build inside a container or guess.
 
 One run cannot tell a chronically slow gate from a one-off spike. Read the history in [run-log.md](run-log.md) before optimizing anything.
 

@@ -39,6 +39,9 @@ Feed Codex and Claude the diff rather than a list of paths — `codex review --u
 
 Each of these cost a failed run to find:
 
+- **Tell every model, in the prompt, not to run skills, slash commands, or tools that write.** On the first full-repo run `zcode -p` found this project's `/code-review` skill and ran it recursively (six gates, including this one), took 626 s, and appended its own line to the run log. Open the prompt with: "Read the files and answer from reading. Do not run any skill, slash command, build, test, or review tool."
+- **Launch both models with `run_in_background` and poll.** A foreground tool call caps at 600 s and a model that overruns it gets backgrounded late, which turns the two calls serial: 626 s + 300 s instead of max(626, 300). Budget 5–10 minutes of wall clock for this gate; it is always the slowest one, and that is expected.
+- **Snapshot `git status --short` before launching and diff it right after each model returns.** Attribute a file change to a model only if it appears between that model's start and end and no other session was editing. On the first run the parent session was applying fixes while the models ran, and the report blamed zcode for edits it never made.
 - **`zcode` accepts no flags alongside `-p`.** In v0.16.5, adding `--mode`, `--max-turns`, `--allowed-tools`, or `--json` makes it print help and exit without calling the model. Use the bare form only.
 - **`zcode -p` runs in `yolo` permission mode** by default and offers no CLI flag to narrow it. Keep its prompts analysis-only, and run it on a clean tree so any stray write is visible in `git status`.
 - **`codex exec` aborts** with `Not inside a trusted directory` outside a git repo — `--skip-git-repo-check` clears it.

@@ -43,8 +43,7 @@
   const SERVICE = "/crawler.v1.CrawlerService";
   const output = document.getElementById("output");
 
-  // Connect protocol: unary RPC is a POST to /<proto package>.<Service>/<Method> carrying a JSON message.
-  async function call(method, message) {
+  async function callCrawlerRpc(method, message) {
     const res = await fetch(`${SERVICE}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json", "connect-protocol-version": "1" },
@@ -61,7 +60,7 @@
   let pollTimer;
 
   async function showJob(jobId) {
-    const job = await call("GetCrawlJob", { jobId });
+    const job = await callCrawlerRpc("GetCrawlJob", { jobId });
     output.textContent = JSON.stringify(job, null, 2);
     if (job.status === "CRAWL_STATUS_QUEUED" || job.status === "CRAWL_STATUS_RUNNING") {
       pollTimer = setTimeout(() => showJob(jobId).catch(fail), 1000);
@@ -79,7 +78,7 @@
     output.textContent = "Starting...";
 
     try {
-      const { jobId } = await call("StartCrawl", {
+      const { jobId } = await callCrawlerRpc("StartCrawl", {
         baseUrl: document.getElementById("baseUrl").value.trim(),
         scope: {
           includePatterns: lines("includePatterns"),

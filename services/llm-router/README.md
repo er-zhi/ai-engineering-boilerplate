@@ -12,7 +12,7 @@ Provider: [OpenRouter](https://openrouter.ai/).
 | `medium` | Summaries, moderate reasoning |
 | `high` | Complex or multi-step reasoning |
 
-Each tier has a primary and a backup model, set in config; on timeout, rate limit, or 5xx the router retries the backup, then returns an error. Remapping a tier is a config change — callers are unaffected. `low` starts on DeepSeek V4 Flash — OpenRouter slug `deepseek/deepseek-v4-flash`, verified against [its model page](https://openrouter.ai/deepseek/deepseek-v4-flash).
+Each tier has a primary and a backup model, set in config; on timeout, rate limit, or 5xx the router pauses 250 ms and tries the backup, then returns an error. Remapping a tier is a config change — callers are unaffected. `low` starts on DeepSeek V4 Flash — OpenRouter slug `deepseek/deepseek-v4-flash`, verified against [its model page](https://openrouter.ai/deepseek/deepseek-v4-flash).
 
 Model slugs move. Re-verify against the [DeepSeek hub](https://openrouter.ai/deepseek) before pinning a new one.
 
@@ -51,23 +51,31 @@ This service is the only one given `OPENROUTER_API_KEY`. Callers reach it over g
 
 ## Reasoning Must Be Off for `low` and `medium`
 
-Send `"reasoning": {"enabled": false}` on every `low` and `medium` request. Leave it on for `high` — that tier exists for it.
+Send `"reasoning": {"effort": "none"}` on every `low` and `medium` request — the form [OpenRouter documents](https://openrouter.ai/docs/use-cases/reasoning-tokens) for disabling reasoning. Leave it on for `high` — that tier exists for it.
 
 Reasoning models spend the completion budget on hidden reasoning tokens before emitting any content. On a one-word classification, `z-ai/glm-4.7-flash` consumed all 300 allowed tokens as `reasoning_tokens`, returned empty content, and stopped with `finish_reason: length`. With reasoning disabled the same prompt answered in 2 tokens. The failure bills normally and returns nothing, so it looks like a parsing bug rather than a config one.
 
 Never treat an empty `content` as a model failure without checking `usage.completion_tokens_details.reasoning_tokens` first.
 
-`{"reasoning": {"enabled": false}}` and `{"reasoning": {"effort": "none"}}` were both checked live against `deepseek/deepseek-v4-flash`: each answered with `reasoning_tokens: 0`.
+`{"reasoning": {"effort": "none"}}` was checked live against `deepseek/deepseek-v4-flash`: a one-word prompt answered in 2 completion tokens with `reasoning_tokens: 0`. `{"enabled": false}` behaved the same in a live call but is not in OpenRouter's documented schema, so the code does not rely on it.
 
 ## gRPC API
 
 [`common/proto/llm_router.proto`](../../common/proto/llm_router.proto) — `Complete` and `DescribeTiers`. Streaming and tool calling are future work.
 
-`POST /complete` exists for manual testing only. `GET /health` reports that this service is up; it does not call the provider, because a health check that spends money and depends on a third party stops being a health check. The key is verified once at startup instead, so a bad key fails the container rather than the first user request.
+Both RPCs answer at the Connect path, JSON body, no client library needed:
+
+```bash
+curl -X POST llm-router:8083/llm_router.v1.LlmRouterService/Complete \
+  -H 'content-type: application/json' -H 'connect-protocol-version: 1' \
+  -d '{"tier":"QUALITY_TIER_LOW","systemPrompt":"Reply with exactly one word.","userPrompt":"Say the word: ok","sampling":{"maxTokens":20}}'
+```
+
+`GET /health` reports that this service is up; it does not call the provider, because a health check that spends money and depends on a third party stops being a health check. The key is verified once at startup instead, so a rejected key fails the container rather than the first user request; if the provider merely cannot be reached at that moment, the service logs a warning and starts anyway rather than crash-looping through a provider outage.
 
 ## Schema (`llm_router`)
 
 Two tables, two lifetimes:
 
-- `requests` — tier, model_used, used_backup, tokens_in, tokens_out, latency_ms, outcome, finish_reason, created_at. Statistics, kept for the long run.
-- `request_payloads` — the full jsonb `sent` and `received` for one request. Kept 30 days, for taking a recent call apart; pruned after that.
+- `requests` — tier, model_used, used_backup, tokens_in, tokens_out, latency_ms, outcome, finish_reason, created_at. `tier`, `outcome`, and `finish_reason` are Rust enums stored as short strings. Statistics, kept for the long run.
+- `request_payloads` — the full jsonb `sent` and `received` for one request, with an indexed `expires_at` 30 days out. Both rows are written in one transaction; an hourly sweep deletes expired payloads and leaves the statistics.

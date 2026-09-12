@@ -13,7 +13,7 @@ Early stage. Most of the system is specified but not yet built.
 | Cargo workspace and `common` crate, which generates Connect/gRPC stubs from `common/proto/` | Done |
 | `frontend` service, which owns the web UI (`services/frontend/`) | Done |
 | Code-review skills (`.agents/skills/code-review/`) | Done |
-| `crawler` and `gateway` services, end to end over Connect + gRPC | Done — job tracking is in memory |
+| `crawler` and `gateway` services, end to end over Connect + gRPC | Done — jobs persisted in `crawler.crawl_jobs`, idempotent `StartCrawl` |
 | Docker Compose with hot reload | Done |
 | Crawling with spider-rs: scope rules, page cap, live progress | Done |
 | Postgres 18 + pgvector, one schema and role per service | Done |
@@ -30,15 +30,14 @@ flowchart LR
   gateway -->|gRPC| crawler
   crawler -->|gRPC| llm["llm-router"]
   llm -->|HTTPS| openrouter[("OpenRouter")]
-  gateway --- pg[("PostgreSQL<br/>schema per service + pgvector")]
-  crawler --- pg
+  crawler --- pg[("PostgreSQL<br/>schema per service + pgvector")]
   llm --- pg
 ```
 
 - **Gateway** is the only service reachable from outside. It routes requests and holds no business logic; each service validates what it receives at its own API boundary.
 - The browser loads the page and calls RPCs from the same origin, so there is no CORS anywhere in the system. Gateway proxies page routes to Frontend and answers every Connect path itself.
 - Services talk to each other over gRPC only. Shared contracts live in `common/proto/`.
-- Each service connects to Postgres with its own role, and that role can only access the service's own schema. Postgres enforces the isolation — see [schema-isolation.md](.agents/skills/code-review/gate-database/schema-isolation.md).
+- Each service that stores data connects to Postgres with its own role, and that role can only access the service's own schema. Gateway stores nothing today; its schema and role are provisioned but empty. Postgres enforces the isolation — see [schema-isolation.md](.agents/skills/code-review/gate-database/schema-isolation.md).
 
 ## Stack
 
@@ -84,6 +83,7 @@ Shared code rules are in [common/README.md](common/README.md).
 
 Each rule is enforced by a code-review gate, which holds the details.
 
+- **Structured logs** — every service writes one JSON line per event to stderr through `tracing`, with the crate name as `target`; nothing goes to stdout.
 - **Self-documenting code, no comments** — names carry the meaning; a one-line summary at the top of a file is the only comment. [gate-code-quality](.agents/skills/code-review/gate-code-quality/SKILL.md)
 - **Check input once, at the entry** — every outside value is validated where it enters and every size has a named limit, so the code behind the entry stays thin. [gate-code-quality](.agents/skills/code-review/gate-code-quality/SKILL.md#boundaries-and-limits)
 - **Fix bugs at their origin** — never with a new condition for the one reported case. [gate-bug-fix](.agents/skills/code-review/gate-bug-fix/SKILL.md)
@@ -92,6 +92,17 @@ Each rule is enforced by a code-review gate, which holds the details.
 - **No workarounds** — every tool is used the way its official docs describe, so no shell scripts around `docker compose` or `cargo`. [gate-facts](.agents/skills/code-review/gate-facts/SKILL.md#documented-way-not-a-workaround)
 - **Entities drive the schema** — sync on startup in dev, migration files for prod. Schema isolation enforced by Postgres roles, the smallest correct column type, ORM only, no logs or permanent raw HTML in the database. [gate-database](.agents/skills/code-review/gate-database/SKILL.md)
 - **Tests are meaningful, fast, and reliable** — parallel, no network in unit tests, the whole suite under 2 minutes. [gate-testing](.agents/skills/code-review/gate-testing/SKILL.md)
+
+## Working in Parallel
+
+The layout exists so that several people or AI agents can each own one service at a time without merge conflicts. One task touches one `services/<name>/` folder; the shared files (`common/proto/`, workspace `Cargo.toml`, `compose.yaml`, `.env.example`, this README) each have an ownership rule in [gate-architecture](.agents/skills/code-review/gate-architecture/SKILL.md#parallel-work). A service builds, tests, and runs alone:
+
+```bash
+cargo nextest run -p crawler       # this service's tests only
+docker compose up crawler          # this service plus what it depends on
+```
+
+Proto contracts change additively, so a service can ship a new field before any caller reads it, and callers upgrade on their own schedule.
 
 ## Code Review Skills
 
@@ -104,11 +115,11 @@ Running the stack needs only Docker with Compose v2.23 or newer, the version tha
 ```bash
 git clone https://github.com/er-zhi/ai-engineering-boilerplate.git
 cd ai-engineering-boilerplate
-cp .env.example .env   # then replace the change-me passwords: openssl rand -hex 24
+cp .env.example .env   # then replace the change-me passwords (openssl rand -hex 24) and set OPENROUTER_API_KEY
 docker compose up
 ```
 
-Then open <http://localhost:8080> for the web UI. Only Gateway is published to the host; Crawler and Frontend stay on the internal network, and Postgres is published on `127.0.0.1` alone.
+Compose refuses to start while `OPENROUTER_API_KEY` is unset, and LLM Router exits at startup if the key is not valid. Then open <http://localhost:8080> for the web UI. Only Gateway is published to the host; Crawler, Frontend, and LLM Router stay on the internal network, and Postgres is published on `127.0.0.1` alone.
 
 While developing, start the same stack with [Compose Watch](https://docs.docker.com/compose/how-tos/file-watch/):
 
@@ -128,7 +139,7 @@ In dev, Postgres listens on `127.0.0.1:5432`, never on the network. Connect any 
 | Host | `127.0.0.1` |
 | Port | `5432` |
 | Database | `app` |
-| Username | `postgres` (superuser), or `crawler_user` / `gateway_user` / `llm_router_user` to see exactly what one service sees |
+| Username | `postgres` (superuser), or `crawler_user` / `llm_router_user` to see exactly what one service sees (`gateway_user` exists too, but its schema holds no tables yet) |
 | Password | the matching value from `.env` |
 
 The `postgres-bootstrap` config in `compose.yaml` creates the schemas and roles only on the first start, when the `pgdata` volume is empty. To apply changed passwords, remove that volume (`docker volume ls | grep pgdata`, then `docker volume rm <name>`), which deletes all data.
@@ -150,9 +161,10 @@ docker compose up -d postgres
 DATABASE_URL=postgres://crawler_user:<CRAWLER_DB_PASSWORD>@127.0.0.1:5432/app cargo run -p crawler
 cargo run -p frontend
 cargo run -p gateway
+OPENROUTER_API_KEY=<key> DATABASE_URL=postgres://llm_router_user:<LLM_ROUTER_DB_PASSWORD>@127.0.0.1:5432/app cargo run -p llm-router
 ```
 
-Replace `<CRAWLER_DB_PASSWORD>` with the value from `.env`. Gateway finds Crawler and Frontend on `127.0.0.1:8081` and `127.0.0.1:8082` by default.
+Replace the placeholders with the values from `.env`; LLM Router also reads the `LLM_<TIER>_PRIMARY` / `LLM_<TIER>_BACKUP` variables listed there. Gateway finds Crawler and Frontend on `127.0.0.1:8081` and `127.0.0.1:8082` by default; LLM Router listens on `8083`.
 
 ### Calling the API
 

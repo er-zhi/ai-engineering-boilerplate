@@ -25,6 +25,8 @@ message CrawlScope {
 message StartCrawlRequest {
   string base_url = 1;
   CrawlScope scope = 2;
+  // Optional. Two requests with the same key start one crawl: the second answers with the first one's job.
+  string idempotency_key = 3;
 }
 
 message StartCrawlResponse {

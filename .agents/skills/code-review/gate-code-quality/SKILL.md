@@ -29,7 +29,11 @@ Modeled on how the Linux kernel treats a system call: each argument from user sp
 
 ## Durability (NASA Power of 10, Linux kernel style)
 
-Sources: NASA/JPL's Power of 10 rules, and the [Linux kernel coding style](https://www.kernel.org/doc/html/latest/process/coding-style.html) — at most 3 levels of indentation, short functions that do one thing, and no new `BUG()`: the kernel warns and keeps running.
+Sources: [NASA/JPL's Power of 10](https://en.wikipedia.org/wiki/The_Power_of_10:_Rules_for_Developing_Safety-Critical_Code) and the [Linux kernel coding style](https://www.kernel.org/doc/html/latest/process/coding-style.html). Both were written for C; what follows is the Rust adaptation, and where it departs from the source it says so.
+
+From the kernel: more than 3 levels of indentation means the function needs restructuring; a function does one thing and fits on one or two screens, with no more than 5–10 locals; no new `BUG()` — the kernel warns with `WARN_ON_ONCE()` and keeps running. The kernel *wants* a comment at the head of a function saying what it does; this repo's no-comments rule above is stricter than the kernel and is our own.
+
+From NASA: fixed loop bounds, no function past ~60 lines, every return value checked and every parameter validated, data at the smallest scope, zero warnings from day one. Three NASA rules are adapted rather than copied: NASA bans recursion outright, we allow it only when depth is provably bounded (a parser over a tree of known depth); NASA forbids heap allocation after startup, we bound it instead; NASA asks for two assertions per function on average, we assert real invariants and let types carry the rest.
 
 **Control flow:** max 3 nesting levels, early returns over else-chains, every loop bounded, no recursion unless depth is provably bounded.
 
@@ -37,7 +41,7 @@ Sources: NASA/JPL's Power of 10 rules, and the [Linux kernel coding style](https
 
 **Resources:** pre-allocate when size is known, bounded channels and queues, borrow instead of clone on hot paths, variables scoped to the smallest block, no leaked handles.
 
-**Correctness:** `assert!`/`debug_assert!` for real invariants, no `unsafe` unless isolated and justified, Clippy clean, types encode constraints (enums over strings, newtypes over raw primitives).
+**Correctness:** `assert!`/`debug_assert!` for real invariants, no `unsafe` unless isolated and justified, Clippy clean with warnings denied in CI, types encode constraints (enums over strings, newtypes over raw primitives).
 
 **Simplicity:** one responsibility per function; add a trait or layer only when a second implementation exists; don't add a crate for a five-line operation.
 

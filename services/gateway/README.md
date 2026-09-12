@@ -20,7 +20,7 @@ Methods come from [`common/proto/crawler.proto`](../../common/proto/crawler.prot
 
 | Route | Purpose |
 |---|---|
-| `POST /crawler.v1.CrawlerService/StartCrawl` | Start crawling and indexing a site |
+| `POST /crawler.v1.CrawlerService/StartCrawl` | Start crawling and indexing a site; repeat it safely with the same `idempotencyKey` |
 | `POST /crawler.v1.CrawlerService/GetCrawlJob` | Job status and progress |
 | `GET /` | Web UI, proxied to Frontend |
 | `GET /health` | Plain-HTTP liveness for Compose |
@@ -47,4 +47,4 @@ Page routes are listed explicitly and forwarded to Frontend over plain HTTP at `
 
 Because pages and RPCs arrive on one origin, no CORS configuration is needed anywhere. That is the whole reason Frontend is not published directly — see [its README](../frontend/README.md).
 
-Serving a page needs Frontend up, so Compose gates Gateway on Frontend's health as well as Crawler's. If Frontend is down, page routes return `502` while RPCs keep working.
+Serving a page needs Frontend up, so Compose gates Gateway on Frontend's health as well as Crawler's. If Frontend is down or takes more than 5 s, page routes return `502` while RPCs keep working. Every call to Crawler carries a 10 s deadline, so a hung internal service fails the one request instead of pinning a Gateway connection forever.
