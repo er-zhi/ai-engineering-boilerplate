@@ -35,7 +35,7 @@ cargo deny check
 cargo machete
 ```
 
-Docker must be running because database tests use testcontainers. `cargo test --workspace` also works if `cargo-nextest` is unavailable.
+Docker must be running for database tests. Nextest starts one disposable Postgres fixture for the suite, while every test gets its own database so the tests remain isolated and parallel; the fixture is removed when nextest exits. `cargo test --workspace` also works if `cargo-nextest` is unavailable and falls back to a testcontainer per database test.
 
 Run the AI review workflow only after deterministic checks pass. Its entry point and required evidence format are in [the code-review skill](../.agents/skills/code-review/SKILL.md).
 

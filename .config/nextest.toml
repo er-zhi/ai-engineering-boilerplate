@@ -1,10 +1,23 @@
 nextest-version = "0.9.131"
+experimental = ["setup-scripts"]
+
+[scripts.setup.postgres]
+command = ["sh", ".config/nextest-postgres.sh"]
+slow-timeout = { period = "10s", terminate-after = 6 }
+
+[[profile.default.scripts]]
+filter = "package(crawler) + package(gateway) + package(knowledge-base) + package(llm-router)"
+setup = "postgres"
+
+[[profile.ci.scripts]]
+filter = "package(crawler) + package(gateway) + package(knowledge-base) + package(llm-router)"
+setup = "postgres"
 
 [profile.default]
 fail-fast = false
 retries = 0
 slow-timeout = { period = "10s", terminate-after = 6 }
-global-timeout = "3m"
+global-timeout = "2m"
 
 [profile.ci]
 fail-fast = false

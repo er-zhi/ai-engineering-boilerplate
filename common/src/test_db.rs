@@ -2,9 +2,10 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sea_orm::{Database, DatabaseConnection};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 use testcontainers::core::{Healthcheck, IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, CopyTargetOptions, GenericImage, ImageExt};
@@ -14,6 +15,7 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const HEALTH_CHECK_RETRIES: u32 = 120;
 const PASSWORD: &str = "test";
 const DATABASE: &str = "app";
+static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub struct ServiceSchema {
     pub schema: &'static str,
@@ -24,10 +26,17 @@ pub struct ServiceSchema {
 
 pub struct TestDb {
     pub db: DatabaseConnection,
-    _container: ContainerAsync<GenericImage>,
+    _container: Option<ContainerAsync<GenericImage>>,
 }
 
 pub async fn start(service: ServiceSchema) -> TestDb {
+    if let (Ok(host), Ok(port)) = (
+        std::env::var("TEST_POSTGRES_HOST"),
+        std::env::var("TEST_POSTGRES_PORT"),
+    ) {
+        return connect_isolated(&service, &host, &port, None).await;
+    }
+
     let bootstrap_sql = format!(
         "CREATE EXTENSION IF NOT EXISTS vector;\n\
          \\getenv password {var}\n\
@@ -60,9 +69,59 @@ pub async fn start(service: ServiceSchema) -> TestDb {
         .expect("start Postgres; database tests need a running Docker");
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
+    connect_isolated(
+        &service,
+        &host.to_string(),
+        &port.to_string(),
+        Some(container),
+    )
+    .await
+}
+
+async fn connect_isolated(
+    service: &ServiceSchema,
+    host: &str,
+    port: &str,
+    container: Option<ContainerAsync<GenericImage>>,
+) -> TestDb {
+    let run = std::env::var("NEXTEST_RUN_ID")
+        .unwrap_or_else(|_| "local".to_owned())
+        .replace('-', "");
+    let database = format!(
+        "test_{run}_{}_{}",
+        std::process::id(),
+        DATABASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let admin = Database::connect(format!(
+        "postgres://postgres:{PASSWORD}@{host}:{port}/postgres"
+    ))
+    .await
+    .unwrap();
+    admin
+        .execute_unprepared(&format!(
+            "CREATE DATABASE {database} WITH TEMPLATE template0 OWNER {}",
+            service.role
+        ))
+        .await
+        .expect("create an isolated database for the test");
+    admin.close().await.unwrap();
+
+    let setup = Database::connect(format!(
+        "postgres://postgres:{PASSWORD}@{host}:{port}/{database}"
+    ))
+    .await
+    .unwrap();
+    setup
+        .execute_unprepared(&format!(
+            "CREATE EXTENSION vector; CREATE SCHEMA {} AUTHORIZATION {}",
+            service.schema, service.role
+        ))
+        .await
+        .expect("bootstrap the isolated test database");
+    setup.close().await.unwrap();
 
     let role_url = format!(
-        "postgres://{}:{PASSWORD}@{host}:{port}/{DATABASE}",
+        "postgres://{}:{PASSWORD}@{host}:{port}/{database}",
         service.role
     );
     let db = Database::connect(role_url).await.unwrap();
