@@ -30,7 +30,8 @@ Entities are the source of truth: schema sync builds the tables from them on sta
 
 | Data | Rule |
 |---|---|
-| Logs | Never in the DB — stdout/stderr → Docker logs |
+| Operational logs | Never in the DB — stdout/stderr → Docker logs |
+| Audit or usage records | Domain tables with an explicit purpose, bounded payload retention, and cleanup |
 | Raw HTML, files, blobs | Never permanent — store the extracted result |
 | Raw data, temporary | Only with `expires_at` + automatic cleanup |
 | Domain data | Permanent — entities, metadata, embeddings, status |
@@ -67,11 +68,12 @@ Each service uses only its own schema, enforced by Postgres roles rather than di
 CREATE TABLE crawler.pages (
     id           bigserial PRIMARY KEY,
     url          varchar(2048) NOT NULL,
-    title        varchar(512),
-    page_type    smallint NOT NULL,
+    title        varchar(512) NOT NULL,
+    main_text    text NOT NULL,
     content_hash char(64) NOT NULL,
+    http_status  smallint NOT NULL,
     crawled_at   timestamptz NOT NULL
 );
 ```
 
-Oversized version to avoid: `uuid` PK, `text` for url/title/hash, `varchar(50)` page_type, `timestamp` without zone.
+Oversized version to avoid: `uuid` PK, `text` for URL/title/hash, `integer` for an HTTP status, and `timestamp` without a time zone.

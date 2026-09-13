@@ -34,7 +34,7 @@ Suite: 47 tests, 41 passed, 0 failed, 6 skipped
 Wall clock: 18.4s  (budget 120s)
 Slowest:
   12.1s  crawler::tests::crawl_respects_exclude_patterns   ← 66% of total
-   2.3s  gateway::tests::search_proxies_to_crawler
+   2.3s  gateway::tests::get_job_proxies_to_crawler
    0.9s  crawler::denoise::strips_nav_and_footer
 ```
 

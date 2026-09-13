@@ -41,7 +41,7 @@ When a tool, crate, or image documents a way to do something, the change uses th
 
 ## Budget
 
-A diff has a handful of claims and this gate finishes in under 30 s. A full-repo run has dozens (the first one made 67 lookups in 156 s), so split it by source: one agent for crates and Docker images, one for model slugs and provider endpoints, one for Compose and Postgres features. Batch lookups that share an index page (`crates.io/api/v1/crates/<name>`, `openrouter.ai/api/v1/models/<slug>/endpoints`) and never re-verify a claim unchanged since the last logged run.
+A diff usually has only a handful of external claims. For a full-repository review, split independent source groups so crate and container facts, model/provider facts, and PostgreSQL/Compose facts can be checked concurrently. Batch lookups that share an official index and do not re-check claims whose pinned source and version are unchanged.
 
 ## Workflow
 
@@ -66,13 +66,11 @@ A diff has a handful of claims and this gate finishes in under 30 s. A full-repo
 Name the source, not just the verdict.
 
 ```
-Critical: services/llm-router/README.md — model `deepseek/deepseek-chat` stopped serving
-2026-07-24 per DeepSeek's API docs → use `deepseek/deepseek-v4-flash`
-(openrouter.ai/deepseek/deepseek-v4-flash)
+Critical: services/llm-router/README.md — configured model slug is absent from
+OpenRouter's current model index → select an available slug and verify its capabilities
+(official model-page URL)
 
 Verified: spider-rs is the crate behind the crawler (Context7 /spider-rs/spider)
 ```
-
-That first finding is real — it came from running this gate against our own `llm-router` docs.
 
 "Probably correct" is a Critical finding. Either it is confirmed or it is unverified.

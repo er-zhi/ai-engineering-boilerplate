@@ -12,13 +12,13 @@ Rust style and input checks belong to `gate-code-quality`; schema, roles, querie
 ## Boundaries
 
 - Each capability is its own service in `services/<name>/`, with no `-service` suffix
-- Nothing the README's [Stack](../../../../README.md#stack) section rules out under *Not now*
+- No infrastructure or framework without a measured need and an explicit ownership boundary
 - Change belongs to one service; no business logic shared across crates
 - No queries, joins, or migrations touching another service's schema
-- No shared mutable state (files, caches needing sync)
+- No unowned shared mutable state; shared artifacts have one writer and read-only consumers
 - Cross-service calls go through gRPC contracts, not DB or filesystem
 - No importing internal modules from a sibling service
-- Every service is a Docker container in `[workspace] members`, with one sanctioned exception: `native/embedder-ane` (the Apple Neural Engine via Core ML has no Linux/container equivalent, and everyone on this project develops on Apple Silicon). It is a Python process outside Docker and the Cargo workspace, reached over plain loopback HTTP, not gRPC — see [knowledge-base's README](../../../../services/knowledge-base/README.md#embedding-native-apple-silicon-only). Adding a second exception like this needs the same bar: a real, verified platform gap, not convenience.
+- Every long-running Rust service is a Docker container and Cargo workspace member. Frontend is a one-shot file-copy container, not a runtime service or workspace member. `native/embedder-ane` is the sanctioned host-native exception because Core ML has no Linux-container equivalent; Knowledge Base reaches it over HTTP. A new exception needs a verified platform constraint.
 
 ## Parallel Work
 
@@ -31,7 +31,7 @@ Services are isolated so that several people or agents can each own one and neve
 | `Cargo.toml` (workspace) | Add a crate to `[workspace.dependencies]` once; each service's own `Cargo.toml` references it with `workspace = true` |
 | `compose.yaml` | Each service edits only its own block (including its `depends_on`) plus its bootstrap lines in `postgres-bootstrap` |
 | `.env.example` | Each service adds only its own keys, grouped under a comment naming the service |
-| `README.md` | The rows and sections that name the service: Status, Services, the diagram, Getting Started; no prose elsewhere |
+| `README.md`, `docs/architecture.md` | Keep the project overview and cross-service flow consistent; service details remain in the service README |
 
 A service's own folder holds everything else it needs: source, entities, Dockerfile, README, tests. A branch that touches one service builds and tests alone — `cargo nextest run -p <service>` and `docker compose up <service>` are the whole loop — so branches merge without conflicts.
 
@@ -39,9 +39,9 @@ A service's own folder holds everything else it needs: source, entities, Dockerf
 
 - Stable request/response shapes at the public boundary
 - Callers see what a service does, never how: no storage rows, library types, or vendor names in a contract others depend on
-- Internal errors map to the shared codes in `common/errors/` at the boundary; a dependency's message never reaches the caller
+- Internal errors map to explicit Connect error codes at the boundary; a dependency's raw message never reaches the caller
 - Outbound calls centralized, not scattered raw clients
-- A timeout, and retries with backoff, on every outbound call
+- A timeout on every outbound call; retries only for transient failures when repeating the operation is safe
 - Idempotency considered for writes other services trigger
 - Breaking API changes are intentional and documented
 

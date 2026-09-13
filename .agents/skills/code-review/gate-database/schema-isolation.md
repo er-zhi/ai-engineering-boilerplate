@@ -21,7 +21,7 @@ For each service in the table, the bootstrap:
 
 It also enables the `vector` extension once. The role owns its schema, so it can create and alter its own tables and has no rights in any other schema. `public` stays on the search path only so the pgvector type resolves.
 
-Compose builds each storing service's `DATABASE_URL` from its role and the matching password in `.env` — see the `crawler` entry in `compose.yaml`. Gateway's schema and role are provisioned ahead of need; it holds no tables and gets no `DATABASE_URL` yet. Dev-mode entity sync runs as the service role, so it can only create or alter tables in that schema.
+Compose builds each storing service's `DATABASE_URL` from its role and the matching password in `.env`. Gateway stores sessions in `gateway.sessions`; the other services own only the tables represented by their entities. Dev-mode entity sync runs as the service role, so it can create or alter tables only in that schema.
 
 ## Verify
 

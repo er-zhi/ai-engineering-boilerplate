@@ -1,71 +1,22 @@
 # Common
 
-Cross-service shared code. Services depend on `common/` — never on each other's internal modules.
+Shared Rust contracts and utilities. Services may depend on `common`; they must not import another service's internal modules.
 
-```
-common/
-├── proto/    # Connect + gRPC contracts (connectrpc/buffa)
-├── src/
-│   ├── lib.rs      # generated stubs + module list
-│   ├── llm.rs      # LLM Router tier contract: limits, Sampling, fit_to_limits
-│   └── test_db.rs  # feature `test-support`: one pgvector testcontainer per service role and schema
-├── errors/   # shared error codes + gRPC status mapping
-├── cache/    # CacheStore trait: Postgres now, Redis later
-└── utils/    # pure helpers, no domain logic
-```
+## Contents
 
-Today only `proto/` and `src/` exist; the other folders appear when a second service first needs them. A service pulls the test helpers in as a dev-dependency: `common = { workspace = true, features = ["test-support"] }`.
+- `proto/` — versioned protobuf contracts for Crawler, Knowledge Base, and LLM Router.
+- `src/cache/` — the `CacheStore` abstraction and PostgreSQL implementation currently used for Gateway sessions.
+- `src/llm.rs` — quality-tier limits, sampling settings, and request validation shared with LLM Router callers.
+- `src/logging.rs` — structured tracing initialization.
+- `src/test_db.rs` — testcontainers support, enabled by the `test-support` feature.
+- `src/lib.rs` — generated protocol modules and public exports.
 
-## Where Code Belongs
+## Placement Rules
 
-```
-Used by 2+ services?  → common/ (proto | src | errors | cache | utils)
-Crosses a boundary?   → common/proto/
-Persists to DB?       → entity in the owning service
-Otherwise             → stays in that service
-```
+- A value crossing a service boundary belongs in that service's versioned proto contract.
+- Code belongs here only after at least two services need the same behavior or when it is part of a published contract.
+- Database entities, queries, mappers, and domain behavior remain inside the owning service.
+- Generated proto types are canonical across services; entity types are canonical inside a service. Do not create hand-written mirrors.
+- Proto changes are additive within a version: add new field numbers, never reuse or renumber existing ones.
 
-## Type Chain
-
-```
-proto message  ←→  generated Rust  ←→  entity
-   canonical          never bypass      canonical
- across services                       within service
-```
-
-- **Entity is canonical inside a service** — repo, service layer, and mappers all use it. No parallel struct with the same fields.
-- **Proto is canonical across services** — use generated types, never a hand-written mirror.
-- **Compose, don't duplicate** — wrap or reference existing types instead of redefining fields.
-- **One mapper module per service** for entity ↔ proto.
-
-### Proto Reuses Messages
-
-```protobuf
-// proto/common.proto
-message PageMetadata { string url = 1; string title = 2; int64 crawled_at = 3; }
-
-// proto/crawler.proto
-import "common.proto";
-message CrawlPageRequest { PageMetadata metadata = 1; string main_content = 2; }
-```
-
-Never copy a field block into a new proto — `import` it. Proto changes are versioned; breaking changes need coordination.
-
-## Errors
-
-Shared codes in `common/errors/`. Service-specific errors map to them at the gRPC boundary. No duplicate error enums across services.
-
-## Cache (Postgres, Redis-ready)
-
-TTL keys, rate limits, and job locks use Postgres behind a trait. Services depend on the trait, never on the backend.
-
-```rust
-#[async_trait]
-pub trait CacheStore: Send + Sync {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError>;
-    async fn set(&self, key: &str, value: &[u8], ttl: Duration) -> Result<(), CacheError>;
-    async fn delete(&self, key: &str) -> Result<(), CacheError>;
-}
-```
-
-Backend switches via `CACHE_BACKEND=postgres|redis`. Cache table lives in the service's own schema (e.g. `crawler.cache_entries`): `key varchar(512)`, `value bytea`, `expires_at timestamptz`.
+`CacheStore` is backend-neutral, but PostgreSQL is the only implementation and there is no runtime `CACHE_BACKEND` switch. A service using it still stores rows in its own schema.

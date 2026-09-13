@@ -65,8 +65,8 @@ ruff check native/embedder-ane
 ty check --python native/embedder-ane/.venv/bin/python native/embedder-ane/server.py
 uvx lizard -l rust -C 15 -T nloc=60 -a 6 -w common services
 uvx lizard -l python -C 15 -T nloc=60 -a 6 -w native/embedder-ane/server.py
-typos
-lychee --offline '**/*.md'
+typos README.md common docs native/embedder-ane services .agents/skills/code-review
+git ls-files -z '*.md' | xargs -0 lychee --offline
 gitleaks dir . --config .gitleaks.toml --redact --no-banner
 ```
 

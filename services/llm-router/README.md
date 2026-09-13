@@ -45,7 +45,7 @@ Integrating a provider means writing an adapter: a type implementing `Provider` 
 
 Keys: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, and `LLM_<TIER>_PRIMARY` / `LLM_<TIER>_BACKUP` for `LOW`, `MEDIUM`, and `HIGH`. Values live in `.env` (gitignored); [`.env.example`](../../.env.example) holds the defaults.
 
-A backup on the same vendor as its primary is not a backup — it shares the outage. Each tier's backup is therefore a different vendor.
+Each tier uses models from different publishers to reduce correlated model-specific failures. Both still depend on OpenRouter, so this is fallback within the provider, not protection from a complete OpenRouter outage.
 
 This service is the only one given `OPENROUTER_API_KEY`. Callers reach it over gRPC and never see provider credentials, so the key stays out of Crawler and Gateway entirely.
 
@@ -53,19 +53,15 @@ This service is the only one given `OPENROUTER_API_KEY`. Callers reach it over g
 
 Send `"reasoning": {"effort": "none"}` on every `low` and `medium` request — the form [OpenRouter documents](https://openrouter.ai/docs/use-cases/reasoning-tokens) for disabling reasoning. Leave it on for `high` — that tier exists for it.
 
-Reasoning models spend the completion budget on hidden reasoning tokens before emitting any content. On a one-word classification, `z-ai/glm-4.7-flash` consumed all 300 allowed tokens as `reasoning_tokens`, returned empty content, and stopped with `finish_reason: length`. With reasoning disabled the same prompt answered in 2 tokens. The failure bills normally and returns nothing, so it looks like a parsing bug rather than a config one.
-
-Never treat an empty `content` as a model failure without checking `usage.completion_tokens_details.reasoning_tokens` first.
-
-`{"reasoning": {"effort": "none"}}` was checked live against `deepseek/deepseek-v4-flash`: a one-word prompt answered in 2 completion tokens with `reasoning_tokens: 0`. `{"enabled": false}` behaved the same in a live call but is not in OpenRouter's documented schema, so the code does not rely on it.
+Reasoning models can spend the completion budget on hidden reasoning tokens before emitting content. For `low` and `medium`, the adapter therefore sends the documented `{"reasoning": {"effort": "none"}}` form. When a response has empty content, inspect `usage.completion_tokens_details.reasoning_tokens` before classifying the failure.
 
 ## No Embeddings Here
 
-Embedding used to be a third RPC on this service (`Embed`, one model, no fallback, backed by OpenRouter). It moved to [`knowledge-base`](../knowledge-base/README.md#embedding-native-apple-silicon-only), the only caller, which now calls a native embedder process on the Mac over loopback HTTP — no provider, no key, nothing to log. This service knows nothing about embeddings any more; see the knowledge-base README for why and how.
+This service handles text completion only. Knowledge Base calls the [native embedder](../knowledge-base/README.md#embedding-native-apple-silicon-only) directly, so embedding needs no provider credential or model route here.
 
 ## gRPC API
 
-[`common/proto/llm_router/v1/llm_router.proto`](../../common/proto/llm_router/v1/llm_router.proto) — `Complete` and `DescribeTiers`. Streaming and tool calling are future work.
+[`common/proto/llm_router/v1/llm_router.proto`](../../common/proto/llm_router/v1/llm_router.proto) defines the supported API: `Complete` and `DescribeTiers`. Streaming and tool calling are not supported.
 
 Both RPCs answer at the Connect path, JSON body, no client library needed:
 

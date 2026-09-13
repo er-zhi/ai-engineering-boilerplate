@@ -8,9 +8,9 @@ Core ML, the only route to the Neural Engine, is a macOS framework; a Linux cont
 
 ## Model
 
-[`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) — 1024-dimensional output, 32k-token context, Apache-2.0, a decoder-only model (last-token pooling, an instruction prefix on queries only) — converted to Core ML by [`neuradex/Qwen3-Embedding-0.6B-CoreML-ANE`](https://huggingface.co/neuradex/Qwen3-Embedding-0.6B-CoreML-ANE) and then weight-quantized to 8-bit here with `coremltools.optimize`. Chosen over the small BERT-family models the original design named because, with a real accelerator, model quality is the only axis left to optimize; the full history is in the [design spec](../../docs/superpowers/specs/2026-09-11-knowledge-base-design.md#embedding-model-native-apple-silicon-only).
+[`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) — 1024-dimensional output, 32k-token context, Apache-2.0, a decoder-only model using last-token pooling and an instruction prefix on queries only. The [`neuradex/Qwen3-Embedding-0.6B-CoreML-ANE`](https://huggingface.co/neuradex/Qwen3-Embedding-0.6B-CoreML-ANE) conversion is weight-quantized to 8-bit here with `coremltools.optimize`.
 
-Two fixed-shape compiled graphs, because the Neural Engine cannot run a dynamic-length graph: `b1_s128` (up to 128 tokens — every search query, most short documents) and `b1_s512` (up to 512 tokens). `server.py` picks the smaller one that fits. Text past 512 tokens is embedded from its first 512 and the response says `"truncated": true` — a head-only vector still finds the page, whereas refusing it would fail the caller's all-or-nothing ingest and, because the crawler never re-sends an unchanged page, drop that page from search for good. In practice knowledge-base splits pages into passages sized to fit before embedding, so truncation only happens for unusually dense text, and knowledge-base logs it.
+Two fixed-shape compiled graphs serve inputs up to 128 or 512 tokens. `server.py` picks the smaller graph that fits. Text past 512 tokens is embedded from its first 512 and the response sets `"truncated": true`. Knowledge Base normally splits pages into passages sized to fit; it logs the exceptional truncation of unusually dense text.
 
 One `threading.Lock` serializes `predict` calls: there is a single Neural Engine, and letting uvicorn's thread pool pile concurrent calls into Core ML only produces worse tail latency than queueing them here. A crawl's document embeds therefore queue ahead of a user's query embed; if that ever shows in search latency, the fix is a priority queue or a second process for queries.
 
@@ -27,7 +27,7 @@ One `threading.Lock` serializes `predict` calls: there is a single Neural Engine
 
 8-bit is the whole win: faster than fp16 with no measurable quality loss. 6-bit is no faster and slightly worse; 4-bit palettization destroys this model's embeddings outright. Below 8-bit the cost is no longer in the weights, so further compression buys nothing. Through the HTTP server the steady-state call is ~20 ms.
 
-The same model on the GPU via `candle`'s Metal backend measured ~190 ms on this machine, and PyTorch's MPS backend the same — at batch size one the model is memory-bandwidth-bound on the GPU, so the Neural Engine's ~10x is not something a different GPU framework could have matched. Search as a whole measures ~26–45 ms through Gateway — see [knowledge-base's README](../../services/knowledge-base/README.md#search).
+The same model on the GPU via `candle`'s Metal backend measured ~190 ms on this machine, and PyTorch's MPS backend the same. Search as a whole measured ~26–45 ms through Gateway on the same setup; the current retrieval path is described in the [Knowledge Base README](../../services/knowledge-base/README.md#retrieval).
 
 ## Portability
 

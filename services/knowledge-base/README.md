@@ -4,21 +4,21 @@ Stores what a source has produced about one piece of content — its full text, 
 
 ## Why a Separate Service
 
-Crawling and knowledge storage are different capabilities with different lifecycles. Crawler keeps its own copy of what it crawled for its own dedup and revisit logic; knowledge-base is the canonical, source-agnostic store on top of that — built now, while crawler is the only caller, so a second source (a manual upload, another crawler) can call the same `Ingest` RPC later without a new contract.
+Crawling and knowledge storage are different capabilities with different lifecycles. Crawler keeps its own crawl record and content hash; Knowledge Base is the canonical, source-agnostic retrieval store. Crawler is the current caller, but another source can use the same `Ingest` contract.
 
 ## Content Ownership and Dedup
 
-Knowledge-base never trusts a caller's dedup claim. It hashes the `content` it receives itself and upserts by `(source, source_id)`; if the hash matches what is already stored, it returns `skipped: true` without spending anything on the LLM or the embedding model. Crawler does its own, separate dedup check (comparing against its own stored hash) before ever calling `Ingest` — two independent checks, so a bug or a second source skipping its own dedup cannot corrupt this store.
+Knowledge Base never trusts a caller's dedup claim. It hashes the `content` it receives and upserts by `(source, source_id)`; if the hash matches what is already stored, it returns `skipped: true` without spending anything on the LLM or the embedding model. Crawler records its own content hash but submits every successfully stored page. This service's check is authoritative and also makes a later crawl a safe retry after a failed hand-off.
 
 ## Pipeline per `Ingest` Call
 
 1. Hash `content`; if it matches the stored hash for `(source, source_id)`, stop here.
-2. `llm-router.Complete` (`low` tier, `response_format: json_object`) for `page_type`, `keywords`, `summary` — the same page-type list crawler's README specifies (`product`, `knowledge`, `instruction`, `documentation`, `blog`, `other`); an unrecognized value falls back to `other` rather than failing the call.
+2. `llm-router.Complete` (`low` tier, `response_format: json_object`) for `page_type`, `keywords`, and `summary`. Supported page types are `product`, `knowledge`, `instruction`, `documentation`, `blog`, and `other`; an unrecognized value becomes `other`.
 3. Split `content` into passages of at most 1,200 characters (`chunk::split`), breaking on lines, then sentences, then words, with no overlap — in Chroma's chunking evaluation, overlap cost precision without improving recall.
 4. Embed each passage with a **contextual chunk header** prepended — the first 150 characters of the title and the first 300 of the summary — over loopback HTTP to the native `embedder-ane` process. The header is embedded, never stored, so a passage deep in a page still carries what the page is about, at no extra LLM cost. (It is not Anthropic's Contextual Retrieval, which has an LLM write per-chunk context; that is heavier and remains an option.) See [Embedding](#embedding-native-apple-silicon-only) below.
 5. Write the document and all its passages in one transaction, replacing any passages from a previous version. Either the whole call succeeds or nothing beyond what was already there is written.
 
-A failure at step 2 or 4 fails the whole call; there is no partial write and no retry queue. Crawler logs a failed hand-off and moves on — an unchanged re-crawl will not retry it, only a further content change will. Accepted for now; revisit if real failure rates justify a durable queue.
+A failure at step 2 or 4 fails the whole call; there is no partial write and no durable retry queue. Crawler logs a failed hand-off and moves on. Its next successful crawl submits the page again, and Knowledge Base either ingests it or skips it using its own hash.
 
 ## Embedding: Native, Apple Silicon Only
 
@@ -26,9 +26,9 @@ This is the one place knowledge-base talks to something other than llm-router or
 
 Two endpoints, not one: `POST /embed/document` for passages written at ingest, `POST /embed/query` for a query — the model (`Qwen/Qwen3-Embedding-0.6B`) needs an instruction prefix on queries only, per its own documented usage pattern, and getting that backwards would quietly hurt ranking rather than error. `EmbedKind::Document` / `EmbedKind::Query` on `LlmClient::embed` is what picks the route.
 
-The embedder's window is 512 tokens. For English prose a 1,200-character passage plus its header is roughly 400 tokens, so it fits; denser text (non-Latin scripts, code, URLs) can exceed it, in which case the embedder embeds the head, says so, and `embedder_client` logs a warning. Sizing passages by real token count is the proper fix and is listed in the design spec. The embedder call has its own 10 s timeout, separate from llm-router's 60 s.
+The embedder's window is 512 tokens. For English prose a 1,200-character passage plus its header is roughly 400 tokens, so it fits; denser text such as non-Latin scripts, code, or URLs can exceed it. In that case the embedder uses the first 512 tokens and `embedder_client` logs a warning. Passage sizing is character-based, not tokenizer-based. The embedder call has its own 10-second timeout, separate from LLM Router's 60-second timeout.
 
-No request or payload logging for these calls, unlike `llm-router`'s `requests`/`request_payloads` tables — there is no cost or vendor to audit for a local, unmetered forward pass. Full reasoning for going native and for this model: [`native/embedder-ane`'s README](../../native/embedder-ane/README.md) and [the design spec](../../docs/superpowers/specs/2026-09-11-knowledge-base-design.md#embedding-model-native-apple-silicon-only).
+No request or payload logging is kept for these calls, unlike `llm-router`'s `requests` and `request_payloads` tables: the forward pass is local and unmetered. Model and runtime details are in the [`native/embedder-ane` README](../../native/embedder-ane/README.md).
 
 ## Retrieval
 
@@ -48,7 +48,7 @@ An optional `page_types` filter restricts both retrievers. Page type is a facet 
 
 There is no generation step here. An agent calling `Search` already has a model; a second LLM inside knowledge-base would add seconds and cost for text the agent rewrites anyway. The web page at `/` only exists to inspect what `Search` returns.
 
-Not built, deliberately: a cross-encoder reranker (on a knowledge base this size the fused order is already close; by our estimate a reranker small enough to stay fast on the Neural Engine is ~30M parameters and could as easily reorder for the worse), true BM25 (`ts_rank_cd` has no IDF; `pg_textsearch` needs a custom Postgres image), and a labelled evaluation set. See the [design spec](../../docs/superpowers/specs/2026-09-11-knowledge-base-design.md#search).
+Current limitations: there is no labelled retrieval evaluation set, cross-encoder reranker, or true BM25. Lexical ranking uses PostgreSQL `ts_rank_cd`.
 
 ## Testing
 
@@ -74,7 +74,7 @@ Indexes, created at startup after schema sync: HNSW on `document_chunks.embeddin
 
 `embedding_model` is stored per document so a future switch of the embedding model — a different vector space — is detectable rather than silently corrupting similarity search. `ingested_at` is set once, on the first write for a `(source, source_id)`.
 
-Schema is synced by SeaORM at startup, non-destructively: a column whose type no longer matches the entity is logged, not altered, and a column removed from an entity stays in the table. There is no migration mechanism yet (tracked in the design spec), so a database created before passages existed has to be reset by hand — its `documents.embedding NOT NULL` column would otherwise fail every write, and crawler would never resend its unchanged pages:
+Schema is synced by SeaORM at startup, non-destructively: a column whose type no longer matches the entity is logged, not altered, and a column removed from an entity stays in the table. There is no migration mechanism yet, so a database created before passage storage existed must be reset by hand; its old `documents.embedding NOT NULL` column otherwise fails every write:
 
 ```bash
 docker compose exec -T postgres psql -U postgres -d app \
