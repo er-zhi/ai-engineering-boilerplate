@@ -180,7 +180,11 @@ mod tests {
             Err(DbErr::Custom("ingest tests do not exercise search".into()))
         }
 
-        async fn lexical(&self, _: &str, _: Vec<PageType>) -> Result<Vec<Passage>, DbErr> {
+        async fn lexical(
+            &self,
+            _: &str,
+            _: Vec<PageType>,
+        ) -> Result<crate::store::LexicalCandidates, DbErr> {
             Err(DbErr::Custom("ingest tests do not exercise search".into()))
         }
     }

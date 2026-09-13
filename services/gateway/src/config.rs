@@ -48,6 +48,18 @@ impl GatewayConfig {
     pub fn session_ttl(&self) -> Duration {
         self.session_ttl
     }
+
+    #[cfg(test)]
+    pub fn for_test(frontend_dir: PathBuf) -> Self {
+        Self {
+            crawler_url: Uri::from_static(DEFAULT_CRAWLER_URL),
+            knowledge_base_url: Uri::from_static(DEFAULT_KNOWLEDGE_BASE_URL),
+            frontend_dir,
+            database_url: "unused in route tests".to_owned(),
+            password: "correct horse battery staple".to_owned(),
+            session_ttl: Duration::from_secs(60),
+        }
+    }
 }
 
 pub fn gateway_config() -> Result<GatewayConfig, Box<dyn std::error::Error>> {

@@ -52,4 +52,5 @@ native/embedder-ane/        host-native Core ML embedding process
 - The stack targets local Apple Silicon development because the embedder uses the Neural Engine.
 - Schema synchronization is convenient for development but is not a production migration system.
 - Crawl-to-Knowledge-Base delivery has no durable retry queue; a later successful crawl retries the hand-off.
+- Any future durable job queue must sit behind a service-owned `Queue` or `JobQueue` trait so domain code depends only on that abstraction. Its first adapter should use the owning service's PostgreSQL schema; SQS, RabbitMQ, or another broker may replace that adapter later without entering business logic.
 - One PostgreSQL instance and Docker Compose are intentional until scale measurements require more infrastructure.

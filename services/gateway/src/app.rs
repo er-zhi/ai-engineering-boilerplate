@@ -6,7 +6,7 @@ use axum::http::{HeaderValue, header};
 use axum::middleware;
 use axum::routing::{get, get_service, post};
 use connectrpc::Router as ConnectRouter;
-use sea_orm::Database;
+use sea_orm::{Database, DatabaseConnection};
 use tower_http::services::ServeFile;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -26,6 +26,10 @@ pub async fn application(
     db.get_schema_registry("gateway::entity::*")
         .sync(&db)
         .await?;
+    Ok(routes(config, db))
+}
+
+fn routes(config: &GatewayConfig, db: DatabaseConnection) -> axum::Router {
     let sessions = PgCacheStore::new(db);
     tokio::spawn(sweep_expired_sessions_periodically(sessions.clone()));
     let auth = Auth::new(sessions, config.password().to_owned(), config.session_ttl());
@@ -68,5 +72,8 @@ pub async fn application(
         )
         .route("/logout", post(logout))
         .with_state(auth);
-    Ok(public.merge(protected))
+    public.merge(protected)
 }
+
+#[cfg(test)]
+mod tests;

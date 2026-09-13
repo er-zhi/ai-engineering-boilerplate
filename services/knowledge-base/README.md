@@ -35,14 +35,16 @@ No request or payload logging is kept for these calls, unlike `llm-router`'s `re
 `Search` (`service::retrieve`) is hybrid retrieval over passages with Reciprocal Rank Fusion, the fusion Elasticsearch's `rrf` retriever and Supabase's hybrid-search guide use:
 
 1. Normalize the query once (`search::normalize`: whitespace collapsed, lowercased).
-2. Two retrievers over `document_chunks`, each returning its top 50 passages in its own order, run concurrently with `tokio::join!` — only the semantic one waits for the query embedding:
+2. Semantic and lexical retrieval run concurrently with `tokio::join!`; this caps each search at two database queries in flight. The lexical branch runs its two short, independently indexed queries sequentially and produces three candidate lists in total, each capped at 50:
    - **Semantic** — `store::nearest`: `ORDER BY embedding <=> $query`, served by the HNSW index. Finds passages that mean the same thing in different words, or in another language.
-   - **Lexical** — `store::lexical`: passages whose content, or whose document's title, matches `to_tsquery('word | word | …')`, served by GIN indexes on both, ordered by `ts_rank_cd` with title matches weighted above content. Any-word matching (`search::lexical_query`), not the all-words `plainto_tsquery`, because a natural question rarely has every word in one passage; passages matching more of them still rank higher. Finds exact terms, product names, identifiers — what embeddings blur.
-3. **Reciprocal Rank Fusion** (`store::fuse`): each passage scores `Σ 1/(60 + rank)` across the lists it appears in (k = 60 from Cormack, Clarke & Büttcher 2009). Only rank order matters, so a cosine distance and a `ts_rank_cd` never have to share a scale.
+   - **Passage lexical** — `store::lexical_passages`: passage content matched and ranked with `to_tsquery` and `ts_rank_cd`.
+   - **Title lexical** — `store::lexical_titles`: document titles matched and ranked independently with the same full-text primitives, returning one deterministic fallback passage per document. Keeping the lexical predicates in separate queries lets PostgreSQL use each table's GIN index instead of evaluating a cross-table `OR`.
+   The lexical query uses any-word matching (`word | word | …`), not the all-words `plainto_tsquery`, because a natural question rarely has every word in one passage; passages matching more terms still rank higher. It finds exact terms, product names, and identifiers that embeddings blur. Candidate queries project only response fields, not full documents or stored vectors.
+3. **Reciprocal Rank Fusion** (`store::fuse_with_document_titles`): semantic and passage-text rank are fused per passage. A title rank boosts the best retrieved passage from that document; the deterministic first passage is used only when the document was found by title alone. Each contribution is `1/(60 + rank)` (k = 60 from Cormack, Clarke & Büttcher 2009). Only rank order matters, so a cosine distance and a `ts_rank_cd` never have to share a scale.
 
 pgvector's HNSW scan reads only `hnsw.ef_search` candidates (default 40) and applies a `WHERE` filter afterwards, which would silently return fewer than 50 passages — far fewer with a page-type filter. The `knowledge_base_user` role therefore defaults to `hnsw.ef_search = 100` and `hnsw.iterative_scan = strict_order`, set in Compose's Postgres bootstrap.
 
-An optional `page_types` filter restricts both retrievers. Page type is a facet the caller chooses, never something guessed from the query text and mixed into the score.
+An optional `page_types` filter restricts all retrievers. Page type is a facet the caller chooses, never something guessed from the query text and mixed into the score.
 
 **`Search`** keeps each document once, represented by its best passage (`store::best_per_document`), and returns the top `limit` (10 by default, at most 50) with that passage as `snippet` and the document's `updated_at`, so an agent can judge freshness.
 
@@ -52,7 +54,7 @@ Current limitations: there is no labelled retrieval evaluation set, cross-encode
 
 ## Testing
 
-Unit tests use a fake `LlmClient` — no real HTTP call to the embedder or llm-router. `store` and entity tests run against a real Postgres via `test_db`.
+Unit tests use a fake `LlmClient` — no real HTTP call to the embedder or llm-router. `store` and entity tests run against a real Postgres via `test_db`. Search performance has two fast regression guards: a synchronization barrier proves semantic and lexical retrieval start concurrently, while a warmed service-level search with real PostgreSQL has a deliberately loose one-second ceiling that catches operational stalls with headroom for normal CI variance. A SQL-shape test separately prevents passage and title predicates from being joined back into the cross-table `OR` that caused the measured regression.
 
 ## gRPC API
 

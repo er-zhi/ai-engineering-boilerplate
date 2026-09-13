@@ -154,3 +154,6 @@ pub async fn sweep_expired_sessions_periodically(sessions: PgCacheStore) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
