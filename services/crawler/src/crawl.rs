@@ -7,6 +7,7 @@ use spider::page::Page;
 use spider::website::Website;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::mpsc;
 
 use crate::scope::Scope;
 
@@ -19,7 +20,10 @@ pub struct Limits {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Unreachable;
+pub enum CrawlError {
+    Unreachable,
+    PagesLost(u32),
+}
 
 pub struct CountedPage {
     pub url: String,
@@ -32,38 +36,66 @@ pub struct FetchedPage {
     pub html: String,
 }
 
-pub async fn crawl(
+#[derive(Default)]
+struct CrawlProgress {
+    any_fetched: bool,
+    pages_emitted: u32,
+    pages_lost: u32,
+}
+
+async fn forward_page(
+    page: Page,
+    scope: &Scope,
+    max_pages: u32,
+    progress: &mut CrawlProgress,
+    counted: &mpsc::Sender<CountedPage>,
+    fetched: &mpsc::Sender<FetchedPage>,
+) {
+    if !page.status_code.is_success() {
+        return;
+    }
+    progress.any_fetched = true;
+    if progress.pages_emitted >= max_pages {
+        progress.pages_lost = progress.pages_lost.saturating_add(1);
+        return;
+    }
+    progress.pages_emitted += 1;
+    let html = page.get_html();
+    if html.len() > crate::links::MAX_PARSEABLE_HTML_BYTES {
+        return;
+    }
+    if scope.counts(page.get_url())
+        && counted
+            .send(CountedPage {
+                url: page.get_url().to_owned(),
+                html: html.clone(),
+                status: page.status_code.as_u16(),
+            })
+            .await
+            .is_err()
+    {
+        progress.pages_lost = progress.pages_lost.saturating_add(1);
+    }
+    let final_url = page.get_url_final().to_owned();
+    if final_url.len() <= crate::links::MAX_URL_BYTES
+        && fetched.send(FetchedPage { final_url, html }).await.is_err()
+    {
+        progress.pages_lost = progress.pages_lost.saturating_add(1);
+    }
+}
+
+pub async fn crawl_into(
     base_url: &str,
     scope: &Scope,
     limits: Limits,
-    mut on_counted: impl FnMut(CountedPage) + Send,
-    mut on_fetched: impl FnMut(FetchedPage) + Send,
-) -> Result<(), Unreachable> {
+    counted: mpsc::Sender<CountedPage>,
+    fetched: mpsc::Sender<FetchedPage>,
+) -> Result<(), CrawlError> {
     let mut website = configured_website(base_url, scope, limits);
     let mut pages = website.subscribe(0);
 
-    let mut any_fetched = false;
-    let mut count_fetched_page = |page: Page| {
-        if page.status_code.is_success() {
-            any_fetched = true;
-            let html = page.get_html();
-            if html.len() > crate::links::MAX_PARSEABLE_HTML_BYTES {
-                return;
-            }
-            let counts_toward_scope = scope.counts(page.get_url());
-            if counts_toward_scope {
-                on_counted(CountedPage {
-                    url: page.get_url().to_owned(),
-                    html: html.clone(),
-                    status: page.status_code.as_u16(),
-                });
-            }
-            let final_url = page.get_url_final().to_owned();
-            if final_url.len() <= crate::links::MAX_URL_BYTES {
-                on_fetched(FetchedPage { final_url, html });
-            }
-        }
-    };
+    let mut pages_lost = 0_u32;
+    let mut progress = CrawlProgress::default();
 
     let crawling = website.crawl();
     tokio::pin!(crawling);
@@ -71,8 +103,15 @@ pub async fn crawl(
         tokio::select! {
             () = &mut crawling => break,
             received = pages.recv() => match received {
-                Ok(page) => count_fetched_page(page),
-                Err(RecvError::Lagged(_)) => {}
+                Ok(page) => {
+                    forward_page(page, scope, limits.max_pages, &mut progress, &counted, &fetched)
+                        .await;
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    pages_lost = pages_lost
+                        .saturating_add(u32::try_from(skipped).unwrap_or(u32::MAX));
+                    tracing::error!(skipped, "crawler page stream lagged");
+                }
                 Err(RecvError::Closed) => {
                     crawling.as_mut().await;
                     break;
@@ -80,12 +119,25 @@ pub async fn crawl(
             },
         }
     }
-    drain_pages_sent_before_the_crawl_returned(&mut pages, &mut count_fetched_page);
+    pages_lost = pages_lost.saturating_add(
+        drain_pages_sent_before_the_crawl_returned(
+            &mut pages,
+            scope,
+            limits.max_pages,
+            &mut progress,
+            &counted,
+            &fetched,
+        )
+        .await,
+    );
+    pages_lost = pages_lost.saturating_add(progress.pages_lost);
 
-    if any_fetched {
+    if pages_lost > 0 {
+        Err(CrawlError::PagesLost(pages_lost))
+    } else if progress.any_fetched {
         Ok(())
     } else {
-        Err(Unreachable)
+        Err(CrawlError::Unreachable)
     }
 }
 
@@ -107,17 +159,26 @@ fn configured_website(base_url: &str, scope: &Scope, limits: Limits) -> Website 
     website
 }
 
-fn drain_pages_sent_before_the_crawl_returned(
+async fn drain_pages_sent_before_the_crawl_returned(
     pages: &mut Receiver<Page>,
-    mut count_fetched_page: impl FnMut(Page),
-) {
+    scope: &Scope,
+    max_pages: u32,
+    progress: &mut CrawlProgress,
+    counted: &mpsc::Sender<CountedPage>,
+    fetched: &mpsc::Sender<FetchedPage>,
+) -> u32 {
+    let mut pages_lost = 0_u32;
     loop {
         match pages.try_recv() {
-            Ok(page) => count_fetched_page(page),
-            Err(TryRecvError::Lagged(_)) => {}
+            Ok(page) => forward_page(page, scope, max_pages, progress, counted, fetched).await,
+            Err(TryRecvError::Lagged(skipped)) => {
+                pages_lost = pages_lost.saturating_add(u32::try_from(skipped).unwrap_or(u32::MAX));
+                tracing::error!(skipped, "crawler page stream lagged while draining");
+            }
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
+    pages_lost
 }
 
 #[cfg(test)]
@@ -134,6 +195,30 @@ mod tests {
 
     fn everything() -> Scope {
         Scope::new(&CrawlScope::default())
+    }
+
+    async fn crawl(
+        base_url: &str,
+        scope: &Scope,
+        limits: Limits,
+        mut on_counted: impl FnMut(CountedPage),
+        mut on_fetched: impl FnMut(FetchedPage),
+    ) -> Result<(), CrawlError> {
+        let (counted, mut counted_pages) = mpsc::channel(1);
+        let (fetched, mut fetched_pages) = mpsc::channel(1);
+        let crawling = crawl_into(base_url, scope, limits, counted, fetched);
+        let collecting_counted = async {
+            while let Some(page) = counted_pages.recv().await {
+                on_counted(page);
+            }
+        };
+        let collecting_fetched = async {
+            while let Some(page) = fetched_pages.recv().await {
+                on_fetched(page);
+            }
+        };
+        let (result, (), ()) = tokio::join!(crawling, collecting_counted, collecting_fetched);
+        result
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -277,6 +362,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_pipeline_receiver_reports_the_page_as_lost() {
+        let site = TestSite::start([("/", "page")]).await;
+        let (counted, counted_pages) = mpsc::channel(1);
+        let (fetched, _fetched_pages) = mpsc::channel(1);
+        drop(counted_pages);
+
+        let result = crawl_into(&site.url("/"), &everything(), LIMITS, counted, fetched).await;
+
+        assert!(matches!(result, Err(CrawlError::PagesLost(pages)) if pages >= 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn unreachable_site_is_an_error() {
         let result = crawl(
             &unreachable_url().await,
@@ -287,7 +384,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(Unreachable));
+        assert_eq!(result, Err(CrawlError::Unreachable));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -304,7 +401,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(Unreachable));
+        assert_eq!(result, Err(CrawlError::Unreachable));
         assert_eq!(counted, 0);
     }
 

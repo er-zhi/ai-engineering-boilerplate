@@ -312,13 +312,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn replacing_outbound_links_to_edges_preserves_other_relation_types() {
+        let test = test_db::start().await;
+        let store = PgEdges::new(test.db.clone());
         for preserved in [
             RelationType::Canonical,
             RelationType::Parent,
             RelationType::Redirect,
         ] {
-            let test = test_db::start().await;
-            let store = PgEdges::new(test.db.clone());
             page_edge::ActiveModel {
                 from_url: Set("https://example.com/a".to_owned()),
                 to_url: Set("https://example.com/preserved-target".to_owned()),

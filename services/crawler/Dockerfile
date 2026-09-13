@@ -11,6 +11,7 @@ RUN --mount=type=bind,target=. \
 
 FROM alpine:3.24
 COPY --from=build /usr/local/bin/crawler /usr/local/bin/
+ENV SPIDER_MAX_SIZE_BYTES=5242880
 USER 10001:10001
 EXPOSE 8081
 HEALTHCHECK --interval=5s CMD ["wget", "-qO-", "http://127.0.0.1:8081/health"]

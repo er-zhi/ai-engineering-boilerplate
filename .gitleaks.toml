@@ -1,7 +1,9 @@
+minVersion = "v8.25.0"
+
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Generated, cached, and local model artifacts"
 paths = [
   '''(^|/)target/''',

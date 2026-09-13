@@ -66,6 +66,7 @@ services:
     develop: *rebuild-on-save
     environment:
       CRAWL_MAX_PAGES:
+      SPIDER_MAX_SIZE_BYTES: 5242880
       KNOWLEDGE_BASE_URL: http://knowledge-base:8084
       DATABASE_URL: postgres://crawler_user:${CRAWLER_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
     depends_on:

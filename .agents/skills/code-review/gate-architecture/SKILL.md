@@ -26,7 +26,7 @@ Services are isolated so that several people or agents can each own one and neve
 
 | Shared file | Who may edit it, and how |
 |---|---|
-| `common/proto/<service>.proto` (snake_case: `llm_router.proto`) | The service that serves it. Additive changes only: new fields get new numbers, nothing is renumbered or removed. A new service gets a new `.proto` file, never a block in an existing one |
+| `common/proto/<service>/vN/<service>.proto` (snake_case: `llm_router/v1/llm_router.proto`) | The service that serves it. The directory mirrors the protobuf package required by Buf STANDARD. Additive changes only: new fields get new numbers, nothing is renumbered or removed. A new service gets its own versioned directory and file, never a block in an existing contract |
 | `common/src/` | Contract types a service publishes for its callers (`llm.rs` is LLM Router's tier contract), or code two services already use; the diff names the consumers |
 | `Cargo.toml` (workspace) | Add a crate to `[workspace.dependencies]` once; each service's own `Cargo.toml` references it with `workspace = true` |
 | `compose.yaml` | Each service edits only its own block (including its `depends_on`) plus its bootstrap lines in `postgres-bootstrap` |

@@ -33,19 +33,31 @@ The unit of review is a scope: a diff by default, or the whole repository on a f
 
 ## Deterministic Pre-review
 
-Run applicable commands directly and in parallel where they do not share build state:
+Resolve the reviewed scope before running anything. A missing command or a version below the
+minimum is `BLOCKED`, not a code failure. Use the exact base commit from the review scope for
+compatibility checks; never infer it from whichever local branch happens to be checked out.
+
+| Changed scope | Required checks |
+|---|---|
+| Rust, `Cargo.toml`, `Cargo.lock` | format, Clippy, nextest, doctest, coverage, cargo-deny, complexity |
+| Python under `native/embedder-ane` | Ruff format/lint, ty, Python complexity |
+| Protobuf or `buf.yaml` | Buf format, lint, breaking against the reviewed base SHA |
+| Dockerfile or `compose.yaml` | Compose config and Hadolint |
+| Markdown | typos and offline local-link checking |
+| Any tracked source or configuration | Gitleaks |
+
+Minimum supported toolchain: Rust 1.98.0, cargo-nextest 0.9.131, cargo-llvm-cov 0.9.1,
+cargo-deny 0.20.2, Buf 1.73.0, Hadolint 2.15.1, Ruff 0.16.7, ty 0.0.80, Lizard 1.24.0,
+typos-cli 1.50.1, Lychee 0.24.0, and Gitleaks 8.25.0. Check versions before the phases below.
+
+Run direct tool commands in these phases. Commands within a phase may run in parallel. Phases run
+in order, and Cargo commands that share the target directory run serially rather than waiting on
+the same lock invisibly.
+
+### Phase 1: cheap static checks
 
 ```bash
 cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace --profile ci --status-level slow
-cargo test --workspace --doc
-cargo llvm-cov nextest --workspace --summary-only --fail-under-lines 90
-cargo deny check
-buf format --diff --exit-code
-buf lint
-buf breaking --against '.git#branch=main'
 docker compose config --quiet
 hadolint services/*/Dockerfile
 ruff format --check native/embedder-ane
@@ -58,7 +70,30 @@ lychee --offline '**/*.md'
 gitleaks dir . --config .gitleaks.toml --redact --no-banner
 ```
 
-`nextest` does not run doctests, so the separate `cargo test --doc` command is mandatory. If the ANE virtual environment is absent, report Python type checking as blocked rather than silently skipping it. Network-dependent link checking and mutation testing are scheduled checks, not pre-review blockers.
+### Phase 2: contracts and dependencies
+
+```bash
+cargo deny check
+buf format --diff --exit-code
+buf lint
+buf breaking --against '.git#ref=<review-base-sha>'
+```
+
+### Phase 3: shared Rust build state
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo nextest run --workspace --profile ci --status-level slow
+cargo test --workspace --doc
+cargo llvm-cov nextest --workspace --summary-only --fail-under-lines 90
+```
+
+Clippy performs compiler checking, so a separate `cargo check` only repeats work and is omitted.
+`nextest` does not run doctests, so `cargo test --doc` remains mandatory. The 120-second suite
+budget is a review warning; nextest's three-minute hard timeout is only a dead-run circuit breaker.
+If the ANE virtual environment is absent, report Python type checking as blocked rather than
+silently skipping it. Network-dependent external links and mutation testing are scheduled checks,
+not pre-review blockers.
 
 ## Parallel Dispatch
 

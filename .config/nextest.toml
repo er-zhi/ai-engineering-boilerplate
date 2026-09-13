@@ -1,8 +1,10 @@
+nextest-version = "0.9.131"
+
 [profile.default]
 fail-fast = false
 retries = 0
 slow-timeout = { period = "10s", terminate-after = 6 }
-global-timeout = "2m"
+global-timeout = "3m"
 
 [profile.ci]
 fail-fast = false

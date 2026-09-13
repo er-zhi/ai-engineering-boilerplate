@@ -177,11 +177,11 @@ mod tests {
         }
 
         async fn nearest(&self, _: Vec<f32>, _: Vec<PageType>) -> Result<Vec<Passage>, DbErr> {
-            panic!("ingest tests do not exercise search")
+            Err(DbErr::Custom("ingest tests do not exercise search".into()))
         }
 
         async fn lexical(&self, _: &str, _: Vec<PageType>) -> Result<Vec<Passage>, DbErr> {
-            panic!("ingest tests do not exercise search")
+            Err(DbErr::Custom("ingest tests do not exercise search".into()))
         }
     }
 

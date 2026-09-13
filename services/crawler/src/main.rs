@@ -1,9 +1,12 @@
 // Crawl job service. Accepts crawl requests over Connect and gRPC, crawls in the background, and reports progress.
 
+mod config;
 mod crawl;
 mod entity;
 mod extract;
 mod graph;
+mod instance_guard;
+mod job_store;
 mod jobs;
 mod knowledge_base;
 mod links;
@@ -35,17 +38,15 @@ use crate::crawl::Limits;
 use crate::entity::crawl_job::MAX_BASE_URL_CHARS;
 use crate::entity::page_edge::RelationType;
 use crate::graph::{EdgeStore, MAX_REQUESTABLE_DEPTH, PgEdges};
-use crate::jobs::{Jobs, PgJobs, parse_job_id};
+use crate::job_store::PgJobs;
+use crate::jobs::{Jobs, MAX_CONCURRENT_CRAWLS, parse_job_id};
 use crate::knowledge_base::KnowledgeBaseClient;
 use crate::scope::Scope;
 use crate::store::PgPages;
 
-const DEFAULT_MAX_PAGES: u32 = 100;
-const MAX_PAGES_CEILING: u32 = 10_000;
 const MAX_SCOPE_RULES: usize = 100;
 const MAX_SCOPE_RULE_CHARS: usize = 2048;
 const MAX_IDEMPOTENCY_KEY_CHARS: usize = 128;
-const MAX_CONCURRENT_CRAWLS: usize = 4;
 const MAX_REQUESTED_RELATION_TYPES: usize = 4;
 const CRAWL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const KNOWLEDGE_BASE_CALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -334,17 +335,12 @@ fn is_private_ip(ip: IpAddr) -> bool {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     common::logging::init();
-    let max_pages = match std::env::var("CRAWL_MAX_PAGES") {
-        Ok(value) => value
-            .parse::<u32>()
-            .map_err(|error| format!("CRAWL_MAX_PAGES: {error}"))?,
-        Err(_) => DEFAULT_MAX_PAGES,
-    };
-    if max_pages == 0 || max_pages > MAX_PAGES_CEILING {
-        return Err(format!("CRAWL_MAX_PAGES must be between 1 and {MAX_PAGES_CEILING}").into());
-    }
+    let config = config::CrawlerConfig::from_env()?;
+    let max_pages = config.max_pages();
     let database_url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
     let db = Database::connect(&database_url).await?;
+    let mut instance_guard = instance_guard::CrawlerInstanceGuard::acquire(&db).await?;
+    instance_guard.wait_for_previous_owner().await?;
     db.get_schema_registry("crawler::entity::*")
         .sync(&db)
         .await?;
@@ -383,7 +379,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8081").await?;
     tracing::info!("crawler listening on 0.0.0.0:8081 (max {max_pages} pages per crawl)");
-    axum::serve(listener, app).await?;
+    tokio::select! {
+        result = axum::serve(listener, app) => result?,
+        result = instance_guard.monitor() => {
+            result?;
+            return Err("crawler ownership monitor stopped unexpectedly".into());
+        }
+    }
 
     Ok(())
 }

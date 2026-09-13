@@ -6,6 +6,7 @@ pub mod logging;
 #[cfg(feature = "test-support")]
 pub mod test_db;
 
+#[allow(clippy::too_many_lines)]
 pub mod proto {
     connectrpc::include_generated!();
 }
