@@ -6,6 +6,7 @@ use chrono::DateTime;
 use sea_orm::DbErr;
 
 use super::super::*;
+use crate::entity::document;
 use crate::llm_client::{Embedded, Enrichment};
 use crate::store::{DocumentWrite, LexicalCandidates, Passage};
 
@@ -21,6 +22,7 @@ pub(super) struct MemoryDocuments {
     pub(super) lexical_passages_with: Calls<String>,
     pub(super) lexical_titles_with: Calls<String>,
     pub(super) fails: bool,
+    pub(super) document: Option<document::Model>,
 }
 
 impl DocumentStore for MemoryDocuments {
@@ -31,6 +33,13 @@ impl DocumentStore for MemoryDocuments {
     async fn upsert(&self, document: DocumentWrite) -> Result<(), DbErr> {
         self.upserted.lock().unwrap().push(document);
         Ok(())
+    }
+
+    async fn document(&self, _: &str, _: &str) -> Result<Option<document::Model>, DbErr> {
+        if self.fails {
+            return Err(DbErr::Custom("database is down".into()));
+        }
+        Ok(self.document.clone())
     }
 
     async fn nearest(
@@ -101,6 +110,7 @@ pub(super) fn passage(chunk_id: i64, source_id: &str) -> Passage {
     Passage {
         chunk_id,
         document_id,
+        ordinal: 0,
         content: format!("passage {chunk_id}"),
         source: "crawler".to_owned(),
         source_id: source_id.to_owned(),
@@ -109,6 +119,7 @@ pub(super) fn passage(chunk_id: i64, source_id: &str) -> Passage {
         page_type: PageType::Product,
         keywords: vec!["wireless".to_owned(), "headphones".to_owned()],
         updated_at: DateTime::from_timestamp(1_789_000_000, 0).unwrap(),
+        content_hash: "0".repeat(64),
     }
 }
 

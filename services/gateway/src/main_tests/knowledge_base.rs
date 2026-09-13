@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use common::proto::knowledge_base::v1::{
-    IngestRequest, IngestResponse, KnowledgeBaseService, KnowledgeBaseServiceClient, SearchRequest,
-    SearchResponse, SearchResult,
+    DocumentRef, IngestRequest, IngestResponse, KnowledgeBaseService, KnowledgeBaseServiceClient,
+    ReadDocumentRequest, ReadDocumentResponse, SearchRequest, SearchResponse, SearchResult,
 };
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{
@@ -16,6 +16,7 @@ use crate::proxy::{Gateway, KNOWLEDGE_BASE_CALL_TIMEOUT};
 struct FakeKnowledgeBase {
     ingested: std::sync::Mutex<Vec<IngestRequest>>,
     searched: std::sync::Mutex<Vec<SearchRequest>>,
+    read: std::sync::Mutex<Vec<ReadDocumentRequest>>,
     failure: Option<ErrorCode>,
 }
 
@@ -62,12 +63,37 @@ impl KnowledgeBaseService for FakeKnowledgeBase {
             ..Default::default()
         })
     }
+
+    async fn read_document(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, ReadDocumentRequest>,
+    ) -> ServiceResult<ReadDocumentResponse> {
+        self.read.lock().unwrap().push(request.to_owned_message());
+        if let Some(code) = self.failure {
+            return Err(ConnectError::new(code, "configured knowledge-base failure"));
+        }
+        Response::ok(ReadDocumentResponse {
+            document: DocumentRef {
+                source: "crawler".to_owned(),
+                source_id: "https://example.com/a".to_owned(),
+                version: "0".repeat(64),
+                ..Default::default()
+            }
+            .into(),
+            title: "Title".to_owned(),
+            content: "Complete document".to_owned(),
+            total_chars: 17,
+            ..Default::default()
+        })
+    }
 }
 
 fn fake_knowledge_base(failure: Option<ErrorCode>) -> Arc<FakeKnowledgeBase> {
     Arc::new(FakeKnowledgeBase {
         ingested: std::sync::Mutex::new(Vec::new()),
         searched: std::sync::Mutex::new(Vec::new()),
+        read: std::sync::Mutex::new(Vec::new()),
         failure,
     })
 }
@@ -150,4 +176,37 @@ async fn ingest_is_never_forwarded_to_knowledge_base() {
     let error = client.ingest(IngestRequest::default()).await.unwrap_err();
     assert_eq!(error.code, ErrorCode::Unimplemented);
     assert!(fake.ingested.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn read_document_forwards_the_reference_and_page_options() {
+    let fake = fake_knowledge_base(None);
+    let knowledge_base_url = start_fake_knowledge_base(Arc::clone(&fake)).await;
+    let gateway = Gateway {
+        crawler: crawler_client_to("http://127.0.0.1:1"),
+        knowledge_base: knowledge_base_client_to(&knowledge_base_url),
+    };
+    let gateway_url = start_gateway(gateway).await;
+    let client = knowledge_base_client_to(&gateway_url);
+    let request = ReadDocumentRequest {
+        document: DocumentRef {
+            source: "crawler".to_owned(),
+            source_id: "https://example.com/a".to_owned(),
+            version: "0".repeat(64),
+            ..Default::default()
+        }
+        .into(),
+        cursor: "kb1:10".to_owned(),
+        max_chars: 8_000,
+        ..Default::default()
+    };
+
+    let response = client
+        .read_document(request.clone())
+        .await
+        .unwrap()
+        .into_owned();
+
+    assert_eq!(*fake.read.lock().unwrap(), [request]);
+    assert_eq!(response.content, "Complete document");
 }

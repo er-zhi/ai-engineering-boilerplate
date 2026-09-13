@@ -46,11 +46,23 @@ pgvector's HNSW scan reads only `hnsw.ef_search` candidates (default 40) and app
 
 An optional `page_types` filter restricts all retrievers. Page type is a facet the caller chooses, never something guessed from the query text and mixed into the score.
 
-**`Search`** keeps each document once, represented by its best passage (`store::best_per_document`), and returns the top `limit` (10 by default, at most 50) with that passage as `snippet` and the document's `updated_at`, so an agent can judge freshness.
+**`Search`** keeps each document once, represented by its best passage (`store::best_per_document`), and returns the top `limit` (10 by default, at most 50) with that passage as `snippet`, its ordinal, a versioned `DocumentRef`, and the document's `updated_at`. An agent can judge freshness from the compact result and call `ReadDocument` only when it needs the complete source.
+
+`ReadDocument` returns bounded, character-safe pages from the canonical full text. The opaque cursor is valid only together with the `DocumentRef` returned by `Search`; if the document has changed, the read fails explicitly and the agent must search again. This prevents an agent from silently combining passages from different document versions.
 
 There is no generation step here. An agent calling `Search` already has a model; a second LLM inside knowledge-base would add seconds and cost for text the agent rewrites anyway. The web page at `/` only exists to inspect what `Search` returns.
 
 Current limitations: there is no labelled retrieval evaluation set, cross-encoder reranker, or true BM25. Lexical ranking uses PostgreSQL `ts_rank_cd`.
+
+## Foundation for Agentic RAG
+
+Knowledge Base is the retrieval layer for a future adaptive, self-correcting RAG loop; it is not itself an answer-generating agent. The intended flow is:
+
+`Query -> reasoning/orchestration agent -> Search -> ReadDocument when needed -> evidence check -> another retrieval or tool call when needed -> final answer`
+
+The orchestrator may later route individual steps to web search, a knowledge graph, or other tools and ask its model whether the gathered evidence is sufficient. Those capabilities belong behind separate adapters so internal KB retrieval remains fast, deterministic, independently testable, and usable without an LLM call. A knowledge graph should be added for workloads that need entity relationships, not as a mandatory hop for every query.
+
+Agents should start with `Search`, keep the returned source metadata and `DocumentRef` as citations, then page through `ReadDocument` only for sources that require broader context. This small-to-big path avoids placing every full document in the model context while still allowing exact whole-document inspection.
 
 ## Testing
 
@@ -61,7 +73,8 @@ Unit tests use a fake `LlmClient` — no real HTTP call to the embedder or llm-r
 [`common/proto/knowledge_base/v1/knowledge_base.proto`](../../common/proto/knowledge_base/v1/knowledge_base.proto):
 
 - `Ingest(source, source_id, title, content) -> (stored, skipped)`. `source` and `source_id` together identify one document; `source` names the caller (`"crawler"` today), `source_id` is whatever that caller uses to identify the thing (crawler uses the URL).
-- `Search(query, page_types, limit) -> results[]` — up to `limit` documents (0 means 10, at most 50), each with its best-matching `snippet` and `updated_at` (RFC 3339). At most 6 page types; a query up to 1,000 characters. The request carries only what agent-facing retrieval tools commonly expose — result count and a metadata filter; search mode, fusion constants, and thresholds stay server-side.
+- `Search(query, page_types, limit) -> results[]` — up to `limit` documents (0 means 10, at most 50), each with its best-matching `snippet`, `passage_ordinal`, versioned `document` reference, and `updated_at` (RFC 3339). At most 6 page types; a query up to 1,000 characters. The request carries only what agent-facing retrieval tools commonly expose — result count and a metadata filter; search mode, fusion constants, and thresholds stay server-side.
+- `ReadDocument(document, cursor, max_chars) -> (content, next_cursor, total_chars)` — reads one exact document version in bounded pages. `max_chars` defaults to 16,000 and cannot exceed 50,000; an empty `next_cursor` means the document is complete. Callers treat cursors as opaque and restart from `Search` when the version is stale.
 
 `Ingest` accepts `content` up to 200,000 characters — about 170 passages, a few seconds of embedding — so one call stays well inside crawler's 90 s timeout.
 

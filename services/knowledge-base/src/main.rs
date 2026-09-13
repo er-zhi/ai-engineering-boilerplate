@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use axum::routing::get;
 use common::proto::knowledge_base::v1::{
-    IngestRequest, IngestResponse, KnowledgeBaseService, SearchRequest, SearchResponse,
+    IngestRequest, IngestResponse, KnowledgeBaseService, ReadDocumentRequest, ReadDocumentResponse,
+    SearchRequest, SearchResponse,
 };
 use connectrpc::{
     RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
@@ -54,6 +55,15 @@ impl KnowledgeBaseService for Ingestor {
         request: ServiceRequest<'_, SearchRequest>,
     ) -> ServiceResult<SearchResponse> {
         let response = self.inner.search(request.to_owned_message()).await?;
+        Response::ok(response)
+    }
+
+    async fn read_document(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, ReadDocumentRequest>,
+    ) -> ServiceResult<ReadDocumentResponse> {
+        let response = self.inner.read_document(request.to_owned_message()).await?;
         Response::ok(response)
     }
 }

@@ -36,6 +36,16 @@ impl DocumentStore for ConcurrentDocuments {
         Ok(())
     }
 
+    async fn document(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<crate::entity::document::Model>, DbErr> {
+        Err(DbErr::Custom(
+            "concurrency tests do not read documents".into(),
+        ))
+    }
+
     async fn nearest(&self, _: Vec<f32>, _: Vec<PageType>) -> Result<Vec<Passage>, DbErr> {
         Ok(self.arrive().await)
     }

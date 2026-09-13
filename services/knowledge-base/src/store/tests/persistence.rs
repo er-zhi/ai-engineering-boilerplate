@@ -23,6 +23,29 @@ async fn a_new_source_and_source_id_has_no_existing_hash() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_document_can_be_read_by_its_external_identity() {
+    let test = test_db::start().await;
+    let store = PgDocuments::new(test.db.clone());
+    store
+        .upsert(document_write(
+            "https://example.com/a",
+            PageType::Documentation,
+            vec![("complete body", fixed_dimension_embedding(1.0, 0.0, 0.0))],
+        ))
+        .await
+        .unwrap();
+
+    let found = store
+        .document("crawler", "https://example.com/a")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(found.content, "complete body");
+    assert_eq!(found.content_hash, "0".repeat(64));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn upserting_again_replaces_the_passages_but_keeps_the_first_ingested_at() {
     let test = test_db::start().await;
     let store = PgDocuments::new(test.db.clone());

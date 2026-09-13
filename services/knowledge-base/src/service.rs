@@ -1,7 +1,8 @@
 // Checks each request at the boundary, then runs ingest or hybrid retrieval over passages.
 
 use common::proto::knowledge_base::v1::{
-    IngestRequest, IngestResponse, SearchRequest, SearchResponse, SearchResult,
+    DocumentRef, IngestRequest, IngestResponse, ReadDocumentRequest, ReadDocumentResponse,
+    SearchRequest, SearchResponse, SearchResult,
 };
 use connectrpc::ConnectError;
 
@@ -10,6 +11,8 @@ use crate::ingest::{self, IngestFailed};
 use crate::llm_client::{EmbedKind, LlmClient};
 use crate::search;
 use crate::store::{self, DocumentStore, Ranked};
+
+mod read;
 
 const MAX_SOURCE_CHARS: usize = 64;
 const MAX_SOURCE_ID_CHARS: usize = 2048;
@@ -54,9 +57,16 @@ impl<D: DocumentStore, L: LlmClient> KnowledgeBase<D, L> {
             results: store::best_per_document(ranked, limit)
                 .into_iter()
                 .map(search_result)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             ..Default::default()
         })
+    }
+
+    pub async fn read_document(
+        &self,
+        request: ReadDocumentRequest,
+    ) -> Result<ReadDocumentResponse, ConnectError> {
+        read::run(&self.documents, request).await
     }
 
     async fn retrieve(
@@ -116,9 +126,19 @@ fn ingest_error(error: IngestFailed) -> ConnectError {
     }
 }
 
-fn search_result(ranked: Ranked) -> SearchResult {
+fn search_result(ranked: Ranked) -> Result<SearchResult, ConnectError> {
     let passage = ranked.passage;
-    SearchResult {
+    let passage_ordinal = u32::try_from(passage.ordinal).map_err(|_| {
+        tracing::error!("stored passage has a negative ordinal");
+        ConnectError::internal("stored passage is invalid")
+    })?;
+    let document = DocumentRef {
+        source: passage.source.clone(),
+        source_id: passage.source_id.clone(),
+        version: passage.content_hash.clone(),
+        ..Default::default()
+    };
+    Ok(SearchResult {
         source: passage.source,
         source_id: passage.source_id,
         title: passage.title,
@@ -128,8 +148,10 @@ fn search_result(ranked: Ranked) -> SearchResult {
         snippet: passage.content,
         updated_at: passage.updated_at.to_rfc3339(),
         score: ranked.score as f32,
+        document: document.into(),
+        passage_ordinal,
         ..Default::default()
-    }
+    })
 }
 
 fn store_unavailable(error: sea_orm::DbErr) -> ConnectError {

@@ -30,6 +30,9 @@ async fn a_search_fuses_passages_and_returns_each_document_once_with_its_best_pa
     assert_eq!(response.results[0].page_type, "product");
     assert_eq!(response.results[0].keywords, ["wireless", "headphones"]);
     assert_eq!(response.results[0].updated_at, "2026-09-10T00:26:40+00:00");
+    assert_eq!(response.results[0].document.source_id, "b");
+    assert_eq!(response.results[0].document.version, "0".repeat(64));
+    assert_eq!(response.results[0].passage_ordinal, 0);
     assert!(response.results[0].score > response.results[1].score);
 
     let wanted = vec![PageType::Product, PageType::Blog];

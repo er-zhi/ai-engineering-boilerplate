@@ -123,7 +123,7 @@ mod tests {
     use sea_orm::DbErr;
 
     use super::*;
-    use crate::entity::document::PageType;
+    use crate::entity::document::{self, PageType};
     use crate::llm_client::{Embedded, Enrichment};
     use crate::store::Passage;
 
@@ -174,6 +174,10 @@ mod tests {
             }
             self.upserted.lock().unwrap().push(document);
             Ok(())
+        }
+
+        async fn document(&self, _: &str, _: &str) -> Result<Option<document::Model>, DbErr> {
+            Err(DbErr::Custom("ingest tests do not read documents".into()))
         }
 
         async fn nearest(&self, _: Vec<f32>, _: Vec<PageType>) -> Result<Vec<Passage>, DbErr> {

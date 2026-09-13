@@ -9,8 +9,8 @@ use common::proto::crawler::v1::{
     GetPageNeighborsRequest, GetPageNeighborsResponse, StartCrawlRequest, StartCrawlResponse,
 };
 use common::proto::knowledge_base::v1::{
-    IngestRequest, IngestResponse, KnowledgeBaseService, KnowledgeBaseServiceClient, SearchRequest,
-    SearchResponse,
+    IngestRequest, IngestResponse, KnowledgeBaseService, KnowledgeBaseServiceClient,
+    ReadDocumentRequest, ReadDocumentResponse, SearchRequest, SearchResponse,
 };
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{
@@ -132,6 +132,19 @@ impl KnowledgeBaseService for Gateway {
         let upstream = self
             .knowledge_base
             .search(request.to_owned_message())
+            .await?
+            .into_owned();
+        Response::ok(upstream)
+    }
+
+    async fn read_document(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, ReadDocumentRequest>,
+    ) -> ServiceResult<ReadDocumentResponse> {
+        let upstream = self
+            .knowledge_base
+            .read_document(request.to_owned_message())
             .await?
             .into_owned();
         Response::ok(upstream)

@@ -5,6 +5,14 @@ package knowledge_base.v1;
 service KnowledgeBaseService {
   rpc Ingest(IngestRequest) returns (IngestResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
+  rpc ReadDocument(ReadDocumentRequest) returns (ReadDocumentResponse);
+}
+
+message DocumentRef {
+  string source = 1;
+  string source_id = 2;
+  // SHA-256 content version returned by Search; prevents mixing revisions while reading pages.
+  string version = 3;
 }
 
 message IngestRequest {
@@ -41,9 +49,30 @@ message SearchResult {
   string snippet = 8;
   // RFC 3339; when knowledge-base last stored a changed version of this document.
   string updated_at = 9;
+  // Stable external identity and the exact revision this result came from.
+  DocumentRef document = 10;
+  // Zero-based position of the matching passage inside this document revision.
+  uint32 passage_ordinal = 11;
 }
 
 message SearchResponse {
   // At most `limit` documents, highest score first.
   repeated SearchResult results = 1;
+}
+
+message ReadDocumentRequest {
+  DocumentRef document = 1;
+  // Opaque cursor returned by the previous page; empty starts at the beginning.
+  string cursor = 2;
+  // Characters to return: 0 means 16,000, at most 50,000.
+  uint32 max_chars = 3;
+}
+
+message ReadDocumentResponse {
+  DocumentRef document = 1;
+  string title = 2;
+  string content = 3;
+  // Empty when the complete document revision has been returned.
+  string next_cursor = 4;
+  uint32 total_chars = 5;
 }

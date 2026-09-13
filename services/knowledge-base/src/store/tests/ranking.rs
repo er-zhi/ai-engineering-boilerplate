@@ -7,6 +7,7 @@ fn passage(chunk_id: i64, document_id: i64) -> Passage {
     Passage {
         chunk_id,
         document_id,
+        ordinal: 0,
         content: format!("passage {chunk_id}"),
         source: "crawler".to_owned(),
         source_id: format!("doc-{document_id}"),
@@ -15,6 +16,7 @@ fn passage(chunk_id: i64, document_id: i64) -> Passage {
         page_type: PageType::Other,
         keywords: vec![],
         updated_at: chrono::DateTime::UNIX_EPOCH,
+        content_hash: "0".repeat(64),
     }
 }
 

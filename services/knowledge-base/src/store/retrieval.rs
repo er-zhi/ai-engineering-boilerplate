@@ -113,6 +113,7 @@ pub(super) fn passage_projection(
         .select_only()
         .column_as(document_chunk::Column::Id, "chunk_id")
         .column_as(document_chunk::Column::DocumentId, "document_id")
+        .column(document_chunk::Column::Ordinal)
         .column(document_chunk::Column::Content)
         .column(document::Column::Source)
         .column(document::Column::SourceId)
@@ -121,4 +122,5 @@ pub(super) fn passage_projection(
         .column(document::Column::PageType)
         .column(document::Column::Keywords)
         .column(document::Column::UpdatedAt)
+        .column(document::Column::ContentHash)
 }

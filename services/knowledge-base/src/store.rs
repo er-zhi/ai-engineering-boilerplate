@@ -31,6 +31,7 @@ pub struct DocumentWrite {
 pub struct Passage {
     pub chunk_id: i64,
     pub document_id: i64,
+    pub ordinal: i32,
     pub content: String,
     pub source: String,
     pub source_id: String,
@@ -39,6 +40,7 @@ pub struct Passage {
     pub page_type: PageType,
     pub keywords: Vec<String>,
     pub updated_at: DateTimeUtc,
+    pub content_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +62,12 @@ pub trait DocumentStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<String>, DbErr>> + Send;
 
     fn upsert(&self, document: DocumentWrite) -> impl Future<Output = Result<(), DbErr>> + Send;
+
+    fn document(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> impl Future<Output = Result<Option<document::Model>, DbErr>> + Send;
 
     fn nearest(
         &self,
@@ -135,6 +143,18 @@ impl DocumentStore for PgDocuments {
                 .await?;
         }
         txn.commit().await
+    }
+
+    async fn document(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> Result<Option<document::Model>, DbErr> {
+        document::Entity::find()
+            .filter(document::Column::Source.eq(source))
+            .filter(document::Column::SourceId.eq(source_id))
+            .one(&self.db)
+            .await
     }
 
     async fn nearest(
