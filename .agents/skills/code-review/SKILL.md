@@ -23,12 +23,42 @@ Orchestrates the review gates. Each gate is one skill in this folder, one concer
 
 The unit of review is a scope: a diff by default, or the whole repository on a first run or after a long gap. Every gate takes the scope in its prompt and reads only that.
 
-1. Pick the gates that apply to the scope; skip the rest.
-2. Note the wall-clock time before dispatch.
-3. Dispatch **all** applicable gates at once, in parallel. Never run a gate serially.
-4. Collect each gate's findings and how long it took.
-5. Merge into the report below. Worst gate verdict wins.
-6. Append one line to the run log — see [run-log.md](run-log.md).
+1. Run the deterministic pre-review checks below. Stop and return their diagnostics to the implementing agent if any check fails; do not spend review-agent calls on mechanically invalid code.
+2. Pick the gates that apply to the scope; skip the rest.
+3. Note the wall-clock time before dispatch.
+4. Dispatch **all** applicable gates at once, in parallel. Never run a gate serially.
+5. Collect each gate's findings and how long it took.
+6. Merge into the report below. Worst gate verdict wins.
+7. Append one line to the run log — see [run-log.md](run-log.md).
+
+## Deterministic Pre-review
+
+Run applicable commands directly and in parallel where they do not share build state:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo nextest run --workspace --profile ci --status-level slow
+cargo test --workspace --doc
+cargo llvm-cov nextest --workspace --summary-only --fail-under-lines 90
+cargo deny check
+buf format --diff --exit-code
+buf lint
+buf breaking --against '.git#branch=main'
+docker compose config --quiet
+hadolint services/*/Dockerfile
+ruff format --check native/embedder-ane
+ruff check native/embedder-ane
+ty check --python native/embedder-ane/.venv/bin/python native/embedder-ane/server.py
+uvx lizard -l rust -C 15 -T nloc=60 -a 6 -w common services
+uvx lizard -l python -C 15 -T nloc=60 -a 6 -w native/embedder-ane/server.py
+typos
+lychee --offline '**/*.md'
+gitleaks dir . --config .gitleaks.toml --redact --no-banner
+```
+
+`nextest` does not run doctests, so the separate `cargo test --doc` command is mandatory. If the ANE virtual environment is absent, report Python type checking as blocked rather than silently skipping it. Network-dependent link checking and mutation testing are scheduled checks, not pre-review blockers.
 
 ## Parallel Dispatch
 

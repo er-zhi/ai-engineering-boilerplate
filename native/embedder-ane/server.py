@@ -3,6 +3,7 @@
 import platform
 import sys
 import threading
+from typing import TypedDict
 
 MINIMUM_MACOS_VERSION = (13, 0)
 MAX_REQUEST_TEXT_CHARS = 20_000
@@ -26,7 +27,9 @@ from tokenizers import Tokenizer
 
 MODEL_DIR = "models"
 PAD_TOKEN = 151643
-QUERY_INSTRUCTION = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+QUERY_INSTRUCTION = (
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+)
 
 app = FastAPI()
 
@@ -38,14 +41,32 @@ async def as_embedder_error(_request: Request, exc: HTTPException):
 
 tokenizer = Tokenizer.from_file(f"{MODEL_DIR}/tokenizer.json")
 
-PROFILES = {
-    "short": {"model": ct.models.MLModel(f"{MODEL_DIR}/qwen3-b1_s128-8bit.mlpackage", compute_units=ct.ComputeUnit.CPU_AND_NE), "seq_len": 128},
-    "long": {"model": ct.models.MLModel(f"{MODEL_DIR}/qwen3-b1_s512-8bit.mlpackage", compute_units=ct.ComputeUnit.CPU_AND_NE), "seq_len": 512},
-}
-
 MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
-MAX_TOKENS = PROFILES["long"]["seq_len"]
 single_neural_engine_lock = threading.Lock()
+
+
+class ModelProfile(TypedDict):
+    model: ct.models.MLModel
+    seq_len: int
+
+
+PROFILES: dict[str, ModelProfile] = {
+    "short": {
+        "model": ct.models.MLModel(
+            f"{MODEL_DIR}/qwen3-b1_s128-8bit.mlpackage",
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+        ),
+        "seq_len": 128,
+    },
+    "long": {
+        "model": ct.models.MLModel(
+            f"{MODEL_DIR}/qwen3-b1_s512-8bit.mlpackage",
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+        ),
+        "seq_len": 512,
+    },
+}
+MAX_TOKENS = PROFILES["long"]["seq_len"]
 
 
 class EmbedRequest(BaseModel):
@@ -82,10 +103,12 @@ def run_embed(text: str) -> tuple[list[float], bool]:
     attention_mask = [0] * pad_len + [1] * len(ids)
 
     with single_neural_engine_lock:
-        out = profile["model"].predict({
-            "input_ids": np.array([input_ids], dtype=np.int32),
-            "attention_mask": np.array([attention_mask], dtype=np.int32),
-        })
+        out = profile["model"].predict(
+            {
+                "input_ids": np.array([input_ids], dtype=np.int32),
+                "attention_mask": np.array([attention_mask], dtype=np.int32),
+            }
+        )
     return np.array(out["embedding"])[0].tolist(), truncated
 
 

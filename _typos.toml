@@ -1,0 +1,15 @@
+[files]
+extend-exclude = [".temp", "target"]
+
+[default.extend-words]
+ane = "ane"
+axum = "axum"
+buffa = "buffa"
+clippy = "clippy"
+connectrpc = "connectrpc"
+openrouter = "openrouter"
+pgvector = "pgvector"
+rustls = "rustls"
+seaorm = "seaorm"
+testcontainers = "testcontainers"
+unparseable = "unparseable"

@@ -1,0 +1,10 @@
+[profile.default]
+fail-fast = false
+retries = 0
+slow-timeout = { period = "10s", terminate-after = 6 }
+global-timeout = "2m"
+
+[profile.ci]
+fail-fast = false
+flaky-result = "fail"
+junit = { path = "junit.xml" }

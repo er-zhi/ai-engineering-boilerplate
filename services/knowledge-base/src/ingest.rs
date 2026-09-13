@@ -46,24 +46,7 @@ pub async fn run(
         .map_err(IngestFailed::Llm)?;
 
     let header = context_header(&input.title, &enrichment.summary);
-    let mut chunks = Vec::new();
-    let mut embedding_model = String::new();
-    for passage in chunk::split(&input.content) {
-        let embedded = llm
-            .embed(&format!("{header}{passage}"), EmbedKind::StoredPassage)
-            .await
-            .map_err(IngestFailed::Llm)?;
-        embedding_model = embedded
-            .model_used
-            .chars()
-            .take(MAX_EMBEDDING_MODEL_CHARS)
-            .collect();
-        chunks.push(document_chunk::ActiveModel {
-            content: Set(passage),
-            embedding: Set(PgVector::from(embedded.values)),
-            ..Default::default()
-        });
-    }
+    let (chunks, embedding_model) = embed_chunks(llm, &input.content, &header).await?;
 
     documents
         .upsert(DocumentWrite {
@@ -89,6 +72,32 @@ pub async fn run(
         skipped: false,
         ..Default::default()
     })
+}
+
+async fn embed_chunks(
+    llm: &impl LlmClient,
+    content: &str,
+    header: &str,
+) -> Result<(Vec<document_chunk::ActiveModel>, String), IngestFailed> {
+    let mut chunks = Vec::new();
+    let mut embedding_model = String::new();
+    for passage in chunk::split(content) {
+        let embedded = llm
+            .embed(&format!("{header}{passage}"), EmbedKind::StoredPassage)
+            .await
+            .map_err(IngestFailed::Llm)?;
+        embedding_model = embedded
+            .model_used
+            .chars()
+            .take(MAX_EMBEDDING_MODEL_CHARS)
+            .collect();
+        chunks.push(document_chunk::ActiveModel {
+            content: Set(passage),
+            embedding: Set(PgVector::from(embedded.values)),
+            ..Default::default()
+        });
+    }
+    Ok((chunks, embedding_model))
 }
 
 fn context_header(title: &str, summary: &str) -> String {
@@ -168,11 +177,11 @@ mod tests {
         }
 
         async fn nearest(&self, _: Vec<f32>, _: Vec<PageType>) -> Result<Vec<Passage>, DbErr> {
-            unimplemented!("ingest tests do not exercise search")
+            panic!("ingest tests do not exercise search")
         }
 
         async fn lexical(&self, _: &str, _: Vec<PageType>) -> Result<Vec<Passage>, DbErr> {
-            unimplemented!("ingest tests do not exercise search")
+            panic!("ingest tests do not exercise search")
         }
     }
 

@@ -65,7 +65,7 @@ Embedding used to be a third RPC on this service (`Embed`, one model, no fallbac
 
 ## gRPC API
 
-[`common/proto/llm_router.proto`](../../common/proto/llm_router.proto) — `Complete` and `DescribeTiers`. Streaming and tool calling are future work.
+[`common/proto/llm_router/v1/llm_router.proto`](../../common/proto/llm_router/v1/llm_router.proto) — `Complete` and `DescribeTiers`. Streaming and tool calling are future work.
 
 Both RPCs answer at the Connect path, JSON body, no client library needed:
 

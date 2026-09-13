@@ -1,0 +1,5 @@
+failure-threshold: warning
+ignored:
+  - DL3018
+trusted-registries:
+  - docker.io

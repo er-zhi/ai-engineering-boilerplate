@@ -10,3 +10,4 @@ native/*/.venv/
 native/*/__pycache__/
 
 .temp
+.lycheecache

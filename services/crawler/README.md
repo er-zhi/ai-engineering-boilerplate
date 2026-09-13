@@ -82,7 +82,7 @@ Chromium dominates crawl cost, so treat it as an escalation and never a default.
 
 ## API
 
-Defined in [`common/proto/crawler.proto`](../../common/proto/crawler.proto) and served over both Connect and gRPC; Gateway reaches it over gRPC.
+Defined in [`common/proto/crawler/v1/crawler.proto`](../../common/proto/crawler/v1/crawler.proto) and served over both Connect and gRPC; Gateway reaches it over gRPC.
 
 - `StartCrawl` — submit a base URL, scope, and optional `idempotency_key` to crawl and index
 - `GetCrawlJob` — job status and page counts

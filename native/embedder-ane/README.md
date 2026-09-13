@@ -52,7 +52,9 @@ import coremltools.optimize.coreml as cto
 
 model = ct.models.MLModel("b1_s128.mlpackage")
 config = cto.OptimizationConfig(
-    global_config=cto.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", weight_threshold=512)
+    global_config=cto.OpLinearQuantizerConfig(
+        mode="linear_symmetric", dtype="int8", weight_threshold=512
+    )
 )
 cto.linear_quantize_weights(model, config=config).save("models/qwen3-b1_s128-8bit.mlpackage")
 ```

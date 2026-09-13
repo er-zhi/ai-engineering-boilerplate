@@ -32,22 +32,9 @@ impl<D: DocumentStore, L: LlmClient> KnowledgeBase<D, L> {
 
     pub async fn ingest(&self, request: IngestRequest) -> Result<IngestResponse, ConnectError> {
         validate(&request)?;
-
-        match ingest::run(&self.documents, &self.llm, request).await {
-            Ok(outcome) => Ok(outcome),
-            Err(IngestFailed::Llm(message)) => {
-                tracing::warn!("ingest could not enrich or embed: {message}");
-                Err(ConnectError::unavailable(
-                    "could not enrich or embed this content; nothing was written",
-                ))
-            }
-            Err(IngestFailed::Store(message)) => {
-                tracing::error!("ingest could not write the document: {message}");
-                Err(ConnectError::unavailable(
-                    "the document store is not available",
-                ))
-            }
-        }
+        ingest::run(&self.documents, &self.llm, request)
+            .await
+            .map_err(ingest_error)
     }
 
     pub async fn search(&self, request: SearchRequest) -> Result<SearchResponse, ConnectError> {
@@ -105,6 +92,19 @@ impl<D: DocumentStore, L: LlmClient> KnowledgeBase<D, L> {
             }
         );
         Ok(store::fuse(vec![semantic?, lexical?]))
+    }
+}
+
+fn ingest_error(error: IngestFailed) -> ConnectError {
+    match error {
+        IngestFailed::Llm(message) => {
+            tracing::warn!("ingest could not enrich or embed: {message}");
+            ConnectError::unavailable("could not enrich or embed this content; nothing was written")
+        }
+        IngestFailed::Store(message) => {
+            tracing::error!("ingest could not write the document: {message}");
+            ConnectError::unavailable("the document store is not available")
+        }
     }
 }
 

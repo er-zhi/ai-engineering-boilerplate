@@ -263,11 +263,18 @@ async fn sweep_expired_sessions_periodically(sessions: PgCacheStore) {
     let mut interval = tokio::time::interval(SESSION_SWEEP_INTERVAL);
     loop {
         interval.tick().await;
-        match sessions.drop_expired(chrono::Utc::now()).await {
-            Ok(removed) if removed > 0 => tracing::info!("swept {removed} expired sessions"),
-            Ok(_) => {}
-            Err(error) => tracing::error!("could not sweep expired sessions: {error}"),
-        }
+        sweep_expired_sessions(&sessions).await;
+    }
+}
+
+async fn sweep_expired_sessions(sessions: &PgCacheStore) {
+    let removed = sessions
+        .drop_expired(chrono::Utc::now())
+        .await
+        .inspect_err(|error| tracing::error!("could not sweep expired sessions: {error}"))
+        .unwrap_or_default();
+    if removed > 0 {
+        tracing::info!("swept {removed} expired sessions");
     }
 }
 
@@ -275,14 +282,16 @@ fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    common::logging::init();
-    let crawler_url =
-        std::env::var("CRAWLER_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into());
-    let knowledge_base_url =
-        std::env::var("KNOWLEDGE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8084".into());
-    let frontend_dir = std::env::var("FRONTEND_DIST_DIR").unwrap_or_else(|_| "/frontend".into());
+struct GatewayConfig {
+    crawler_url: String,
+    knowledge_base_url: String,
+    frontend_dir: String,
+    database_url: String,
+    password: String,
+    session_ttl: Duration,
+}
+
+fn gateway_config() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
     let session_ttl_hours = match std::env::var("GATEWAY_SESSION_TTL_HOURS") {
         Ok(value) => value
             .parse::<u64>()
@@ -296,8 +305,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let database_url = env("DATABASE_URL")?;
-    let db = Database::connect(&database_url).await?;
+    Ok(GatewayConfig {
+        crawler_url: std::env::var("CRAWLER_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8081".into()),
+        knowledge_base_url: std::env::var("KNOWLEDGE_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8084".into()),
+        frontend_dir: std::env::var("FRONTEND_DIST_DIR").unwrap_or_else(|_| "/frontend".into()),
+        database_url: env("DATABASE_URL")?,
+        password: env("GATEWAY_AUTH_PASSWORD")?,
+        session_ttl: Duration::from_secs(session_ttl_hours * 3600),
+    })
+}
+
+async fn application(config: &GatewayConfig) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    let db = Database::connect(&config.database_url).await?;
     db.get_schema_registry("gateway::entity::*")
         .sync(&db)
         .await?;
@@ -306,30 +327,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let auth = Auth {
         sessions,
-        password: env("GATEWAY_AUTH_PASSWORD")?,
-        session_ttl: Duration::from_secs(
-            session_ttl_hours
-                .checked_mul(3600)
-                .expect("session_ttl_hours is bounded by MAX_SESSION_TTL_HOURS"),
-        ),
+        password: config.password.clone(),
+        session_ttl: config.session_ttl,
     };
 
-    let gateway = Gateway {
-        crawler: CrawlerServiceClient::new(
-            HttpClient::plaintext_http2_only(),
-            ClientConfig::new(crawler_url.parse()?)
-                .with_protocol(Protocol::Grpc)
-                .with_default_timeout(CRAWLER_CALL_TIMEOUT)
-                .proto(),
-        ),
-        knowledge_base: KnowledgeBaseServiceClient::new(
-            HttpClient::plaintext_http2_only(),
-            ClientConfig::new(knowledge_base_url.parse()?)
-                .with_protocol(Protocol::Grpc)
-                .with_default_timeout(KNOWLEDGE_BASE_CALL_TIMEOUT)
-                .proto(),
-        ),
-    };
+    let gateway = service_clients(config)?;
 
     let gateway = Arc::new(gateway);
     let connect = ConnectRouter::new()
@@ -341,10 +343,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
     let protected = axum::Router::new()
-        .route_service("/", ServeFile::new(format!("{frontend_dir}/index.html")))
+        .route_service(
+            "/",
+            ServeFile::new(format!("{}/index.html", config.frontend_dir)),
+        )
         .route_service(
             "/sources",
-            ServeFile::new(format!("{frontend_dir}/sources.html")),
+            ServeFile::new(format!("{}/sources.html", config.frontend_dir)),
         )
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
@@ -360,16 +365,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(|| async { "OK" }))
         .route(
             "/login",
-            get_service(ServeFile::new(format!("{frontend_dir}/login.html"))).post(login_submit),
+            get_service(ServeFile::new(format!(
+                "{}/login.html",
+                config.frontend_dir
+            )))
+            .post(login_submit),
         )
         .route("/logout", post(logout))
         .with_state(auth);
 
-    let app = public.merge(protected);
+    Ok(public.merge(protected))
+}
 
+fn service_clients(config: &GatewayConfig) -> Result<Gateway, Box<dyn std::error::Error>> {
+    Ok(Gateway {
+        crawler: CrawlerServiceClient::new(
+            HttpClient::plaintext_http2_only(),
+            ClientConfig::new(config.crawler_url.parse()?)
+                .with_protocol(Protocol::Grpc)
+                .with_default_timeout(CRAWLER_CALL_TIMEOUT)
+                .proto(),
+        ),
+        knowledge_base: KnowledgeBaseServiceClient::new(
+            HttpClient::plaintext_http2_only(),
+            ClientConfig::new(config.knowledge_base_url.parse()?)
+                .with_protocol(Protocol::Grpc)
+                .with_default_timeout(KNOWLEDGE_BASE_CALL_TIMEOUT)
+                .proto(),
+        ),
+    })
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    common::logging::init();
+    let config = gateway_config()?;
+    let app = application(&config).await?;
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     tracing::info!(
-        "gateway listening on 0.0.0.0:8080 -> crawler at {crawler_url}, knowledge-base at {knowledge_base_url}"
+        "gateway listening on 0.0.0.0:8080 -> crawler at {}, knowledge-base at {}",
+        config.crawler_url,
+        config.knowledge_base_url
     );
     axum::serve(listener, app).await?;
 

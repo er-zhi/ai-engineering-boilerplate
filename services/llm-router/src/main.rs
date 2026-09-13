@@ -70,13 +70,20 @@ async fn prune_payloads_periodically(log: impl RequestLog) {
     let mut interval = tokio::time::interval(PAYLOAD_CLEANUP_INTERVAL);
     loop {
         interval.tick().await;
-        match log.drop_expired_payloads(chrono::Utc::now()).await {
-            Ok(removed) if removed > 0 => {
-                tracing::info!("pruned {removed} expired llm request payloads")
-            }
-            Ok(_) => {}
-            Err(error) => tracing::error!("could not prune expired llm request payloads: {error}"),
-        }
+        prune_expired_payloads(&log).await;
+    }
+}
+
+async fn prune_expired_payloads(log: &impl RequestLog) {
+    let removed = log
+        .drop_expired_payloads(chrono::Utc::now())
+        .await
+        .inspect_err(|error| {
+            tracing::error!("could not prune expired llm request payloads: {error}")
+        })
+        .unwrap_or_default();
+    if removed > 0 {
+        tracing::info!("pruned {removed} expired llm request payloads");
     }
 }
 

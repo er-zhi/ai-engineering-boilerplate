@@ -1,5 +1,7 @@
 // Test-only Postgres: a throwaway pgvector container, bootstrapped with one service's role and schema the way compose.yaml bootstraps the stack.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::time::Duration;
 
 use sea_orm::{Database, DatabaseConnection};

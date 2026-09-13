@@ -260,51 +260,64 @@ impl<S: PageStore, J: JobStore, K: KnowledgeBase, E: EdgeStore> Jobs<S, J, K, E>
 
     async fn store_counted_pages(&self, id: i64, mut to_store: mpsc::Receiver<CountedPage>) {
         while let Some(page) = to_store.recv().await {
-            let url = page.url.clone();
-            match self.pages.save(page).await {
-                Ok(saved) => {
-                    tracing::debug!(job = id, content_changed = saved.changed, "stored {url}");
-                    if let Err(error) = self.jobs.add_crawled_page(id).await {
-                        tracing::error!(job = id, "could not count a stored page: {error}");
-                    }
-                    if let Err(error) = self
-                        .knowledge_base
-                        .ingest(&url, &saved.title, &saved.main_text)
-                        .await
-                    {
-                        tracing::error!(
-                            job = id,
-                            "could not hand {url} to knowledge-base: {error}"
-                        );
-                    }
-                }
-                Err(error) => tracing::error!(job = id, "could not store {url}: {error}"),
-            }
+            self.store_counted_page(id, page).await;
+        }
+    }
+
+    async fn store_counted_page(&self, id: i64, page: CountedPage) {
+        let url = page.url.clone();
+        let Some(saved) = self
+            .pages
+            .save(page)
+            .await
+            .inspect_err(|error| tracing::error!(job = id, "could not store {url}: {error}"))
+            .ok()
+        else {
+            return;
+        };
+        tracing::debug!(job = id, content_changed = saved.changed, "stored {url}");
+        self.count_stored_page(id).await;
+        self.ingest_stored_page(id, &url, &saved.title, &saved.main_text)
+            .await;
+    }
+
+    async fn count_stored_page(&self, id: i64) {
+        if let Err(error) = self.jobs.add_crawled_page(id).await {
+            tracing::error!(job = id, "could not count a stored page: {error}");
+        }
+    }
+
+    async fn ingest_stored_page(&self, id: i64, url: &str, title: &str, main_text: &str) {
+        if let Err(error) = self.knowledge_base.ingest(url, title, main_text).await {
+            tracing::error!(job = id, "could not hand {url} to knowledge-base: {error}");
         }
     }
 
     async fn update_graph_edges(&self, id: i64, mut to_graph: mpsc::Receiver<FetchedPage>) {
         while let Some(page) = to_graph.recv().await {
-            let Some(discovered_links) = links::try_extract_links(&page.final_url, &page.html)
-            else {
-                tracing::warn!(
-                    job = id,
-                    "skipped graph edges for {}: extraction did not run",
-                    page.final_url
-                );
-                continue;
-            };
-            if let Err(error) = self
-                .edges
-                .replace_outbound(&page.final_url, discovered_links)
-                .await
-            {
-                tracing::error!(
-                    job = id,
-                    "could not update graph edges for {}: {error}",
-                    page.final_url
-                );
-            }
+            self.update_page_graph(id, page).await;
+        }
+    }
+
+    async fn update_page_graph(&self, id: i64, page: FetchedPage) {
+        let Some(discovered_links) = links::try_extract_links(&page.final_url, &page.html) else {
+            tracing::warn!(
+                job = id,
+                "skipped graph edges for {}: extraction did not run",
+                page.final_url
+            );
+            return;
+        };
+        if let Err(error) = self
+            .edges
+            .replace_outbound(&page.final_url, discovered_links)
+            .await
+        {
+            tracing::error!(
+                job = id,
+                "could not update graph edges for {}: {error}",
+                page.final_url
+            );
         }
     }
 

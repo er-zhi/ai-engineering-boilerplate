@@ -39,20 +39,7 @@ pub async fn crawl(
     mut on_counted: impl FnMut(CountedPage) + Send,
     mut on_fetched: impl FnMut(FetchedPage) + Send,
 ) -> Result<(), Unreachable> {
-    let blacklist: Vec<CompactString> = scope
-        .blacklist()
-        .into_iter()
-        .map(CompactString::from)
-        .collect();
-
-    let mut website = Website::new(base_url);
-    website
-        .with_respect_robots_txt(true)
-        .with_subdomains(false)
-        .with_limit(limits.max_pages)
-        .with_request_timeout(Some(limits.request_timeout))
-        .with_user_agent(Some(USER_AGENT))
-        .with_blacklist_url(Some(blacklist));
+    let mut website = configured_website(base_url, scope, limits);
     let mut pages = website.subscribe(0);
 
     let mut any_fetched = false;
@@ -100,6 +87,24 @@ pub async fn crawl(
     } else {
         Err(Unreachable)
     }
+}
+
+fn configured_website(base_url: &str, scope: &Scope, limits: Limits) -> Website {
+    let blacklist: Vec<CompactString> = scope
+        .blacklist()
+        .into_iter()
+        .map(CompactString::from)
+        .collect();
+
+    let mut website = Website::new(base_url);
+    website
+        .with_respect_robots_txt(true)
+        .with_subdomains(false)
+        .with_limit(limits.max_pages)
+        .with_request_timeout(Some(limits.request_timeout))
+        .with_user_agent(Some(USER_AGENT))
+        .with_blacklist_url(Some(blacklist));
+    website
 }
 
 fn drain_pages_sent_before_the_crawl_returned(

@@ -1,0 +1,5 @@
+cache = true
+max_cache_age = "1d"
+max_retries = 2
+timeout = 20
+exclude_path = [".temp", "target"]

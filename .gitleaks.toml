@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated, cached, and local model artifacts"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)\.git/''',
+  '''(^|/)\.temp/''',
+  '''(^|/)\.lycheecache$''',
+  '''(^|/)\.env$''',
+  '''(^|/)native/[^/]+/models/''',
+  '''(^|/)native/[^/]+/\.venv/''',
+]

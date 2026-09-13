@@ -44,32 +44,8 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
         &self,
         request: CompleteRequest,
     ) -> Result<CompleteResponse, ConnectError> {
-        let tier = known_tier(request.tier);
-        let Some(contract) = limits(tier) else {
-            return Err(ConnectError::invalid_argument(format!(
-                "tier {tier:?} is not served"
-            )));
-        };
-        if request.user_prompt.trim().is_empty() {
-            return Err(ConnectError::invalid_argument("user_prompt is required"));
-        }
-
-        let mut sampling = sampling_from(request.sampling.into_option().unwrap_or_default());
-        validate_sampling(&sampling)?;
-        fit_to_limits(
-            &request.system_prompt,
-            &request.user_prompt,
-            &mut sampling,
-            contract,
-        )
-        .map_err(ConnectError::invalid_argument)?;
-
-        let prompt = Prompt {
-            tier,
-            system: request.system_prompt,
-            user: request.user_prompt,
-            sampling,
-        };
+        let prompt = validated_prompt(request)?;
+        let tier = prompt.tier;
 
         let started = Instant::now();
         let routed = router::complete(&self.provider, &self.tiers, &prompt).await;
@@ -127,6 +103,35 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
             tracing::error!("could not record an llm call: {error}");
         }
     }
+}
+
+fn validated_prompt(request: CompleteRequest) -> Result<Prompt, ConnectError> {
+    let tier = known_tier(request.tier);
+    let Some(contract) = limits(tier) else {
+        return Err(ConnectError::invalid_argument(format!(
+            "tier {tier:?} is not served"
+        )));
+    };
+    if request.user_prompt.trim().is_empty() {
+        return Err(ConnectError::invalid_argument("user_prompt is required"));
+    }
+
+    let mut sampling = sampling_from(request.sampling.into_option().unwrap_or_default());
+    validate_sampling(&sampling)?;
+    fit_to_limits(
+        &request.system_prompt,
+        &request.user_prompt,
+        &mut sampling,
+        contract,
+    )
+    .map_err(ConnectError::invalid_argument)?;
+
+    Ok(Prompt {
+        tier,
+        system: request.system_prompt,
+        user: request.user_prompt,
+        sampling,
+    })
 }
 
 fn validate_sampling(sampling: &Sampling) -> Result<(), ConnectError> {

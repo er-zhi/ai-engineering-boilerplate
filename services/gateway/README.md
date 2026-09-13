@@ -33,7 +33,7 @@ Only Gateway checks the session, per [gate-architecture](../../.agents/skills/co
 
 ## API
 
-Methods come from [`common/proto/crawler.proto`](../../common/proto/crawler.proto). Gateway re-exposes `CrawlerService` rather than defining a parallel contract, so there is exactly one schema for both hops.
+Methods come from [`common/proto/crawler/v1/crawler.proto`](../../common/proto/crawler/v1/crawler.proto). Gateway re-exposes `CrawlerService` rather than defining a parallel contract, so there is exactly one schema for both hops.
 
 | Route | Purpose |
 |---|---|

@@ -56,7 +56,7 @@ Unit tests use a fake `LlmClient` — no real HTTP call to the embedder or llm-r
 
 ## gRPC API
 
-[`common/proto/knowledge_base.proto`](../../common/proto/knowledge_base.proto):
+[`common/proto/knowledge_base/v1/knowledge_base.proto`](../../common/proto/knowledge_base/v1/knowledge_base.proto):
 
 - `Ingest(source, source_id, title, content) -> (stored, skipped)`. `source` and `source_id` together identify one document; `source` names the caller (`"crawler"` today), `source_id` is whatever that caller uses to identify the thing (crawler uses the URL).
 - `Search(query, page_types, limit) -> results[]` — up to `limit` documents (0 means 10, at most 50), each with its best-matching `snippet` and `updated_at` (RFC 3339). At most 6 page types; a query up to 1,000 characters. The request carries only what agent-facing retrieval tools commonly expose — result count and a metadata filter; search mode, fusion constants, and thresholds stay server-side.

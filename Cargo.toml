@@ -6,6 +6,19 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.98"
 version = "0.1.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cognitive_complexity = "deny"
+dbg_macro = "deny"
+todo = "deny"
+too_many_arguments = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
 
 [workspace.dependencies]
 connectrpc = "0.9"
@@ -35,4 +48,4 @@ tower = "0.5"
 tower-http = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-common = { path = "common" }
+common = { path = "common", version = "0.1.0" }
