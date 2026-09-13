@@ -2,7 +2,9 @@
 
 A Rust microservice boilerplate for AI products, built to go from code change to running service in seconds on a local machine. Prototyping now, scaling later: the code holds up in production, while infrastructure stays lean (one Postgres, Docker Compose, no Kafka or Kubernetes) until the product proves itself. Service boundaries are clean enough to move to the cloud later without a rewrite.
 
-It ships with a crawler that indexes websites for semantic search, an LLM router that picks models by quality tier, and a set of code-review skills that AI agents run in parallel.
+It ships with a crawler that finds and denoises pages, a knowledge-base service that enriches and embeds what changed, an LLM router that picks models by quality tier, and a set of code-review skills that AI agents run in parallel.
+
+**Requires an Apple Silicon Mac (M1 or newer).** Embedding runs on a native process outside Docker, on the chip's Neural Engine — see [Running the Native Embedder](#running-the-native-embedder) — because there is no Linux-container equivalent of Apple's Core ML or Metal. Everything else in the stack is plain Docker Compose and would run anywhere; this one piece is the deliberate exception.
 
 ## Status
 
@@ -18,8 +20,12 @@ Early stage. Most of the system is specified but not yet built.
 | Crawling with spider-rs: scope rules, page cap, live progress | Done |
 | Postgres 18 + pgvector, one schema and role per service | Done |
 | Crawler page storage: title, main text, and content hash in `crawler.pages` | Done |
-| `llm-router` service: tier contract, fallback, request log | Done — crawler enrichment not wired yet |
-| Enrichment, embeddings, search, `CacheStore` | Next |
+| `llm-router` service: tier contract, fallback, request log | Done |
+| `knowledge-base` service: `Ingest`, own dedup, LLM enrichment, embedding via the native process | Done — crawler hands changed pages to it |
+| `native/embedder-ane`: Qwen3-Embedding-0.6B on the Neural Engine via Core ML, 8-bit, ~20 ms a call | Done — Apple Silicon only, run outside Docker |
+| `CacheStore` trait + Postgres impl, Gateway session auth (login/logout, `gateway.sessions`) | Done |
+| Frontend build-once-and-exit, Gateway serves its output directly, `no-store` on every page | Done |
+| Retrieval for agents: passages with contextual headers, hybrid search (HNSW + GIN) with Reciprocal Rank Fusion, page-type filter | Done — no reranker or BM25 yet, see the design spec |
 
 ## Architecture
 
@@ -28,16 +34,22 @@ flowchart LR
   browser["Browser"] -->|"page load + Connect JSON"| gateway
   gateway -->|HTTP| frontend
   gateway -->|gRPC| crawler
-  crawler -->|gRPC| llm["llm-router"]
+  crawler -->|"gRPC, changed pages only"| kb["knowledge-base"]
+  kb -->|gRPC| llm["llm-router"]
   llm -->|HTTPS| openrouter[("OpenRouter")]
+  kb -->|"HTTP, loopback only"| embedder["embedder-ane<br/>(native, Apple Silicon, Neural Engine)"]
   crawler --- pg[("PostgreSQL<br/>schema per service + pgvector")]
+  kb --- pg
   llm --- pg
 ```
 
 - **Gateway** is the only service reachable from outside. It routes requests and holds no business logic; each service validates what it receives at its own API boundary.
 - The browser loads the page and calls RPCs from the same origin, so there is no CORS anywhere in the system. Gateway proxies page routes to Frontend and answers every Connect path itself.
 - Services talk to each other over gRPC only. Shared contracts live in `common/proto/`.
-- Each service that stores data connects to Postgres with its own role, and that role can only access the service's own schema. Gateway stores nothing today; its schema and role are provisioned but empty. Postgres enforces the isolation — see [schema-isolation.md](.agents/skills/code-review/gate-database/schema-isolation.md).
+- Each service that stores data connects to Postgres with its own role, and that role can only access the service's own schema. Postgres enforces the isolation — see [schema-isolation.md](.agents/skills/code-review/gate-database/schema-isolation.md).
+- Crawler and knowledge-base each do their own, independent content-hash dedup — crawler decides whether to call knowledge-base at all; knowledge-base never trusts that decision and hashes again before spending anything on an LLM or embedding call.
+- Every page and RPC behind Gateway requires a session, checked against `gateway.sessions` on every call — see [Gateway's Authentication section](services/gateway/README.md#authentication).
+- `native/` is the one sanctioned exception to "every service is a container": Core ML and Metal have no Linux backend, so the embedder runs directly on the host and knowledge-base reaches it over loopback HTTP instead of gRPC. See [Running the Native Embedder](#running-the-native-embedder) and [knowledge-base's README](services/knowledge-base/README.md#embedding-native-apple-silicon-only).
 
 ## Stack
 
@@ -49,7 +61,8 @@ flowchart LR
 | Database | PostgreSQL 18, one instance, schema per service, pgvector, through [SeaORM](https://crates.io/crates/sea-orm) entities |
 | Cache | PostgreSQL behind the `CacheStore` trait in `common/cache/`, swappable for Redis later |
 | LLM | [OpenRouter](https://openrouter.ai/), reached through the LLM Router |
-| Runtime | Docker Compose, one Dockerfile per service, Alpine base with static musl binaries |
+| Embedding | [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) on the Neural Engine via Core ML (8-bit), native on the host — never in Docker |
+| Runtime | Docker Compose, one Dockerfile per service, Alpine base with static musl binaries; `native/embedder-ane` is the one non-Dockerized process |
 
 **Not now:** Redis, Kafka, Kubernetes, cloud tooling, a second database, heavy frameworks. Need a cache? Postgres behind `CacheStore`. Cloud scaling comes later, on top of this codebase — not inside it.
 
@@ -61,10 +74,13 @@ flowchart LR
 ├── compose.yaml                  # the whole stack: images, resource limits, Postgres bootstrap
 ├── common/                       # shared crate: proto contracts + generated stubs
 ├── services/
-│   ├── crawler/                  # crawl, enrich, embed, search
+│   ├── crawler/                  # crawl, denoise, dedup, hand off changed pages
 │   ├── frontend/                 # web UI: pages, styles, client-side logic
 │   ├── gateway/                  # public Connect API, proxies page routes to frontend
+│   ├── knowledge-base/           # store, enrich, embed, search
 │   └── llm-router/               # LLM calls by quality tier, with fallback
+├── native/
+│   └── embedder-ane/             # Qwen3 on the Neural Engine via Core ML — Apple Silicon only, not Dockerized
 └── .agents/skills/code-review/   # review gates for AI agents
 ```
 
@@ -72,7 +88,8 @@ flowchart LR
 
 | Service | What it does |
 |---|---|
-| [crawler](services/crawler/README.md) | Crawls sites with [spider-rs](https://github.com/spider-rs/spider), strips each page down to its main content, enriches it with an LLM, and stores embeddings for hybrid search. Unchanged pages are skipped before any paid LLM or embedding call. |
+| [crawler](services/crawler/README.md) | Crawls sites with [spider-rs](https://github.com/spider-rs/spider), strips each page down to its main content, and keeps its own copy for dedup. A page whose content actually changed is handed to knowledge-base; unchanged pages never leave crawler. |
+| [knowledge-base](services/knowledge-base/README.md) | The canonical, source-agnostic store: hashes content independently, calls llm-router for page type/keywords/summary, splits content into passages embedded via the native `embedder-ane` process, and writes it all in one transaction. `Search` is hybrid retrieval over passages fused by reciprocal rank, for agents to ground their own answers. |
 | [frontend](services/frontend/README.md) | Owns the entire web UI — markup, styles, and all client-side logic. Serves pages on the internal network only; the browser reaches them through Gateway. |
 | [gateway](services/gateway/README.md) | The only service exposed to the host. Re-exposes `CrawlerService` over Connect so browsers can call it with plain `fetch`, forwards to internal services over gRPC, and proxies page routes to Frontend. |
 | [llm-router](services/llm-router/README.md) | Callers ask for a `low`, `medium`, or `high` tier instead of a model name. The router maps each tier to a primary and backup model on OpenRouter. |
@@ -115,11 +132,11 @@ Running the stack needs only Docker with Compose v2.23 or newer, the version tha
 ```bash
 git clone https://github.com/er-zhi/ai-engineering-boilerplate.git
 cd ai-engineering-boilerplate
-cp .env.example .env   # then replace the change-me passwords (openssl rand -hex 24) and set OPENROUTER_API_KEY
+cp .env.example .env   # then replace the change-me passwords (openssl rand -hex 24), set OPENROUTER_API_KEY and GATEWAY_AUTH_PASSWORD
 docker compose up
 ```
 
-Compose refuses to start while `OPENROUTER_API_KEY` is unset, and LLM Router exits at startup if the key is not valid. Then open <http://localhost:8080> for the web UI. Only Gateway is published to the host; Crawler, Frontend, and LLM Router stay on the internal network, and Postgres is published on `127.0.0.1` alone.
+Compose refuses to start while `OPENROUTER_API_KEY` or `GATEWAY_AUTH_PASSWORD` is unset, and LLM Router exits at startup if the key is not valid. Then open <http://localhost:8080> and log in with `GATEWAY_AUTH_PASSWORD`. Only Gateway is published to the host; Crawler, Frontend, LLM Router, and knowledge-base stay on the internal network, and Postgres is published on `127.0.0.1` alone.
 
 While developing, start the same stack with [Compose Watch](https://docs.docker.com/compose/how-tos/file-watch/):
 
@@ -128,6 +145,24 @@ docker compose up --watch
 ```
 
 Saving a file rebuilds that service's image and replaces its container. Development and production run the very same image, under the resource limits `compose.yaml` sets for every service.
+
+## Running the Native Embedder
+
+Everyone on this project develops on Apple Silicon (M1 or newer), so embedding is not Dockerized: `native/embedder-ane` runs [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) directly on the Mac's Neural Engine through Core ML, and `knowledge-base` (in Docker) calls it over `http://host.docker.internal:8086`. Without it running, `Ingest` and `Search` fail with "could not reach the native embedder" — everything else in the stack works fine.
+
+**One-time setup** — a Python 3.12 virtualenv plus the model files (about 1.1 GB); the exact steps, including how the 8-bit model files are produced, are in [native/embedder-ane/README.md](native/embedder-ane/README.md#setup).
+
+**Every time you develop**, start it in its own terminal before (or any time before) you need `Ingest` or `Search` to work — it is a plain long-running process, not a Compose service, so `docker compose up` does not start or stop it:
+
+```bash
+cd native/embedder-ane
+source .venv/bin/activate
+uvicorn server:app --host 0.0.0.0 --port 8086
+```
+
+It is silent for 30–60 s while Core ML compiles the model for the Neural Engine, then prints `Application startup complete`; `GET http://localhost:8086/health` confirms it is up.
+
+It is a Python process, not a Cargo workspace member (see [gate-architecture](.agents/skills/code-review/gate-architecture/SKILL.md#boundaries)), so `cargo build --workspace` / `cargo nextest run --workspace` never touch it and nothing here breaks on a non-Mac CI runner. Core ML is macOS-only; moving this stack to a Linux server would mean re-implementing the embedder there (the same model runs on CUDA via `candle` or PyTorch) and re-embedding every document.
 
 ### Database
 
@@ -139,7 +174,7 @@ In dev, Postgres listens on `127.0.0.1:5432`, never on the network. Connect any 
 | Host | `127.0.0.1` |
 | Port | `5432` |
 | Database | `app` |
-| Username | `postgres` (superuser), or `crawler_user` / `llm_router_user` to see exactly what one service sees (`gateway_user` exists too, but its schema holds no tables yet) |
+| Username | `postgres` (superuser), or `crawler_user` / `llm_router_user` / `knowledge_base_user` / `gateway_user` to see exactly what one service sees |
 | Password | the matching value from `.env` |
 
 The `postgres-bootstrap` config in `compose.yaml` creates the schemas and roles only on the first start, when the `pgdata` volume is empty. To apply changed passwords, remove that volume (`docker volume ls | grep pgdata`, then `docker volume rm <name>`), which deletes all data.
@@ -159,12 +194,12 @@ The services also run outside Docker. You need Rust 1.98+ and `protoc` on your `
 ```bash
 docker compose up -d postgres
 DATABASE_URL=postgres://crawler_user:<CRAWLER_DB_PASSWORD>@127.0.0.1:5432/app cargo run -p crawler
-cargo run -p frontend
-cargo run -p gateway
 OPENROUTER_API_KEY=<key> DATABASE_URL=postgres://llm_router_user:<LLM_ROUTER_DB_PASSWORD>@127.0.0.1:5432/app cargo run -p llm-router
+DATABASE_URL=postgres://knowledge_base_user:<KNOWLEDGE_BASE_DB_PASSWORD>@127.0.0.1:5432/app cargo run -p knowledge-base
+GATEWAY_AUTH_PASSWORD=<password> DATABASE_URL=postgres://gateway_user:<GATEWAY_DB_PASSWORD>@127.0.0.1:5432/app FRONTEND_DIST_DIR=services/frontend/client cargo run -p gateway
 ```
 
-Replace the placeholders with the values from `.env`; LLM Router also reads the `LLM_<TIER>_PRIMARY` / `LLM_<TIER>_BACKUP` variables listed there. Gateway finds Crawler and Frontend on `127.0.0.1:8081` and `127.0.0.1:8082` by default; LLM Router listens on `8083`.
+Replace the placeholders with the values from `.env`; LLM Router also reads the `LLM_<TIER>_PRIMARY` / `LLM_<TIER>_BACKUP` variables listed there. Frontend has no server to run outside Docker — `FRONTEND_DIST_DIR` points Gateway straight at `client/` instead of the shared volume Compose creates. Gateway finds Crawler on `127.0.0.1:8081` by default; LLM Router listens on `8083`, knowledge-base on `8084`, and crawler finds knowledge-base there via `KNOWLEDGE_BASE_URL`.
 
 ### Calling the API
 

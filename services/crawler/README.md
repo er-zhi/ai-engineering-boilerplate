@@ -12,7 +12,7 @@ Crawls for real and stores what it finds:
 - `pages_crawled` rises as rows are written. A failed write goes to stderr and is skipped; the job still finishes.
 - One host only, `robots.txt` respected, 15 s per request, at most `CRAWL_MAX_PAGES` fetched pages per crawl (default 100).
 - `pages_skipped` stays `0` until the skip ladder below exists; it counts unchanged pages.
-- Jobs are rows in `crawler.crawl_jobs`, so they survive a restart; a job caught mid-crawl by a restart is marked `FAILED` on the next start. At most 4 crawls run at once; the rest wait as `QUEUED`. An optional `idempotency_key` on `StartCrawl` makes a retried request answer with the first job instead of starting a second crawl. Schema sync creates missing tables and columns on every start; replace it with migrations before the data matters. **Denoise** and **Store** run; **Enrich**, **Embed**, and **Search** do not yet.
+- Jobs are rows in `crawler.crawl_jobs`, so they survive a restart; a job caught mid-crawl by a restart is marked `FAILED` on the next start. At most 4 crawls run at once; the rest wait as `QUEUED`. An optional `idempotency_key` on `StartCrawl` makes a retried request answer with the first job instead of starting a second crawl. Schema sync creates missing tables and columns on every start; replace it with migrations before the data matters. **Denoise**, **Compare**, and **Store** run here; a page whose hash actually changed is handed to [knowledge-base](../knowledge-base/README.md), which owns **Enrich**, **Embed**, and **Search**.
 
 ### Scope
 
@@ -27,14 +27,16 @@ Tests: `cargo nextest run -p crawler`. Crawl tests use a local site on `127.0.0.
 
 ## Pipeline
 
+Crawler owns the first four steps; a page whose content actually changed is handed to [knowledge-base](../knowledge-base/README.md) for the rest, over its own `Ingest` gRPC call:
+
 1. **Plan** — split URLs into known revisits and new discoveries; drop any whose sitemap `lastmod` predates `crawled_at`
 2. **Fetch** — conditional GET for revisits, `crawl_smart()` for discoveries; a `304` ends the work for that page
 3. **Denoise** — strip nav, ads, footers; keep main body only
-4. **Compare** — hash the denoised content; an unchanged hash ends the work before any spend
-5. **Enrich** — LLM Router (`low`/`medium` tier) returns page type, keywords, summary
-6. **Embed** — embedding model produces the content vector
-7. **Store** — extracted content only; raw HTML is never persisted
-8. **Search** — pgvector similarity combined with keyword and type filters
+4. **Compare** — hash the denoised content against crawler's own stored hash; unchanged ends the work here, before any spend and before knowledge-base is even called
+5. **Store** — extracted content only, in `crawler.pages`; raw HTML is never persisted
+6. **Hand off** — a real change calls `knowledge-base.Ingest(source: "crawler", source_id: url, title, content: main_text)`; a failed hand-off is logged and does not fail the crawl
+
+Knowledge-base does its own independent dedup (see its README) rather than trusting crawler's; its **Enrich**, **Embed**, and **Search** steps live there, not here.
 
 ## Skip Ladder
 
@@ -44,7 +46,7 @@ Never re-do work for a page that has not changed. Each check exists to avoid the
 |---|---|
 | Sitemap `lastmod` older than `crawled_at` | The request itself — one sitemap covers many URLs |
 | `304 Not Modified` | Body transfer, parsing, and any Chromium call |
-| Denoised hash unchanged | LLM enrichment and embedding — the only steps that cost money |
+| Denoised hash unchanged | Calling knowledge-base at all, and everything it would spend on LLM enrichment and embedding |
 
 Conditional GET sends `If-None-Match` with the stored `etag`, falling back to `If-Modified-Since` with `last_modified` when no ETag exists. Do not send both: per RFC 9110 §13.1.3 a recipient MUST ignore `If-Modified-Since` whenever `If-None-Match` is present, so the date is dead weight rather than a fallback.
 
@@ -72,27 +74,11 @@ Chromium dominates crawl cost, so treat it as an escalation and never a default.
 
 ## Schema (`crawler`)
 
-- `pages` today — `url`, `title`, `main_text`, `content_hash`, `http_status`, `crawled_at`; column types live in [the entity](src/entity/page.rs)
-- `pages` with enrichment — `page_type`, `keywords`, `summary`, `metadata`
+- `pages` today — `url`, `title`, `main_text`, `content_hash`, `http_status`, `crawled_at`; column types live in [the entity](src/entity/page.rs). This is crawler's own bookkeeping copy, kept for its own dedup and revisit logic — enrichment, embeddings, and search live in [knowledge-base](../knowledge-base/README.md)'s schema, not here.
 - `pages` freshness — `etag varchar(256)`, `last_modified timestamptz`, `needs_js boolean`, `unchanged_streak smallint`, `next_crawl_at timestamptz`
-- `page_embeddings` — page_id, embedding, model_version
 - `crawl_jobs` — `base_url`, `status`, `pages_crawled`, `pages_skipped`, `idempotency_key` (unique, nullable), `created_at`, `updated_at`
 
 `etag` and `last_modified` are nullable — plenty of servers send neither, and those pages fall back to the hash check.
-
-## Page Types
-
-LLM picks the best match: `product`, `knowledge`, `instruction`, `documentation`, `blog`, `other`.
-
-Enrichment result per page:
-
-```json
-{
-  "page_type": "product",
-  "keywords": ["wireless headphones", "noise cancelling"],
-  "summary": "Product page for Sony WH-1000XM5 headphones"
-}
-```
 
 ## API
 
@@ -100,5 +86,6 @@ Defined in [`common/proto/crawler.proto`](../../common/proto/crawler.proto) and 
 
 - `StartCrawl` — submit a base URL, scope, and optional `idempotency_key` to crawl and index
 - `GetCrawlJob` — job status and page counts
-- `Search` — semantic similarity plus lexical and type filters (not yet implemented)
 - `GET /health` — plain-HTTP liveness for Compose
+
+Search (semantic similarity plus lexical and type filters) will live on [knowledge-base](../knowledge-base/README.md), against the content it actually holds, not here.

@@ -16,7 +16,7 @@ pub struct Seen {
 
 pub struct TestProvider {
     base_url: String,
-    seen: Arc<Mutex<Vec<Seen>>>,
+    chat_seen: Arc<Mutex<Vec<Seen>>>,
 }
 
 impl TestProvider {
@@ -33,29 +33,28 @@ impl TestProvider {
     }
 
     async fn start(
-        status: StatusCode,
-        reply: Value,
-        delay: Duration,
+        chat_status: StatusCode,
+        chat_reply: Value,
+        chat_delay: Duration,
         key_status: StatusCode,
     ) -> Self {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let reply = Arc::new(reply);
+        let chat_seen = Arc::new(Mutex::new(Vec::new()));
 
         let app = axum::Router::new()
             .route(
                 "/chat/completions",
                 post({
-                    let seen = seen.clone();
+                    let seen = chat_seen.clone();
                     move |headers: HeaderMap, Json(body): Json<Value>| {
                         let seen = seen.clone();
-                        let reply = reply.clone();
+                        let reply = chat_reply.clone();
                         async move {
                             seen.lock().unwrap().push(Seen {
                                 authorization: bearer(&headers),
                                 body,
                             });
-                            tokio::time::sleep(delay).await;
-                            (status, Json(reply.as_ref().clone()))
+                            tokio::time::sleep(chat_delay).await;
+                            (chat_status, Json(reply))
                         }
                     }
                 }),
@@ -69,7 +68,10 @@ impl TestProvider {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        Self { base_url, seen }
+        Self {
+            base_url,
+            chat_seen,
+        }
     }
 
     pub fn base_url(&self) -> String {
@@ -77,7 +79,7 @@ impl TestProvider {
     }
 
     pub fn seen(&self) -> Vec<Seen> {
-        self.seen.lock().unwrap().clone()
+        self.chat_seen.lock().unwrap().clone()
     }
 }
 

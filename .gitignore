@@ -4,5 +4,9 @@ target/
 !.env.example
 .agents/skills/code-review/logs/
 
+# Native embedders: model weights are downloaded per README, never committed.
+native/*/models/
+native/*/.venv/
+native/*/__pycache__/
 
 .temp

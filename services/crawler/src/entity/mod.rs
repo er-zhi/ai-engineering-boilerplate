@@ -2,3 +2,4 @@
 
 pub mod crawl_job;
 pub mod page;
+pub mod page_edge;

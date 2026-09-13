@@ -1,5 +1,6 @@
 // Connect service stubs and message types generated from common/proto, shared by every service.
 
+pub mod cache;
 pub mod llm;
 pub mod logging;
 #[cfg(feature = "test-support")]

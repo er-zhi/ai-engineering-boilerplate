@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package knowledge_base.v1;
+
+service KnowledgeBaseService {
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+message IngestRequest {
+  string source = 1;
+  string source_id = 2;
+  string title = 3;
+  string content = 4;
+}
+
+message IngestResponse {
+  bool stored = 1;
+  // True when the content hash matched an existing document: no LLM or embedding call was made.
+  bool skipped = 2;
+}
+
+message SearchRequest {
+  string query = 1;
+  // Restricts results to these page types ("product", "knowledge", "instruction", "documentation",
+  // "blog", "other"). Empty means every type.
+  repeated string page_types = 2;
+  // How many documents to return: 0 means 10, at most 50.
+  uint32 limit = 3;
+}
+
+message SearchResult {
+  string source = 1;
+  string source_id = 2;
+  string title = 3;
+  string summary = 4;
+  string page_type = 5;
+  float score = 6;
+  repeated string keywords = 7;
+  // The passage of this document that matched the query best.
+  string snippet = 8;
+  // RFC 3339; when knowledge-base last stored a changed version of this document.
+  string updated_at = 9;
+}
+
+message SearchResponse {
+  // At most `limit` documents, highest score first.
+  repeated SearchResult results = 1;
+}

@@ -3,7 +3,10 @@
 mod crawl;
 mod entity;
 mod extract;
+mod graph;
 mod jobs;
+mod knowledge_base;
+mod links;
 mod scope;
 mod store;
 #[cfg(test)]
@@ -19,8 +22,8 @@ use axum::http::Uri;
 use axum::routing::get;
 use buffa::EnumValue;
 use common::proto::crawler::v1::{
-    CrawlScope, CrawlerService, GetCrawlJobRequest, GetCrawlJobResponse, StartCrawlRequest,
-    StartCrawlResponse,
+    CrawlScope, CrawlerService, GetCrawlJobRequest, GetCrawlJobResponse, GetPageNeighborsRequest,
+    GetPageNeighborsResponse, PageNeighbor, PageRelation, StartCrawlRequest, StartCrawlResponse,
 };
 use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
@@ -29,7 +32,10 @@ use connectrpc::{
 use sea_orm::Database;
 
 use crate::crawl::Limits;
+use crate::entity::page_edge::RelationType;
+use crate::graph::{EdgeStore, MAX_REQUESTABLE_DEPTH, PgEdges};
 use crate::jobs::{Jobs, PgJobs, parse_job_id};
+use crate::knowledge_base::KnowledgeBaseClient;
 use crate::scope::Scope;
 use crate::store::PgPages;
 
@@ -39,10 +45,13 @@ const MAX_SCOPE_RULES: usize = 100;
 const MAX_SCOPE_RULE_CHARS: usize = 2048;
 const MAX_IDEMPOTENCY_KEY_CHARS: usize = 128;
 const MAX_CONCURRENT_CRAWLS: usize = 4;
+const MAX_REQUESTED_RELATION_TYPES: usize = 4;
 const CRAWL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const KNOWLEDGE_BASE_CALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 struct Crawler {
-    jobs: Jobs<PgPages, PgJobs>,
+    jobs: Jobs<PgPages, PgJobs, KnowledgeBaseClient, PgEdges>,
+    edges: PgEdges,
     limits: Limits,
 }
 
@@ -108,6 +117,99 @@ impl CrawlerService for Crawler {
             pages_skipped: job.pages_skipped,
             ..Default::default()
         })
+    }
+
+    async fn get_page_neighbors(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, GetPageNeighborsRequest>,
+    ) -> ServiceResult<GetPageNeighborsResponse> {
+        validate_graph_url_length(request.url)?;
+        validate_base_url(request.url)?;
+        let max_depth = resolve_max_depth(request.max_depth)?;
+        let relation_types = parse_allowed_relation_types(&request.allowed_relation_types)?;
+
+        let neighbors = self
+            .edges
+            .neighbors(request.url, relation_types, max_depth)
+            .await
+            .map_err(graph_store_failed)?;
+
+        Response::ok(GetPageNeighborsResponse {
+            shallowest_first_neighbors: neighbors.into_iter().map(page_neighbor).collect(),
+            ..Default::default()
+        })
+    }
+}
+
+fn graph_store_failed(error: sea_orm::DbErr) -> ConnectError {
+    tracing::error!("graph store call failed: {error}");
+    ConnectError::unavailable("the graph store is not available")
+}
+
+fn validate_graph_url_length(url: &str) -> Result<(), ConnectError> {
+    if url.len() > links::MAX_URL_BYTES {
+        return Err(ConnectError::invalid_argument(format!(
+            "url is longer than {} bytes",
+            links::MAX_URL_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_max_depth(requested: u32) -> Result<u32, ConnectError> {
+    match requested {
+        0 => Ok(MAX_REQUESTABLE_DEPTH),
+        depth if depth > MAX_REQUESTABLE_DEPTH => Err(ConnectError::invalid_argument(format!(
+            "max_depth is above {MAX_REQUESTABLE_DEPTH}"
+        ))),
+        depth => Ok(depth),
+    }
+}
+
+fn parse_allowed_relation_types(
+    relations: &[EnumValue<PageRelation>],
+) -> Result<Vec<RelationType>, ConnectError> {
+    if relations.len() > MAX_REQUESTED_RELATION_TYPES {
+        return Err(ConnectError::invalid_argument(format!(
+            "at most {MAX_REQUESTED_RELATION_TYPES} relation types"
+        )));
+    }
+    relations
+        .iter()
+        .map(|relation| relation_type_from(*relation))
+        .collect()
+}
+
+fn relation_type_from(relation: EnumValue<PageRelation>) -> Result<RelationType, ConnectError> {
+    match relation {
+        EnumValue::Known(PageRelation::LinksTo) => Ok(RelationType::LinksTo),
+        EnumValue::Known(PageRelation::Parent) => Ok(RelationType::Parent),
+        EnumValue::Known(PageRelation::Canonical) => Ok(RelationType::Canonical),
+        EnumValue::Known(PageRelation::Redirect) => Ok(RelationType::Redirect),
+        _ => Err(ConnectError::invalid_argument(
+            "allowed_relation_types must not include PAGE_RELATION_UNSPECIFIED",
+        )),
+    }
+}
+
+fn page_relation_from(relation_type: RelationType) -> PageRelation {
+    match relation_type {
+        RelationType::LinksTo => PageRelation::LinksTo,
+        RelationType::Parent => PageRelation::Parent,
+        RelationType::Canonical => PageRelation::Canonical,
+        RelationType::Redirect => PageRelation::Redirect,
+    }
+}
+
+fn page_neighbor(neighbor: crate::graph::Neighbor) -> PageNeighbor {
+    PageNeighbor {
+        crawled: neighbor.page_id.is_some(),
+        url: neighbor.url,
+        title: neighbor.title.unwrap_or_default(),
+        relation: EnumValue::Known(page_relation_from(neighbor.relation_type)),
+        depth: neighbor.depth as u32,
+        ..Default::default()
     }
 }
 
@@ -216,9 +318,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sync(&db)
         .await?;
 
+    let knowledge_base_url =
+        std::env::var("KNOWLEDGE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8084".to_owned());
+    let knowledge_base =
+        KnowledgeBaseClient::new(&knowledge_base_url, KNOWLEDGE_BASE_CALL_TIMEOUT)?;
+
     let jobs = Jobs::new(
         PgPages::new(db.clone()),
-        PgJobs::new(db),
+        PgJobs::new(db.clone()),
+        knowledge_base,
+        PgEdges::new(db.clone()),
         MAX_CONCURRENT_CRAWLS,
     );
     let interrupted = jobs.fail_unfinished().await?;
@@ -228,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let crawler = Crawler {
         jobs,
+        edges: PgEdges::new(db),
         limits: Limits {
             max_pages,
             request_timeout: CRAWL_REQUEST_TIMEOUT,
@@ -315,5 +425,284 @@ mod tests {
         ] {
             assert!(validate_base_url(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn a_zero_max_depth_resolves_to_the_ceiling() {
+        assert_eq!(resolve_max_depth(0).unwrap(), MAX_REQUESTABLE_DEPTH);
+    }
+
+    #[test]
+    fn a_max_depth_at_the_ceiling_is_accepted() {
+        assert_eq!(
+            resolve_max_depth(MAX_REQUESTABLE_DEPTH).unwrap(),
+            MAX_REQUESTABLE_DEPTH
+        );
+    }
+
+    #[test]
+    fn a_max_depth_above_the_ceiling_is_refused() {
+        let error = resolve_max_depth(MAX_REQUESTABLE_DEPTH + 1).unwrap_err();
+        assert!(format!("{error:?}").contains("max_depth"), "{error:?}");
+    }
+
+    #[test]
+    fn an_unspecified_relation_type_is_refused() {
+        let error = parse_allowed_relation_types(&[EnumValue::Known(PageRelation::Unspecified)])
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("allowed_relation_types"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn known_relation_types_round_trip_through_the_wire_enum() {
+        let requested = [
+            EnumValue::Known(PageRelation::LinksTo),
+            EnumValue::Known(PageRelation::Parent),
+            EnumValue::Known(PageRelation::Canonical),
+            EnumValue::Known(PageRelation::Redirect),
+        ];
+
+        let parsed = parse_allowed_relation_types(&requested).unwrap();
+
+        assert_eq!(
+            parsed,
+            [
+                RelationType::LinksTo,
+                RelationType::Parent,
+                RelationType::Canonical,
+                RelationType::Redirect,
+            ]
+        );
+    }
+
+    #[test]
+    fn more_than_the_relation_type_limit_is_refused() {
+        let too_many =
+            vec![EnumValue::Known(PageRelation::LinksTo); MAX_REQUESTED_RELATION_TYPES + 1];
+
+        let error = parse_allowed_relation_types(&too_many).unwrap_err();
+
+        assert!(format!("{error:?}").contains("relation types"), "{error:?}");
+    }
+
+    #[test]
+    fn a_neighbor_with_no_page_id_maps_to_an_uncrawled_response() {
+        let neighbor = crate::graph::Neighbor {
+            url: "https://example.com/a".to_owned(),
+            page_id: None,
+            title: None,
+            relation_type: RelationType::LinksTo,
+            depth: 1,
+        };
+
+        let mapped = page_neighbor(neighbor);
+
+        assert!(!mapped.crawled);
+        assert_eq!(mapped.title, "");
+    }
+
+    #[test]
+    fn a_neighbor_with_a_page_id_maps_to_a_crawled_response() {
+        let neighbor = crate::graph::Neighbor {
+            url: "https://example.com/a".to_owned(),
+            page_id: Some(42),
+            title: Some("Title".to_owned()),
+            relation_type: RelationType::Canonical,
+            depth: 2,
+        };
+
+        let mapped = page_neighbor(neighbor);
+
+        assert!(mapped.crawled);
+        assert_eq!(mapped.title, "Title");
+        assert_eq!(mapped.relation, EnumValue::Known(PageRelation::Canonical));
+        assert_eq!(mapped.depth, 2);
+    }
+
+    use connectrpc::ErrorCode;
+    use connectrpc::client::{ClientConfig, HttpClient};
+
+    async fn start_crawler(db: sea_orm::DatabaseConnection) -> String {
+        let crawler = Crawler {
+            jobs: Jobs::new(
+                PgPages::new(db.clone()),
+                PgJobs::new(db.clone()),
+                KnowledgeBaseClient::new("http://127.0.0.1:1", Duration::from_secs(1)).unwrap(),
+                PgEdges::new(db.clone()),
+                1,
+            ),
+            edges: PgEdges::new(db),
+            limits: Limits {
+                max_pages: 10,
+                request_timeout: Duration::from_secs(5),
+            },
+        };
+        let connect = ConnectRouter::new().add_service(Arc::new(crawler));
+        let app = axum::Router::new().fallback_service(connect.into_axum_service());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    fn client_to(url: &str) -> common::proto::crawler::v1::CrawlerServiceClient<HttpClient> {
+        common::proto::crawler::v1::CrawlerServiceClient::new(
+            HttpClient::plaintext_http2_only(),
+            ClientConfig::new(url.parse().unwrap())
+                .with_protocol(connectrpc::Protocol::Grpc)
+                .with_default_timeout(Duration::from_secs(5))
+                .proto(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_page_neighbors_rejects_an_invalid_url_at_the_rpc_boundary() {
+        let test = crate::test_db::start().await;
+        let url = start_crawler(test.db.clone()).await;
+        let client = client_to(&url);
+
+        let error = client
+            .get_page_neighbors(GetPageNeighborsRequest {
+                url: "not a url".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_page_neighbors_accepts_a_url_at_the_byte_limit_at_the_rpc_boundary() {
+        let test = crate::test_db::start().await;
+        let url = start_crawler(test.db.clone()).await;
+        let client = client_to(&url);
+        let long_url = format!("https://example.com/{}", "a".repeat(1024 - 20));
+        assert_eq!(long_url.len(), 1024);
+
+        let response = client
+            .get_page_neighbors(GetPageNeighborsRequest {
+                url: long_url,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned();
+
+        assert!(response.shallowest_first_neighbors.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_page_neighbors_rejects_a_url_over_the_byte_limit_at_the_rpc_boundary() {
+        let test = crate::test_db::start().await;
+        let url = start_crawler(test.db.clone()).await;
+        let client = client_to(&url);
+        let long_url = format!("https://example.com/{}", "a".repeat(1025 - 20));
+        assert_eq!(long_url.len(), 1025);
+
+        let error = client
+            .get_page_neighbors(GetPageNeighborsRequest {
+                url: long_url,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(
+            error
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("bytes"),
+            "expected the length check, not base-URL validation, to reject this: {error:?}"
+        );
+    }
+
+    #[test]
+    fn graph_store_failed_names_the_graph_store_not_the_job_store() {
+        let error = graph_store_failed(sea_orm::DbErr::Custom("connection lost".into()));
+
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert!(
+            error
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("graph store"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_page_neighbors_rejects_a_max_depth_above_the_ceiling_at_the_rpc_boundary() {
+        let test = crate::test_db::start().await;
+        let url = start_crawler(test.db.clone()).await;
+        let client = client_to(&url);
+
+        let error = client
+            .get_page_neighbors(GetPageNeighborsRequest {
+                url: "https://example.com/a".to_owned(),
+                max_depth: MAX_REQUESTABLE_DEPTH + 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_page_neighbors_rejects_an_unspecified_relation_type_at_the_rpc_boundary() {
+        let test = crate::test_db::start().await;
+        let url = start_crawler(test.db.clone()).await;
+        let client = client_to(&url);
+
+        let error = client
+            .get_page_neighbors(GetPageNeighborsRequest {
+                url: "https://example.com/a".to_owned(),
+                allowed_relation_types: vec![EnumValue::Known(PageRelation::Unspecified)],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_page_neighbors_returns_a_full_neighbor_from_the_real_store_by_default() {
+        let test = crate::test_db::start().await;
+        crate::graph::PgEdges::new(test.db.clone())
+            .replace_outbound(
+                "https://example.com/a",
+                vec![crate::links::Link {
+                    url: "https://example.com/b".to_owned(),
+                    anchor_text: "B".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let url = start_crawler(test.db.clone()).await;
+        let client = client_to(&url);
+
+        let response = client
+            .get_page_neighbors(GetPageNeighborsRequest {
+                url: "https://example.com/a".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned();
+
+        assert_eq!(response.shallowest_first_neighbors.len(), 1);
+        let neighbor = &response.shallowest_first_neighbors[0];
+        assert_eq!(neighbor.url, "https://example.com/b");
+        assert!(!neighbor.crawled);
+        assert_eq!(neighbor.relation, EnumValue::Known(PageRelation::LinksTo));
+        assert_eq!(neighbor.depth, 1);
     }
 }

@@ -5,6 +5,7 @@ package crawler.v1;
 service CrawlerService {
   rpc StartCrawl(StartCrawlRequest) returns (StartCrawlResponse);
   rpc GetCrawlJob(GetCrawlJobRequest) returns (GetCrawlJobResponse);
+  rpc GetPageNeighbors(GetPageNeighborsRequest) returns (GetPageNeighborsResponse);
 }
 
 enum CrawlStatus {
@@ -44,4 +45,30 @@ message GetCrawlJobResponse {
   CrawlStatus status = 3;
   uint32 pages_crawled = 4;
   uint32 pages_skipped = 5;
+}
+
+enum PageRelation {
+  PAGE_RELATION_UNSPECIFIED = 0;
+  PAGE_RELATION_LINKS_TO = 1;
+  PAGE_RELATION_PARENT = 2;
+  PAGE_RELATION_CANONICAL = 3;
+  PAGE_RELATION_REDIRECT = 4;
+}
+
+message GetPageNeighborsRequest {
+  string url = 1;
+  repeated PageRelation allowed_relation_types = 2;
+  uint32 max_depth = 3;
+}
+
+message PageNeighbor {
+  bool crawled = 1;
+  string url = 2;
+  string title = 3;
+  PageRelation relation = 4;
+  uint32 depth = 5;
+}
+
+message GetPageNeighborsResponse {
+  repeated PageNeighbor shallowest_first_neighbors = 1;
 }

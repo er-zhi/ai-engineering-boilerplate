@@ -6,11 +6,13 @@ version.workspace = true
 
 [dependencies]
 common = { workspace = true }
-connectrpc = { workspace = true, features = ["axum"] }
+connectrpc = { workspace = true, features = ["axum", "client"] }
 buffa = { workspace = true }
 axum = { workspace = true }
 regex = { workspace = true }
 dom_smoothie = { workspace = true }
+scraper = { workspace = true }
+url = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }

@@ -43,11 +43,16 @@ ORM only. Service and test code reads and writes through SeaORM entities and the
 
 | Found in code | Use instead |
 |---|---|
-| `Statement::from_string`, `query_*_raw`, `execute_raw`, `execute_unprepared`, `sqlx::query` | The entity or query-builder equivalent |
+| `Statement::from_string`, `query_*_raw`, `execute_raw`, `execute_unprepared`, `sqlx::query` reading or writing rows | The entity or query-builder equivalent |
 | SQL assembled with `format!` | The query builder, with bound values |
 | Tests reading `information_schema` or `pg_catalog` | Assert the behavior the schema guarantees through the ORM: a too-long value or a duplicate key is rejected |
 
-The only exception is database bootstrap the ORM can't express (roles, schemas, extensions), and it lives only in the `postgres-bootstrap` config in `compose.yaml`. A test container that needs a service role creates it with the same statements.
+The only exceptions are schema objects the ORM genuinely cannot express:
+
+- Database bootstrap (roles, schemas, extensions) — lives only in the `postgres-bootstrap` config in `compose.yaml`, run once by Postgres itself before any service ever connects. A test container that needs a service role creates it with the same statements.
+- A vendor-specific index type entity-driven schema-sync has no derive attribute for (pgvector `USING hnsw`, a `GIN` index on `tsvector`/an array column) — this can't live in bootstrap, because bootstrap runs before schema-sync has created the table. It runs once at the owning service's own startup, immediately after schema-sync: `ConnectionTrait::execute_unprepared` naming one literal `CREATE INDEX IF NOT EXISTS ...` string is the sanctioned mechanism for exactly this, and only this — never a query, never touching rows, never string-built from anything but a compile-time literal. Document each one where its entity is defined.
+
+Neither exception licenses raw SQL for anything else — a query that reads or writes rows still goes through the entity or the query builder, `Expr::cust`/`Expr::cust_with_values` included for the one operator or function the builder has no named method for (pgvector `<=>`, `ts_rank`, array `&&`) inside an otherwise-typed `Select` chain, never a whole hand-assembled statement.
 
 ## Schema Isolation
 

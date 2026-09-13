@@ -59,6 +59,10 @@ Never treat an empty `content` as a model failure without checking `usage.comple
 
 `{"reasoning": {"effort": "none"}}` was checked live against `deepseek/deepseek-v4-flash`: a one-word prompt answered in 2 completion tokens with `reasoning_tokens: 0`. `{"enabled": false}` behaved the same in a live call but is not in OpenRouter's documented schema, so the code does not rely on it.
 
+## No Embeddings Here
+
+Embedding used to be a third RPC on this service (`Embed`, one model, no fallback, backed by OpenRouter). It moved to [`knowledge-base`](../knowledge-base/README.md#embedding-native-apple-silicon-only), the only caller, which now calls a native embedder process on the Mac over loopback HTTP — no provider, no key, nothing to log. This service knows nothing about embeddings any more; see the knowledge-base README for why and how.
+
 ## gRPC API
 
 [`common/proto/llm_router.proto`](../../common/proto/llm_router.proto) — `Complete` and `DescribeTiers`. Streaming and tool calling are future work.

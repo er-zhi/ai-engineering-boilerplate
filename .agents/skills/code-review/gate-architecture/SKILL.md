@@ -18,6 +18,7 @@ Rust style and input checks belong to `gate-code-quality`; schema, roles, querie
 - No shared mutable state (files, caches needing sync)
 - Cross-service calls go through gRPC contracts, not DB or filesystem
 - No importing internal modules from a sibling service
+- Every service is a Docker container in `[workspace] members`, with one sanctioned exception: `native/embedder-ane` (the Apple Neural Engine via Core ML has no Linux/container equivalent, and everyone on this project develops on Apple Silicon). It is a Python process outside Docker and the Cargo workspace, reached over plain loopback HTTP, not gRPC — see [knowledge-base's README](../../../../services/knowledge-base/README.md#embedding-native-apple-silicon-only). Adding a second exception like this needs the same bar: a real, verified platform gap, not convenience.
 
 ## Parallel Work
 

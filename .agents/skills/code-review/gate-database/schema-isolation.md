@@ -7,6 +7,7 @@ One Postgres instance, one schema and role per service. A role cannot reach anot
 | crawler | `crawler` | `crawler_user` | `CRAWLER_DB_PASSWORD` |
 | gateway | `gateway` | `gateway_user` | `GATEWAY_DB_PASSWORD` |
 | llm-router | `llm_router` | `llm_router_user` | `LLM_ROUTER_DB_PASSWORD` |
+| knowledge-base | `knowledge_base` | `knowledge_base_user` | `KNOWLEDGE_BASE_DB_PASSWORD` |
 
 ## Bootstrap
 
@@ -26,6 +27,7 @@ Compose builds each storing service's `DATABASE_URL` from its role and the match
 
 ```sql
 SET ROLE crawler_user;
-SELECT * FROM llm_router.requests;  -- must fail: permission denied for schema llm_router
-SELECT * FROM crawler.pages;        -- must succeed
+SELECT * FROM llm_router.requests;        -- must fail: permission denied for schema llm_router
+SELECT * FROM knowledge_base.documents;   -- must fail: permission denied for schema knowledge_base
+SELECT * FROM crawler.pages;              -- must succeed
 ```

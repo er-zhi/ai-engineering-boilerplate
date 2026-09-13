@@ -1,4 +1,4 @@
-// Crawl jobs: rows in crawler.crawl_jobs, run under a concurrency cap, with page counts kept current as pages are stored.
+// Crawl jobs: rows in crawler.crawl_jobs, run under a concurrency cap, with page counts kept current as pages are stored and changed pages handed to knowledge-base.
 
 use std::sync::Arc;
 
@@ -9,8 +9,11 @@ use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
 use tokio::sync::{Semaphore, mpsc};
 
-use crate::crawl::{self, CountedPage, Limits, Unreachable};
+use crate::crawl::{self, CountedPage, FetchedPage, Limits, Unreachable};
 use crate::entity::crawl_job::{self, Status};
+use crate::graph::EdgeStore;
+use crate::knowledge_base::KnowledgeBase;
+use crate::links;
 use crate::scope::Scope;
 use crate::store::PageStore;
 
@@ -148,17 +151,27 @@ impl JobStore for PgJobs {
 }
 
 #[derive(Clone)]
-pub struct Jobs<S, J> {
+pub struct Jobs<S, J, K, E> {
     pages: S,
     jobs: J,
+    knowledge_base: K,
+    edges: E,
     running: Arc<Semaphore>,
 }
 
-impl<S: PageStore, J: JobStore> Jobs<S, J> {
-    pub fn new(pages: S, jobs: J, max_concurrent_crawls: usize) -> Self {
+impl<S: PageStore, J: JobStore, K: KnowledgeBase, E: EdgeStore> Jobs<S, J, K, E> {
+    pub fn new(
+        pages: S,
+        jobs: J,
+        knowledge_base: K,
+        edges: E,
+        max_concurrent_crawls: usize,
+    ) -> Self {
         Self {
             pages,
             jobs,
+            knowledge_base,
+            edges,
             running: Arc::new(Semaphore::new(max_concurrent_crawls)),
         }
     }
@@ -202,35 +215,85 @@ impl<S: PageStore, J: JobStore> Jobs<S, J> {
             .expect("the crawl semaphore is never closed");
         self.set_status(id, CrawlStatus::Running).await;
 
-        let (counted, mut to_store) = mpsc::channel::<CountedPage>(limits.max_pages as usize);
+        let (counted, to_store) = mpsc::channel::<CountedPage>(limits.max_pages as usize);
+        let (fetched, to_graph) = mpsc::channel::<FetchedPage>(limits.max_pages as usize);
         let crawling = async move {
-            crawl::crawl(base_url, &scope, limits, move |page| {
-                if let Err(error) = counted.try_send(page) {
-                    tracing::warn!(job = id, "dropped a counted page: {error}");
-                }
-            })
+            crawl::crawl(
+                base_url,
+                &scope,
+                limits,
+                move |page| {
+                    if let Err(error) = counted.try_send(page) {
+                        tracing::warn!(job = id, "dropped a counted page: {error}");
+                    }
+                },
+                move |page| {
+                    if let Err(error) = fetched.try_send(page) {
+                        tracing::warn!(job = id, "dropped a fetched page for the graph: {error}");
+                    }
+                },
+            )
             .await
         };
-        let storing = async {
-            while let Some(page) = to_store.recv().await {
-                let url = page.url.clone();
-                match self.pages.save(page).await {
-                    Ok(()) => {
-                        if let Err(error) = self.jobs.add_crawled_page(id).await {
-                            tracing::error!(job = id, "could not count a stored page: {error}");
-                        }
-                    }
-                    Err(error) => tracing::error!(job = id, "could not store {url}: {error}"),
-                }
-            }
-        };
-        let (outcome, ()) = tokio::join!(crawling, storing);
+        let storing = self.store_counted_pages(id, to_store);
+        let updating_graph_edges = self.update_graph_edges(id, to_graph);
+        let (outcome, (), ()) = tokio::join!(crawling, storing, updating_graph_edges);
 
         let status = match outcome {
             Ok(()) => CrawlStatus::Done,
             Err(Unreachable) => CrawlStatus::Failed,
         };
         self.set_status(id, status).await;
+    }
+
+    async fn store_counted_pages(&self, id: i64, mut to_store: mpsc::Receiver<CountedPage>) {
+        while let Some(page) = to_store.recv().await {
+            let url = page.url.clone();
+            match self.pages.save(page).await {
+                Ok(saved) => {
+                    tracing::debug!(job = id, content_changed = saved.changed, "stored {url}");
+                    if let Err(error) = self.jobs.add_crawled_page(id).await {
+                        tracing::error!(job = id, "could not count a stored page: {error}");
+                    }
+                    if let Err(error) = self
+                        .knowledge_base
+                        .ingest(&url, &saved.title, &saved.main_text)
+                        .await
+                    {
+                        tracing::error!(
+                            job = id,
+                            "could not hand {url} to knowledge-base: {error}"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(job = id, "could not store {url}: {error}"),
+            }
+        }
+    }
+
+    async fn update_graph_edges(&self, id: i64, mut to_graph: mpsc::Receiver<FetchedPage>) {
+        while let Some(page) = to_graph.recv().await {
+            let Some(discovered_links) = links::try_extract_links(&page.final_url, &page.html)
+            else {
+                tracing::warn!(
+                    job = id,
+                    "skipped graph edges for {}: extraction did not run",
+                    page.final_url
+                );
+                continue;
+            };
+            if let Err(error) = self
+                .edges
+                .replace_outbound(&page.final_url, discovered_links)
+                .await
+            {
+                tracing::error!(
+                    job = id,
+                    "could not update graph edges for {}: {error}",
+                    page.final_url
+                );
+            }
+        }
     }
 
     async fn set_status(&self, id: i64, status: CrawlStatus) {
@@ -252,7 +315,7 @@ mod tests {
     use super::*;
     use crate::crawl::CountedPage;
     use crate::entity::page;
-    use crate::store::{PageStore, PgPages};
+    use crate::store::{PageStore, PgPages, Saved};
     use crate::test_db;
     use crate::test_site::{TestSite, unreachable_url};
 
@@ -266,9 +329,26 @@ mod tests {
     struct MemoryPages(Arc<Mutex<Vec<String>>>);
 
     impl PageStore for MemoryPages {
-        async fn save(&self, page: CountedPage) -> Result<(), DbErr> {
+        async fn save(&self, page: CountedPage) -> Result<Saved, DbErr> {
             self.0.lock().unwrap().push(page.url);
-            Ok(())
+            Ok(Saved {
+                title: String::new(),
+                main_text: String::new(),
+                changed: true,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct UnchangedPages;
+
+    impl PageStore for UnchangedPages {
+        async fn save(&self, _page: CountedPage) -> Result<Saved, DbErr> {
+            Ok(Saved {
+                title: "Title".to_owned(),
+                main_text: "Content".to_owned(),
+                changed: false,
+            })
         }
     }
 
@@ -276,8 +356,42 @@ mod tests {
     struct FailingPages;
 
     impl PageStore for FailingPages {
-        async fn save(&self, _page: CountedPage) -> Result<(), DbErr> {
+        async fn save(&self, _page: CountedPage) -> Result<Saved, DbErr> {
             Err(DbErr::Custom("database is down".into()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct NoopKnowledgeBase;
+
+    impl KnowledgeBase for NoopKnowledgeBase {
+        async fn ingest(&self, _url: &str, _title: &str, _content: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingKnowledgeBase {
+        ingested: Arc<Mutex<Vec<String>>>,
+        fails: bool,
+    }
+
+    impl RecordingKnowledgeBase {
+        fn failing() -> Self {
+            Self {
+                fails: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl KnowledgeBase for RecordingKnowledgeBase {
+        async fn ingest(&self, url: &str, _title: &str, _content: &str) -> Result<(), String> {
+            if self.fails {
+                return Err("knowledge-base is unavailable".to_owned());
+            }
+            self.ingested.lock().unwrap().push(url.to_owned());
+            Ok(())
         }
     }
 
@@ -343,11 +457,122 @@ mod tests {
         }
     }
 
-    fn in_memory(pages: impl PageStore) -> Jobs<impl PageStore, MemoryJobs> {
-        Jobs::new(pages, MemoryJobs::default(), ONE_AT_A_TIME)
+    #[derive(Clone, Default)]
+    struct NoopEdges;
+
+    impl EdgeStore for NoopEdges {
+        async fn replace_outbound(
+            &self,
+            _from_url: &str,
+            _links: Vec<crate::links::Link>,
+        ) -> Result<(), DbErr> {
+            Ok(())
+        }
+
+        async fn neighbors(
+            &self,
+            _start_url: &str,
+            _relation_types: Vec<crate::entity::page_edge::RelationType>,
+            _max_depth: u32,
+        ) -> Result<Vec<crate::graph::Neighbor>, DbErr> {
+            Ok(Vec::new())
+        }
     }
 
-    async fn job(jobs: &Jobs<impl PageStore, impl JobStore>, id: i64) -> CrawlJob {
+    type ReplacedEdges = Vec<(String, Vec<crate::links::Link>)>;
+
+    #[derive(Clone, Default)]
+    struct RecordingEdges {
+        replaced: Arc<Mutex<ReplacedEdges>>,
+    }
+
+    impl EdgeStore for RecordingEdges {
+        async fn replace_outbound(
+            &self,
+            from_url: &str,
+            links: Vec<crate::links::Link>,
+        ) -> Result<(), DbErr> {
+            self.replaced
+                .lock()
+                .unwrap()
+                .push((from_url.to_owned(), links));
+            Ok(())
+        }
+
+        async fn neighbors(
+            &self,
+            _start_url: &str,
+            _relation_types: Vec<crate::entity::page_edge::RelationType>,
+            _max_depth: u32,
+        ) -> Result<Vec<crate::graph::Neighbor>, DbErr> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailingEdges;
+
+    impl EdgeStore for FailingEdges {
+        async fn replace_outbound(
+            &self,
+            _from_url: &str,
+            _links: Vec<crate::links::Link>,
+        ) -> Result<(), DbErr> {
+            Err(DbErr::Custom("graph store is down".into()))
+        }
+
+        async fn neighbors(
+            &self,
+            _start_url: &str,
+            _relation_types: Vec<crate::entity::page_edge::RelationType>,
+            _max_depth: u32,
+        ) -> Result<Vec<crate::graph::Neighbor>, DbErr> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn in_memory(
+        pages: impl PageStore,
+    ) -> Jobs<impl PageStore, MemoryJobs, NoopKnowledgeBase, NoopEdges> {
+        Jobs::new(
+            pages,
+            MemoryJobs::default(),
+            NoopKnowledgeBase,
+            NoopEdges,
+            ONE_AT_A_TIME,
+        )
+    }
+
+    fn in_memory_with_edges(
+        pages: impl PageStore,
+        edges: impl EdgeStore,
+    ) -> Jobs<impl PageStore, MemoryJobs, NoopKnowledgeBase, impl EdgeStore> {
+        Jobs::new(
+            pages,
+            MemoryJobs::default(),
+            NoopKnowledgeBase,
+            edges,
+            ONE_AT_A_TIME,
+        )
+    }
+
+    fn in_memory_with(
+        pages: impl PageStore,
+        knowledge_base: impl KnowledgeBase,
+    ) -> Jobs<impl PageStore, MemoryJobs, impl KnowledgeBase, NoopEdges> {
+        Jobs::new(
+            pages,
+            MemoryJobs::default(),
+            knowledge_base,
+            NoopEdges,
+            ONE_AT_A_TIME,
+        )
+    }
+
+    async fn job(
+        jobs: &Jobs<impl PageStore, impl JobStore, impl KnowledgeBase, impl EdgeStore>,
+        id: i64,
+    ) -> CrawlJob {
         jobs.get(id).await.unwrap().unwrap()
     }
 
@@ -564,6 +789,221 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_crawl_extracts_and_replaces_outbound_links_for_every_fetched_page() {
+        let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
+        let edges = RecordingEdges::default();
+        let jobs = in_memory_with_edges(MemoryPages::default(), edges.clone());
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
+
+        jobs.run(
+            created.id,
+            &site.url("/"),
+            Scope::new(&CrawlScope::default()),
+            LIMITS,
+        )
+        .await;
+
+        let replaced = edges.replaced.lock().unwrap();
+        let root = replaced
+            .iter()
+            .find(|(from_url, _)| *from_url == site.url("/"))
+            .unwrap_or_else(|| panic!("no edges recorded from {}: {replaced:?}", site.url("/")));
+        assert_eq!(
+            root.1,
+            [crate::links::Link {
+                url: site.url("/docs/a"),
+                anchor_text: "/docs/a".to_owned(),
+            }]
+        );
+        let child = replaced
+            .iter()
+            .find(|(from_url, _)| *from_url == site.url("/docs/a"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no edges recorded from {}: {replaced:?}",
+                    site.url("/docs/a")
+                )
+            });
+        assert_eq!(
+            child.1,
+            [],
+            "a page with no links should replace with an empty set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_url_at_the_byte_limit_reaches_the_graph_store() {
+        let edges = RecordingEdges::default();
+        let jobs = in_memory_with_edges(MemoryPages::default(), edges.clone());
+        let url = format!("https://example.com/{}", "a".repeat(1024 - 20));
+        assert_eq!(url.len(), 1024);
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(crate::crawl::FetchedPage {
+                final_url: url.clone(),
+                html: String::new(),
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        jobs.update_graph_edges(0, receiver).await;
+
+        assert_eq!(edges.replaced.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn html_over_the_parseable_size_never_replaces_existing_edges() {
+        let edges = RecordingEdges::default();
+        let jobs = in_memory_with_edges(MemoryPages::default(), edges.clone());
+        let oversized_html = "x".repeat(crate::links::MAX_PARSEABLE_HTML_BYTES + 1);
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(crate::crawl::FetchedPage {
+                final_url: "https://example.com/a".to_owned(),
+                html: oversized_html,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        jobs.update_graph_edges(0, receiver).await;
+
+        assert!(
+            edges.replaced.lock().unwrap().is_empty(),
+            "skipped extraction must never call replace_outbound"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn html_over_the_parseable_size_leaves_a_real_stored_edge_intact() {
+        let test = test_db::start().await;
+        let real_edges = crate::graph::PgEdges::new(test.db.clone());
+        real_edges
+            .replace_outbound(
+                "https://example.com/a",
+                vec![crate::links::Link {
+                    url: "https://example.com/b".to_owned(),
+                    anchor_text: "B".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let jobs = in_memory_with_edges(MemoryPages::default(), real_edges.clone());
+        let oversized_html = "x".repeat(crate::links::MAX_PARSEABLE_HTML_BYTES + 1);
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(crate::crawl::FetchedPage {
+                final_url: "https://example.com/a".to_owned(),
+                html: oversized_html,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        jobs.update_graph_edges(0, receiver).await;
+
+        let neighbors = real_edges
+            .neighbors(
+                "https://example.com/a",
+                vec![],
+                crate::graph::MAX_REQUESTABLE_DEPTH,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbors.iter().map(|n| n.url.as_str()).collect::<Vec<_>>(),
+            ["https://example.com/b"],
+            "the previously stored edge must survive a skipped, oversized extraction"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_graph_store_does_not_fail_the_job_or_skip_knowledge_base() {
+        let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
+        let knowledge_base = RecordingKnowledgeBase::default();
+        let jobs = Jobs::new(
+            MemoryPages::default(),
+            MemoryJobs::default(),
+            knowledge_base.clone(),
+            FailingEdges,
+            ONE_AT_A_TIME,
+        );
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
+
+        jobs.run(created.id, &site.url("/"), only_docs(), LIMITS)
+            .await;
+
+        let finished = job(&jobs, created.id).await;
+        assert_eq!(finished.status, CrawlStatus::Done);
+        assert_eq!(finished.pages_crawled, 1);
+        assert_eq!(
+            knowledge_base.ingested.lock().unwrap().as_slice(),
+            [site.url("/docs/a")]
+        );
+    }
+
+    fn only_docs() -> Scope {
+        Scope::new(&CrawlScope {
+            include_patterns: vec!["/docs/*".into()],
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changed_page_is_handed_to_knowledge_base() {
+        let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
+        let knowledge_base = RecordingKnowledgeBase::default();
+        let jobs = in_memory_with(MemoryPages::default(), knowledge_base.clone());
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
+
+        jobs.run(created.id, &site.url("/"), only_docs(), LIMITS)
+            .await;
+
+        assert_eq!(
+            knowledge_base.ingested.lock().unwrap().as_slice(),
+            [site.url("/docs/a")]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unchanged_page_is_still_handed_to_knowledge_base() {
+        let knowledge_base = RecordingKnowledgeBase::default();
+        let jobs = in_memory_with(UnchangedPages, knowledge_base.clone());
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(CountedPage {
+                url: "https://example.com/docs/a".to_owned(),
+                html: String::new(),
+                status: 200,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        jobs.store_counted_pages(1, receiver).await;
+
+        assert_eq!(
+            knowledge_base.ingested.lock().unwrap().as_slice(),
+            ["https://example.com/docs/a"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_hand_off_to_knowledge_base_does_not_fail_the_job() {
+        let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
+        let jobs = in_memory_with(MemoryPages::default(), RecordingKnowledgeBase::failing());
+        let (created, _) = jobs.create(&site.url("/"), None).await.unwrap();
+
+        jobs.run(created.id, &site.url("/"), only_docs(), LIMITS)
+            .await;
+
+        let finished = job(&jobs, created.id).await;
+        assert_eq!(finished.status, CrawlStatus::Done);
+        assert_eq!(finished.pages_crawled, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn crawl_stores_the_in_scope_pages_and_the_job_row_in_postgres() {
         let test = test_db::start().await;
         let site =
@@ -571,6 +1011,8 @@ mod tests {
         let jobs = Jobs::new(
             PgPages::new(test.db.clone()),
             PgJobs::new(test.db.clone()),
+            NoopKnowledgeBase,
+            crate::graph::PgEdges::new(test.db.clone()),
             ONE_AT_A_TIME,
         );
         let (created, _) = jobs.create(&site.url("/"), Some("k1")).await.unwrap();
@@ -603,6 +1045,8 @@ mod tests {
         let jobs = Jobs::new(
             PgPages::new(test.db.clone()),
             PgJobs::new(test.db.clone()),
+            NoopKnowledgeBase,
+            crate::graph::PgEdges::new(test.db.clone()),
             ONE_AT_A_TIME,
         );
         let (queued, _) = jobs.create("https://a.example", None).await.unwrap();

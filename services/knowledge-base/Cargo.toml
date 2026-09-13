@@ -1,0 +1,25 @@
+[package]
+name = "knowledge-base"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+buffa = { workspace = true }
+chrono = { workspace = true }
+common = { workspace = true }
+connectrpc = { workspace = true, features = ["axum", "client"] }
+hyper-util = { workspace = true }
+pgvector = { workspace = true }
+reqwest = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+common = { workspace = true, features = ["test-support"] }

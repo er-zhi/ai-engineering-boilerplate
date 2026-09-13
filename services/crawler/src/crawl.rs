@@ -1,4 +1,4 @@
-// Runs one crawl with spider and reports every fetched page the scope counts.
+// Runs one crawl with spider, reporting in-scope pages and every fetched page separately.
 
 use std::time::Duration;
 
@@ -27,11 +27,17 @@ pub struct CountedPage {
     pub status: u16,
 }
 
+pub struct FetchedPage {
+    pub final_url: String,
+    pub html: String,
+}
+
 pub async fn crawl(
     base_url: &str,
     scope: &Scope,
     limits: Limits,
     mut on_counted: impl FnMut(CountedPage) + Send,
+    mut on_fetched: impl FnMut(FetchedPage) + Send,
 ) -> Result<(), Unreachable> {
     let blacklist: Vec<CompactString> = scope
         .blacklist()
@@ -53,12 +59,18 @@ pub async fn crawl(
     let mut count_fetched_page = |page: Page| {
         if page.status_code.is_success() {
             any_fetched = true;
-            if scope.counts(page.get_url()) {
+            let html = page.get_html();
+            let counts_toward_scope = scope.counts(page.get_url());
+            if counts_toward_scope {
                 on_counted(CountedPage {
                     url: page.get_url().to_owned(),
-                    html: page.get_html(),
+                    html: html.clone(),
                     status: page.status_code.as_u16(),
                 });
+            }
+            let final_url = page.get_url_final().to_owned();
+            if final_url.len() <= crate::links::MAX_URL_BYTES {
+                on_fetched(FetchedPage { final_url, html });
             }
         }
     };
@@ -134,9 +146,13 @@ mod tests {
         });
 
         let mut counted = Vec::new();
-        crawl(&site.url("/"), &scope, LIMITS, |page| {
-            counted.push(page.url)
-        })
+        crawl(
+            &site.url("/"),
+            &scope,
+            LIMITS,
+            |page| counted.push(page.url),
+            |_| {},
+        )
         .await
         .unwrap();
 
@@ -153,6 +169,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn on_fetched_fires_for_a_page_scope_excludes_from_on_counted() {
+        let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
+        let scope = Scope::new(&CrawlScope {
+            include_patterns: vec!["/docs/*".into()],
+            ..Default::default()
+        });
+
+        let mut counted = Vec::new();
+        let mut fetched = Vec::new();
+        crawl(
+            &site.url("/"),
+            &scope,
+            LIMITS,
+            |page| counted.push(page.url),
+            |page| fetched.push(page.final_url),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counted, [site.url("/docs/a")]);
+        fetched.sort();
+        assert_eq!(fetched, [site.url("/"), site.url("/docs/a")]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_fetched_never_fires_for_a_url_over_the_byte_limit() {
+        let long_path = format!("/{}", "a".repeat(1100));
+        let site = TestSite::start([
+            ("/", long_path.clone()),
+            (long_path.as_str(), String::new()),
+        ])
+        .await;
+
+        let mut fetched = Vec::new();
+        crawl(
+            &site.url("/"),
+            &everything(),
+            LIMITS,
+            |_| {},
+            |page| fetched.push(page.final_url),
+        )
+        .await
+        .unwrap();
+
+        assert!(fetched.contains(&site.url("/")));
+        assert!(!fetched.contains(&site.url(&long_path)), "{fetched:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn stops_fetching_at_the_page_limit() {
         let many_links: String = (1..=20).map(|i| format!("/p/{i} ")).collect();
         let site = TestSite::start(
@@ -166,9 +231,15 @@ mod tests {
         };
 
         let mut counted = 0;
-        crawl(&site.url("/"), &everything(), limits, |_| counted += 1)
-            .await
-            .unwrap();
+        crawl(
+            &site.url("/"),
+            &everything(),
+            limits,
+            |_| counted += 1,
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         let fetched = site.requested_pages().len();
         assert!((1..=5).contains(&fetched), "fetched {fetched} pages");
@@ -177,7 +248,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unreachable_site_is_an_error() {
-        let result = crawl(&unreachable_url().await, &everything(), LIMITS, |_| {}).await;
+        let result = crawl(
+            &unreachable_url().await,
+            &everything(),
+            LIMITS,
+            |_| {},
+            |_| {},
+        )
+        .await;
 
         assert_eq!(result, Err(Unreachable));
     }
@@ -187,7 +265,14 @@ mod tests {
         let site = TestSite::start([("/elsewhere", "")]).await;
 
         let mut counted = 0;
-        let result = crawl(&site.url("/"), &everything(), LIMITS, |_| counted += 1).await;
+        let result = crawl(
+            &site.url("/"),
+            &everything(),
+            LIMITS,
+            |_| counted += 1,
+            |_| {},
+        )
+        .await;
 
         assert_eq!(result, Err(Unreachable));
         assert_eq!(counted, 0);
@@ -198,9 +283,13 @@ mod tests {
         let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;
 
         let mut pages = Vec::new();
-        crawl(&site.url("/"), &everything(), LIMITS, |page| {
-            pages.push(page)
-        })
+        crawl(
+            &site.url("/"),
+            &everything(),
+            LIMITS,
+            |page| pages.push(page),
+            |_| {},
+        )
         .await
         .unwrap();
 

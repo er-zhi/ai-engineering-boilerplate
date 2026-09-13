@@ -79,3 +79,4 @@ message CompleteResponse {
   bool used_backup = 5;
   FinishReason finish_reason = 6;
 }
+
