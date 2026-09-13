@@ -3,6 +3,8 @@
 use common::proto::crawler::v1::CrawlStatus;
 use sea_orm::entity::prelude::*;
 
+pub(crate) const MAX_BASE_URL_CHARS: usize = 2048;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::N(16))")]
 pub enum Status {
@@ -44,7 +46,7 @@ impl From<CrawlStatus> for Status {
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
-    #[sea_orm(column_type = "String(StringLen::N(2048))")]
+    #[sea_orm(column_type = "String(StringLen::N(MAX_BASE_URL_CHARS as u32))")]
     pub base_url: String,
     pub status: Status,
     pub pages_crawled: i32,

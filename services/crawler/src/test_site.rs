@@ -21,6 +21,18 @@ impl TestSite {
         Self::start_with_response_delay(pages, Duration::ZERO).await
     }
 
+    pub async fn start_with_html<P, B>(pages: impl IntoIterator<Item = (P, B)>) -> Self
+    where
+        P: Into<String>,
+        B: Into<String>,
+    {
+        let pages = pages
+            .into_iter()
+            .map(|(path, body)| (path.into(), body.into()))
+            .collect();
+        Self::start_pages(pages, Duration::ZERO).await
+    }
+
     pub async fn start_with_response_delay<P, L>(
         pages: impl IntoIterator<Item = (P, L)>,
         response_delay: Duration,
@@ -29,12 +41,15 @@ impl TestSite {
         P: Into<String>,
         L: Into<String>,
     {
-        let pages: Arc<HashMap<String, String>> = Arc::new(
-            pages
-                .into_iter()
-                .map(|(path, hrefs)| (path.into(), page_linking_to(&hrefs.into())))
-                .collect(),
-        );
+        let pages = pages
+            .into_iter()
+            .map(|(path, hrefs)| (path.into(), page_linking_to(&hrefs.into())))
+            .collect();
+        Self::start_pages(pages, response_delay).await
+    }
+
+    async fn start_pages(pages: HashMap<String, String>, response_delay: Duration) -> Self {
+        let pages = Arc::new(pages);
         let requested = Arc::new(Mutex::new(Vec::new()));
 
         let app = axum::Router::new().fallback({

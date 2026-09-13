@@ -8,6 +8,8 @@ use crate::entity::document::MAX_EMBEDDING_MODEL_CHARS;
 use crate::entity::document_chunk::EMBEDDING_DIMENSIONS;
 use crate::llm_client::{EmbedKind, Embedded};
 
+const MAX_EMBEDDER_RESPONSE_BYTES: usize = 256 * 1024;
+
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
     text: &'a str,
@@ -67,18 +69,15 @@ impl EmbedderClient {
             })?;
 
         let status = response.status();
+        let response_bytes = read_embedder_response(response).await?;
         if !status.is_success() {
-            let detail = response
-                .json::<EmbedderError>()
-                .await
+            let detail = serde_json::from_slice::<EmbedderError>(&response_bytes)
                 .map(|body| body.error)
                 .unwrap_or_else(|_| format!("the embedder answered {status}"));
             return Err(detail);
         }
 
-        let body = response
-            .json::<EmbedResponse>()
-            .await
+        let body = serde_json::from_slice::<EmbedResponse>(&response_bytes)
             .map_err(|error| format!("the embedder sent a reply we cannot read: {error}"))?;
         if body.truncated {
             tracing::warn!(
@@ -89,6 +88,32 @@ impl EmbedderClient {
 
         validate_response(body)
     }
+}
+
+async fn read_embedder_response(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_EMBEDDER_RESPONSE_BYTES as u64)
+    {
+        return Err(embedder_response_too_large());
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("the embedder sent a reply we cannot read: {error}"))?
+    {
+        if chunk.len() > MAX_EMBEDDER_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(embedder_response_too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn embedder_response_too_large() -> String {
+    format!("the embedder response is larger than {MAX_EMBEDDER_RESPONSE_BYTES} bytes")
 }
 
 fn validate_response(body: EmbedResponse) -> Result<Embedded, String> {
@@ -132,6 +157,7 @@ mod tests {
         Malformed,
         Rejected,
         Delayed,
+        Oversized,
     }
 
     #[derive(Clone)]
@@ -175,6 +201,9 @@ mod tests {
                     "model_used": "test-embedder"
                 }))
                 .into_response()
+            }
+            FakeReply::Oversized => {
+                (StatusCode::OK, "x".repeat(MAX_EMBEDDER_RESPONSE_BYTES + 1)).into_response()
             }
         }
     }
@@ -257,6 +286,22 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "the native embedder did not answer in time");
+    }
+
+    #[tokio::test]
+    async fn a_response_over_the_byte_limit_is_rejected_before_json_parsing() {
+        let (url, _) = start_fake_embedder(FakeReply::Oversized).await;
+        let client = EmbedderClient::new(&url, Duration::from_secs(1)).unwrap();
+
+        let error = client
+            .embed("text", EmbedKind::StoredPassage)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.contains(&MAX_EMBEDDER_RESPONSE_BYTES.to_string()),
+            "{error}"
+        );
     }
 
     #[test]

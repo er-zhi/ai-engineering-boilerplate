@@ -10,6 +10,7 @@ use crate::provider::{CallError, Completion, Prompt, Provider};
 
 const COMPLETIONS_PATH: &str = "/chat/completions";
 const KEY_PATH: &str = "/key";
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const TOO_MANY_REQUESTS: u16 = 429;
 const FIRST_SERVER_FAULT: u16 = 500;
 
@@ -76,11 +77,38 @@ impl Provider for OpenAiCompatible {
             return Err(error_for_status(status.as_u16()));
         }
 
-        let body = response.json::<Value>().await.map_err(|error| {
-            CallError::WorthRetrying(format!("the provider sent a reply we cannot read: {error}"))
-        })?;
+        let body = read_provider_response(response).await?;
         read_completion(&body)
     }
+}
+
+async fn read_provider_response(mut response: reqwest::Response) -> Result<Value, CallError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        return Err(provider_response_too_large());
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        CallError::WorthRetrying(format!("the provider sent a reply we cannot read: {error}"))
+    })? {
+        if chunk.len() > MAX_PROVIDER_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(provider_response_too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&bytes).map_err(|error| {
+        CallError::WorthRetrying(format!("the provider sent a reply we cannot read: {error}"))
+    })
+}
+
+fn provider_response_too_large() -> CallError {
+    CallError::WorthRetrying(format!(
+        "the provider response is larger than {MAX_PROVIDER_RESPONSE_BYTES} bytes"
+    ))
 }
 
 pub fn request_body(model: &str, prompt: &Prompt) -> Value {
@@ -309,6 +337,29 @@ mod tests {
             panic!("a slow provider is exactly what the backup exists for");
         };
         assert!(message.contains("in time"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_response_over_the_byte_limit_is_rejected_before_json_parsing() {
+        let stub = TestProvider::answering(
+            StatusCode::OK,
+            json!({"padding": "x".repeat(MAX_PROVIDER_RESPONSE_BYTES)}),
+        )
+        .await;
+        let adapter = adapter_for(&stub, PATIENT_ENOUGH).await;
+
+        let error = adapter
+            .complete("deepseek/deepseek-v4-flash", &prompt(QualityTier::Low))
+            .await
+            .unwrap_err();
+
+        let CallError::WorthRetrying(message) = error else {
+            panic!("an oversized provider response should allow the backup to answer");
+        };
+        assert!(
+            message.contains(&MAX_PROVIDER_RESPONSE_BYTES.to_string()),
+            "{message}"
+        );
     }
 
     fn prompt(tier: QualityTier) -> Prompt {

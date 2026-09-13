@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use common::llm::{fit_to_limits, limits};
+use common::llm::{Sampling, fit_to_limits, limits};
 use common::proto::llm_router::v1::{CompleteRequest, CompleteResponse, FinishReason};
 use connectrpc::ConnectError;
 use serde_json::json;
@@ -19,6 +19,11 @@ const NO_MODEL_ANSWERED: &str =
     "no model on this tier answered; the request log holds the provider's reply";
 const PROVIDER_REFUSED: &str =
     "the provider refused this request; the request log holds the provider's reply";
+const MAX_STOP_SEQUENCES: usize = 4;
+const MAX_STOP_SEQUENCE_BYTES: usize = 1024;
+const MAX_TOTAL_STOP_BYTES: usize = 2048;
+const MAX_LOGIT_BIAS_ENTRIES: usize = 300;
+const MAX_TOP_LOGPROBS: i32 = 20;
 
 pub struct Router<P: Provider, L: RequestLog> {
     provider: P,
@@ -50,6 +55,7 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
         }
 
         let mut sampling = sampling_from(request.sampling.into_option().unwrap_or_default());
+        validate_sampling(&sampling)?;
         fit_to_limits(
             &request.system_prompt,
             &request.user_prompt,
@@ -121,6 +127,75 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
             tracing::error!("could not record an llm call: {error}");
         }
     }
+}
+
+fn validate_sampling(sampling: &Sampling) -> Result<(), ConnectError> {
+    validate_number("temperature", sampling.temperature, 0.0, 2.0)?;
+    validate_number("top_p", sampling.top_p, 0.0, 1.0)?;
+    validate_number("frequency_penalty", sampling.frequency_penalty, -2.0, 2.0)?;
+    validate_number("presence_penalty", sampling.presence_penalty, -2.0, 2.0)?;
+    validate_stop_sequences(&sampling.stop)?;
+    validate_logit_bias(sampling)?;
+    if sampling
+        .top_logprobs
+        .is_some_and(|value| !(0..=MAX_TOP_LOGPROBS).contains(&value))
+    {
+        return Err(ConnectError::invalid_argument(format!(
+            "top_logprobs must be between 0 and {MAX_TOP_LOGPROBS}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_number(
+    field: &str,
+    value: Option<f64>,
+    minimum: f64,
+    maximum: f64,
+) -> Result<(), ConnectError> {
+    if value.is_some_and(|value| !value.is_finite() || !(minimum..=maximum).contains(&value)) {
+        return Err(ConnectError::invalid_argument(format!(
+            "{field} must be a finite number between {minimum} and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stop_sequences(stop: &[String]) -> Result<(), ConnectError> {
+    if stop.len() > MAX_STOP_SEQUENCES {
+        return Err(ConnectError::invalid_argument(format!(
+            "stop must hold at most {MAX_STOP_SEQUENCES} sequences"
+        )));
+    }
+    if stop
+        .iter()
+        .any(|sequence| sequence.len() > MAX_STOP_SEQUENCE_BYTES)
+    {
+        return Err(ConnectError::invalid_argument(format!(
+            "each stop sequence must be at most {MAX_STOP_SEQUENCE_BYTES} bytes"
+        )));
+    }
+    let total_bytes = stop.iter().fold(0_usize, |total, sequence| {
+        total.saturating_add(sequence.len())
+    });
+    if total_bytes > MAX_TOTAL_STOP_BYTES {
+        return Err(ConnectError::invalid_argument(format!(
+            "stop sequences must total at most {MAX_TOTAL_STOP_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_logit_bias(sampling: &Sampling) -> Result<(), ConnectError> {
+    if sampling.logit_bias.len() > MAX_LOGIT_BIAS_ENTRIES {
+        return Err(ConnectError::invalid_argument(format!(
+            "logit_bias must hold at most {MAX_LOGIT_BIAS_ENTRIES} entries"
+        )));
+    }
+    for value in sampling.logit_bias.values() {
+        validate_number("each logit_bias value", Some(*value), -100.0, 100.0)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -219,6 +294,24 @@ mod tests {
             user_prompt: user_prompt.to_owned(),
             ..Default::default()
         }
+    }
+
+    async fn assert_sampling_refused(sampling: WireSampling, field: &str) {
+        let provider = Scripted::new(vec![answered()]);
+        let log = Recorded::new();
+        let router = Router::new(provider.clone(), log.clone(), tiers());
+
+        let error = router
+            .complete(CompleteRequest {
+                sampling: sampling.into(),
+                ..asking(QualityTier::Low, "https://example.com")
+            })
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:?}").contains(field), "{error:?}");
+        assert!(provider.asked().is_empty());
+        assert_eq!(log.attempts(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -345,6 +438,163 @@ mod tests {
             "{error:?}"
         );
         assert!(provider.asked().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn temperature_outside_zero_to_two_or_non_finite_is_refused() {
+        for temperature in [-0.1, 2.1, f64::NAN, f64::INFINITY] {
+            assert_sampling_refused(
+                WireSampling {
+                    temperature: Some(temperature),
+                    ..Default::default()
+                },
+                "temperature",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn top_p_outside_zero_to_one_is_refused() {
+        for top_p in [-0.1, 1.1] {
+            assert_sampling_refused(
+                WireSampling {
+                    top_p: Some(top_p),
+                    ..Default::default()
+                },
+                "top_p",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frequency_penalty_outside_minus_two_to_two_is_refused() {
+        assert_sampling_refused(
+            WireSampling {
+                frequency_penalty: Some(2.1),
+                ..Default::default()
+            },
+            "frequency_penalty",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_penalty_outside_minus_two_to_two_is_refused() {
+        assert_sampling_refused(
+            WireSampling {
+                presence_penalty: Some(-2.1),
+                ..Default::default()
+            },
+            "presence_penalty",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn more_than_four_stop_sequences_are_refused() {
+        assert_sampling_refused(
+            WireSampling {
+                stop: vec!["x".to_owned(); MAX_STOP_SEQUENCES + 1],
+                ..Default::default()
+            },
+            "stop",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_individual_stop_sequence_over_the_byte_limit_is_refused() {
+        assert_sampling_refused(
+            WireSampling {
+                stop: vec!["x".repeat(MAX_STOP_SEQUENCE_BYTES + 1)],
+                ..Default::default()
+            },
+            "stop sequence",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_sequences_over_the_total_byte_limit_are_refused() {
+        assert_sampling_refused(
+            WireSampling {
+                stop: vec!["x".repeat(MAX_TOTAL_STOP_BYTES / MAX_STOP_SEQUENCES + 1); 4],
+                ..Default::default()
+            },
+            "stop sequences",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn too_many_logit_bias_entries_are_refused() {
+        let logit_bias = (0..=MAX_LOGIT_BIAS_ENTRIES)
+            .map(|token| (token.to_string(), 0.0))
+            .collect();
+        assert_sampling_refused(
+            WireSampling {
+                logit_bias,
+                ..Default::default()
+            },
+            "logit_bias",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn logit_bias_values_outside_minus_one_hundred_to_one_hundred_are_refused() {
+        assert_sampling_refused(
+            WireSampling {
+                logit_bias: [("42".to_owned(), 100.1)].into_iter().collect(),
+                ..Default::default()
+            },
+            "logit_bias value",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn top_logprobs_outside_zero_to_twenty_are_refused() {
+        for top_logprobs in [-1, MAX_TOP_LOGPROBS + 1] {
+            assert_sampling_refused(
+                WireSampling {
+                    top_logprobs: Some(top_logprobs),
+                    ..Default::default()
+                },
+                "top_logprobs",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sampling_values_at_every_boundary_are_accepted() {
+        let provider = Scripted::new(vec![answered()]);
+        let router = Router::new(provider.clone(), Recorded::new(), tiers());
+
+        router
+            .complete(CompleteRequest {
+                sampling: WireSampling {
+                    temperature: Some(2.0),
+                    top_p: Some(1.0),
+                    stop: vec!["x".repeat(MAX_TOTAL_STOP_BYTES / MAX_STOP_SEQUENCES); 4],
+                    frequency_penalty: Some(-2.0),
+                    presence_penalty: Some(2.0),
+                    logit_bias: (0..MAX_LOGIT_BIAS_ENTRIES)
+                        .map(|token| (token.to_string(), 100.0))
+                        .collect(),
+                    top_logprobs: Some(MAX_TOP_LOGPROBS),
+                    ..Default::default()
+                }
+                .into(),
+                ..asking(QualityTier::Low, "https://example.com")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.asked().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

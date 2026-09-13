@@ -32,6 +32,7 @@ use connectrpc::{
 use sea_orm::Database;
 
 use crate::crawl::Limits;
+use crate::entity::crawl_job::MAX_BASE_URL_CHARS;
 use crate::entity::page_edge::RelationType;
 use crate::graph::{EdgeStore, MAX_REQUESTABLE_DEPTH, PgEdges};
 use crate::jobs::{Jobs, PgJobs, parse_job_id};
@@ -67,7 +68,7 @@ impl CrawlerService for Crawler {
         _ctx: RequestContext,
         request: ServiceRequest<'_, StartCrawlRequest>,
     ) -> ServiceResult<StartCrawlResponse> {
-        validate_base_url(request.base_url)?;
+        validate_base_url(request.base_url).await?;
         validate_idempotency_key(request.idempotency_key)?;
 
         let request = request.to_owned_message();
@@ -125,7 +126,7 @@ impl CrawlerService for Crawler {
         request: ServiceRequest<'_, GetPageNeighborsRequest>,
     ) -> ServiceResult<GetPageNeighborsResponse> {
         validate_graph_url_length(request.url)?;
-        validate_base_url(request.url)?;
+        validate_base_url(request.url).await?;
         let max_depth = resolve_max_depth(request.max_depth)?;
         let relation_types = parse_allowed_relation_types(&request.allowed_relation_types)?;
 
@@ -246,9 +247,14 @@ fn validate_idempotency_key(key: &str) -> Result<(), ConnectError> {
     Ok(())
 }
 
-fn validate_base_url(raw: &str) -> Result<(), ConnectError> {
+async fn validate_base_url(raw: &str) -> Result<(), ConnectError> {
     if raw.is_empty() {
         return Err(ConnectError::invalid_argument("base_url is required"));
+    }
+    if raw.chars().count() > MAX_BASE_URL_CHARS {
+        return Err(ConnectError::invalid_argument(format!(
+            "base_url is longer than {MAX_BASE_URL_CHARS} characters"
+        )));
     }
     let Some(host) = raw.parse::<Uri>().ok().and_then(|uri| {
         matches!(uri.scheme_str(), Some("http" | "https"))
@@ -264,21 +270,47 @@ fn validate_base_url(raw: &str) -> Result<(), ConnectError> {
             "base_url must be an absolute http or https URL",
         ));
     }
-    if is_private_host(&host) {
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
         return Err(ConnectError::invalid_argument(
             "base_url must point at a public host, not a loopback, private, or link-local address",
+        ));
+    }
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = literal.parse::<IpAddr>() {
+        return public_ip(ip);
+    }
+
+    let addresses = tokio::net::lookup_host((literal, 0))
+        .await
+        .map_err(|error| {
+            ConnectError::invalid_argument(format!("base_url host could not be resolved: {error}"))
+        })?;
+    let mut resolved_any = false;
+    for address in addresses {
+        resolved_any = true;
+        public_ip(address.ip())?;
+    }
+    if !resolved_any {
+        return Err(ConnectError::invalid_argument(
+            "base_url host did not resolve to an address",
         ));
     }
     Ok(())
 }
 
-fn is_private_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        return true;
+fn public_ip(ip: IpAddr) -> Result<(), ConnectError> {
+    if is_private_ip(ip) {
+        Err(ConnectError::invalid_argument(
+            "base_url must point at a public host, not a loopback, private, or link-local address",
+        ))
+    } else {
+        Ok(())
     }
-    let literal = host.trim_start_matches('[').trim_end_matches(']');
-    match literal.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => {
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
             ip.is_loopback()
                 || ip.is_private()
                 || ip.is_link_local()
@@ -286,7 +318,7 @@ fn is_private_host(host: &str) -> bool {
                 || ip.is_broadcast()
                 || ip.is_multicast()
         }
-        Ok(IpAddr::V6(ip)) => {
+        IpAddr::V6(ip) => {
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
@@ -294,9 +326,8 @@ fn is_private_host(host: &str) -> bool {
                 || ip.is_unicast_link_local()
                 || ip
                     .to_ipv4_mapped()
-                    .is_some_and(|v4| is_private_host(&v4.to_string()))
+                    .is_some_and(|v4| is_private_ip(IpAddr::V4(v4)))
         }
-        Err(_) => false,
     }
 }
 
@@ -361,15 +392,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn accepts_absolute_http_and_https_urls_on_public_hosts() {
-        for url in ["https://example.com", "http://93.184.216.34:8080/docs/"] {
-            assert!(validate_base_url(url).is_ok(), "{url}");
+    #[tokio::test]
+    async fn accepts_absolute_http_and_https_urls_on_public_hosts() {
+        for url in ["https://93.184.216.34", "http://93.184.216.34:8080/docs/"] {
+            assert!(validate_base_url(url).await.is_ok(), "{url}");
         }
     }
 
-    #[test]
-    fn rejects_hosts_inside_the_network_the_crawler_runs_in() {
+    #[tokio::test]
+    async fn rejects_hosts_inside_the_network_the_crawler_runs_in() {
         for url in [
             "http://localhost/",
             "http://app.localhost/",
@@ -383,8 +414,24 @@ mod tests {
             "http://[fd00::1]/",
             "http://[::ffff:127.0.0.1]/",
         ] {
-            assert!(validate_base_url(url).is_err(), "{url}");
+            assert!(validate_base_url(url).await.is_err(), "{url}");
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_hostname_that_dns_resolves_to_loopback() {
+        assert!(validate_base_url("http://localhost./").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn base_url_length_matches_the_storage_column_boundary() {
+        let prefix = "http://93.184.216.34/";
+        let at_limit = format!("{prefix}{}", "a".repeat(MAX_BASE_URL_CHARS - prefix.len()));
+        let over_limit = format!("{at_limit}a");
+
+        assert_eq!(at_limit.chars().count(), MAX_BASE_URL_CHARS);
+        assert!(validate_base_url(&at_limit).await.is_ok());
+        assert!(validate_base_url(&over_limit).await.is_err());
     }
 
     #[test]
@@ -413,8 +460,8 @@ mod tests {
         assert!(validate_scope(&at_the_limit).is_ok());
     }
 
-    #[test]
-    fn rejects_urls_the_crawler_cannot_fetch() {
+    #[tokio::test]
+    async fn rejects_urls_the_crawler_cannot_fetch() {
         for url in [
             "",
             "example.com",
@@ -423,7 +470,7 @@ mod tests {
             "https://",
             "not a url",
         ] {
-            assert!(validate_base_url(url).is_err(), "{url}");
+            assert!(validate_base_url(url).await.is_err(), "{url}");
         }
     }
 

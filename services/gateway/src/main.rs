@@ -43,6 +43,7 @@ const KNOWLEDGE_BASE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 // show a stale authenticated page after logout without ever asking the server again.
 const PAGE_CACHE_HEADER: &str = "no-store";
 const DEFAULT_SESSION_TTL_HOURS: u64 = 24;
+const MAX_SESSION_TTL_HOURS: u64 = 24 * 365;
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 const UNAUTHENTICATED_RPC_BODY: &str = r#"{"code":"unauthenticated","message":"log in first"}"#;
 const LOGIN_REJECTED_BODY: &str = "Wrong password. <a href=\"/login\">Try again</a>";
@@ -124,15 +125,11 @@ impl KnowledgeBaseService for Gateway {
     async fn ingest(
         &self,
         _ctx: RequestContext,
-        request: ServiceRequest<'_, IngestRequest>,
+        _request: ServiceRequest<'_, IngestRequest>,
     ) -> ServiceResult<IngestResponse> {
-        let upstream = self
-            .knowledge_base
-            .ingest(request.to_owned_message())
-            .await?
-            .into_owned();
-
-        Response::ok(upstream)
+        Err(ConnectError::unimplemented(
+            "ingest is a crawler-to-knowledge-base call, not exposed through Gateway",
+        ))
     }
 
     async fn search(
@@ -292,6 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|error| format!("GATEWAY_SESSION_TTL_HOURS: {error}"))?,
         Err(_) => DEFAULT_SESSION_TTL_HOURS,
     };
+    if session_ttl_hours == 0 || session_ttl_hours > MAX_SESSION_TTL_HOURS {
+        return Err(format!(
+            "GATEWAY_SESSION_TTL_HOURS must be between 1 and {MAX_SESSION_TTL_HOURS}"
+        )
+        .into());
+    }
 
     let database_url = env("DATABASE_URL")?;
     let db = Database::connect(&database_url).await?;
@@ -304,7 +307,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth = Auth {
         sessions,
         password: env("GATEWAY_AUTH_PASSWORD")?,
-        session_ttl: Duration::from_secs(session_ttl_hours * 3600),
+        session_ttl: Duration::from_secs(
+            session_ttl_hours
+                .checked_mul(3600)
+                .expect("session_ttl_hours is bounded by MAX_SESSION_TTL_HOURS"),
+        ),
     };
 
     let gateway = Gateway {
@@ -587,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn knowledge_base_ingest_and_search_round_trip_complete_messages() {
+    async fn search_forwards_the_complete_request_and_response_through_gateway() {
         let fake = fake_knowledge_base(None);
         let knowledge_base_url = start_fake_knowledge_base(Arc::clone(&fake)).await;
         let gateway = Gateway {
@@ -596,13 +603,6 @@ mod tests {
         };
         let gateway_url = start_gateway(gateway).await;
         let client = knowledge_base_client_to(&gateway_url);
-        let ingest = IngestRequest {
-            source: "manual".to_owned(),
-            source_id: "source-1".to_owned(),
-            title: "Complete title".to_owned(),
-            content: "Complete content".to_owned(),
-            ..Default::default()
-        };
         let search = SearchRequest {
             query: "complete query".to_owned(),
             page_types: vec!["documentation".to_owned()],
@@ -610,19 +610,16 @@ mod tests {
             ..Default::default()
         };
 
-        let ingest_response = client.ingest(ingest.clone()).await.unwrap().into_owned();
         let search_response = client.search(search.clone()).await.unwrap().into_owned();
 
-        assert_eq!(*fake.ingested.lock().unwrap(), [ingest]);
         assert_eq!(*fake.searched.lock().unwrap(), [search]);
-        assert!(ingest_response.stored);
         assert_eq!(search_response.results.len(), 1);
         assert_eq!(search_response.results[0].snippet, "Matching passage");
         assert_eq!(search_response.results[0].score, 0.75);
     }
 
     #[tokio::test]
-    async fn knowledge_base_upstream_error_propagates_through_gateway() {
+    async fn search_upstream_error_propagates_through_gateway() {
         let fake = fake_knowledge_base(Some(ErrorCode::InvalidArgument));
         let knowledge_base_url = start_fake_knowledge_base(fake).await;
         let gateway = Gateway {
@@ -632,11 +629,26 @@ mod tests {
         let gateway_url = start_gateway(gateway).await;
         let client = knowledge_base_client_to(&gateway_url);
 
-        let ingest_error = client.ingest(IngestRequest::default()).await.unwrap_err();
         let search_error = client.search(SearchRequest::default()).await.unwrap_err();
 
-        assert_eq!(ingest_error.code, ErrorCode::InvalidArgument);
         assert_eq!(search_error.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn ingest_is_never_forwarded_to_knowledge_base() {
+        let fake = fake_knowledge_base(None);
+        let knowledge_base_url = start_fake_knowledge_base(Arc::clone(&fake)).await;
+        let gateway = Gateway {
+            crawler: client_to("http://127.0.0.1:1"),
+            knowledge_base: knowledge_base_client_to(&knowledge_base_url),
+        };
+        let gateway_url = start_gateway(gateway).await;
+        let client = knowledge_base_client_to(&gateway_url);
+
+        let error = client.ingest(IngestRequest::default()).await.unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Unimplemented);
+        assert!(fake.ingested.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

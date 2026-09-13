@@ -60,6 +60,9 @@ pub async fn crawl(
         if page.status_code.is_success() {
             any_fetched = true;
             let html = page.get_html();
+            if html.len() > crate::links::MAX_PARSEABLE_HTML_BYTES {
+                return;
+            }
             let counts_toward_scope = scope.counts(page.get_url());
             if counts_toward_scope {
                 on_counted(CountedPage {
@@ -215,6 +218,28 @@ mod tests {
 
         assert!(fetched.contains(&site.url("/")));
         assert!(!fetched.contains(&site.url(&long_path)), "{fetched:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_html_is_reachable_but_never_counted_or_forwarded() {
+        let oversized_html = "x".repeat(crate::links::MAX_PARSEABLE_HTML_BYTES + 1);
+        let site = TestSite::start_with_html([("/", oversized_html)]).await;
+        let mut counted = 0;
+        let mut fetched = 0;
+
+        let result = crawl(
+            &site.url("/"),
+            &everything(),
+            LIMITS,
+            |_| counted += 1,
+            |_| fetched += 1,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(counted, 0);
+        assert_eq!(fetched, 0);
+        assert_eq!(site.requested_pages(), ["/"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

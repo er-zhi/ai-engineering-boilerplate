@@ -74,9 +74,21 @@ fn job_from(row: crawl_job::Model) -> CrawlJob {
         id: row.id,
         base_url: row.base_url,
         status: row.status.into(),
-        pages_crawled: u32::try_from(row.pages_crawled).unwrap_or_default(),
-        pages_skipped: u32::try_from(row.pages_skipped).unwrap_or_default(),
+        pages_crawled: stored_page_count(row.id, "pages_crawled", row.pages_crawled),
+        pages_skipped: stored_page_count(row.id, "pages_skipped", row.pages_skipped),
     }
+}
+
+fn stored_page_count(job_id: i64, column: &str, value: i32) -> u32 {
+    u32::try_from(value).unwrap_or_else(|error| {
+        tracing::error!(
+            job = job_id,
+            column,
+            value,
+            "invalid crawl job counter: {error}"
+        );
+        0
+    })
 }
 
 impl JobStore for PgJobs {
@@ -609,6 +621,24 @@ mod tests {
         for garbage in ["42", "job-", "job-x", "", "job-1-2"] {
             assert_eq!(parse_job_id(garbage), None, "{garbage}");
         }
+    }
+
+    #[test]
+    fn negative_stored_page_counts_are_reported_as_zero_without_panicking() {
+        let now = Utc::now();
+        let job = job_from(crawl_job::Model {
+            id: 42,
+            base_url: "https://example.com".to_owned(),
+            status: Status::Running,
+            pages_crawled: -1,
+            pages_skipped: -2,
+            idempotency_key: None,
+            created_at: now,
+            updated_at: now,
+        });
+
+        assert_eq!(job.pages_crawled, 0);
+        assert_eq!(job.pages_skipped, 0);
     }
 
     #[tokio::test]
