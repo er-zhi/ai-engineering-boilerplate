@@ -41,11 +41,14 @@ All selected Core ML graphs passed this project's strict compute-plan gate:
 preferred neural operations. Tokenization, array handling, gRPC and Core ML
 control remain host work; this is not a zero-CPU system.
 
-## Run
+## Download and run
 
 Requires Apple Silicon, Python 3.12 and Xcode command-line tools.
 
 ```bash
+python3.12 -m pip install --upgrade huggingface_hub
+hf download erjigit17/Qwen3-TTS-0.6B-ANE --local-dir Qwen3-TTS-0.6B-ANE
+cd Qwen3-TTS-0.6B-ANE
 python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements-runtime.txt
