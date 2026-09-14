@@ -12,8 +12,9 @@ use crate::entity::{document, document_chunk};
 use crate::llm_client::{EmbedKind, LlmClient};
 use crate::store::{DocumentStore, DocumentWrite};
 
-const MAX_HEADER_TITLE_CHARS: usize = 150;
-const MAX_HEADER_SUMMARY_CHARS: usize = 300;
+// See chunk::MAX_CHUNK_CHARS for why these are sized against the embedder's 128-token window.
+const MAX_HEADER_TITLE_CHARS: usize = 60;
+const MAX_HEADER_SUMMARY_CHARS: usize = 120;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum IngestFailed {
@@ -224,7 +225,7 @@ mod tests {
                 model_used: self
                     .model_used
                     .clone()
-                    .unwrap_or_else(|| "Qwen/Qwen3-Embedding-0.6B".to_owned()),
+                    .unwrap_or_else(|| "google/embeddinggemma-300m".to_owned()),
             })
         }
     }
@@ -264,7 +265,7 @@ mod tests {
         assert_eq!(document.document.content.clone().unwrap(), long);
         assert_eq!(
             document.document.embedding_model.clone().unwrap(),
-            "Qwen/Qwen3-Embedding-0.6B"
+            "google/embeddinggemma-300m"
         );
         assert!(document.chunks.len() > 1);
         let embedded = llm.embedded_texts.lock().unwrap();

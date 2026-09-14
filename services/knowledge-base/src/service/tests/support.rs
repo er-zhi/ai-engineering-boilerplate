@@ -100,7 +100,7 @@ impl LlmClient for FakeLlm {
         }
         Ok(Embedded {
             values: vec![0.1, 0.2, 0.3],
-            model_used: "Qwen/Qwen3-Embedding-0.6B".to_owned(),
+            model_used: "google/embeddinggemma-300m".to_owned(),
         })
     }
 }

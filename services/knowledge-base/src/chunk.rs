@@ -1,6 +1,11 @@
 // Splits document text into passages of at most MAX_CHUNK_CHARS, breaking on lines, then sentences, then words.
 
-pub const MAX_CHUNK_CHARS: usize = 1200;
+// Sized against the embedder's 128-token fixed window together with ingest.rs's context header
+// (MAX_HEADER_TITLE_CHARS + MAX_HEADER_SUMMARY_CHARS): measured against the real tokenizer, a
+// header+passage at these limits runs ~107 tokens for typical English, leaving headroom before
+// the 128-token cut. Denser text (non-Latin scripts, code, URLs) can still truncate — that
+// remains the accepted, logged exception, not the common case this budget is sized for.
+pub const MAX_CHUNK_CHARS: usize = 300;
 
 struct Piece<'a> {
     text: &'a str,

@@ -2,7 +2,7 @@
 
 use sea_orm::entity::prelude::*;
 
-pub const EMBEDDING_DIMENSIONS: u32 = 1024;
+pub const EMBEDDING_DIMENSIONS: u32 = 768;
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]

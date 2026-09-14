@@ -1,8 +1,9 @@
-"""Serves EmbeddingGemma embeddings through Core ML on the Apple Neural Engine."""
+"""Serves Qwen3 embeddings through Core ML on the Apple Neural Engine."""
 
 import platform
 import sys
 import threading
+from typing import TypedDict
 
 MINIMUM_MACOS_VERSION = (13, 0)
 MAX_REQUEST_TEXT_CHARS = 20_000
@@ -24,11 +25,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
-from config import DOCUMENT_PREFIX, QUERY_PREFIX, SEQ_LEN
-
 MODEL_DIR = "models"
-PAD_TOKEN_ID = 0
-PAD_TOKEN = "<pad>"
+PAD_TOKEN = 151643
+QUERY_INSTRUCTION = (
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+)
 
 app = FastAPI()
 
@@ -39,15 +40,33 @@ async def as_embedder_error(_request: Request, exc: HTTPException):
 
 
 tokenizer = Tokenizer.from_file(f"{MODEL_DIR}/tokenizer.json")
-tokenizer.enable_padding(length=SEQ_LEN, pad_id=PAD_TOKEN_ID, pad_token=PAD_TOKEN)
-tokenizer.enable_truncation(max_length=SEQ_LEN)
 
-MODEL_NAME = "google/embeddinggemma-300m"
-model = ct.models.MLModel(
-    f"{MODEL_DIR}/embeddinggemma-300m-8bit.mlpackage",
-    compute_units=ct.ComputeUnit.CPU_AND_NE,
-)
+MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 single_neural_engine_lock = threading.Lock()
+
+
+class ModelProfile(TypedDict):
+    model: ct.models.MLModel
+    seq_len: int
+
+
+PROFILES: dict[str, ModelProfile] = {
+    "short": {
+        "model": ct.models.MLModel(
+            f"{MODEL_DIR}/qwen3-b1_s128-8bit.mlpackage",
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+        ),
+        "seq_len": 128,
+    },
+    "long": {
+        "model": ct.models.MLModel(
+            f"{MODEL_DIR}/qwen3-b1_s512-8bit.mlpackage",
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+        ),
+        "seq_len": 512,
+    },
+}
+MAX_TOKENS = PROFILES["long"]["seq_len"]
 
 
 class EmbedRequest(BaseModel):
@@ -72,14 +91,22 @@ def require_text(request: EmbedRequest) -> str:
 
 
 def run_embed(text: str) -> tuple[list[float], bool]:
-    encoding = tokenizer.encode(text)
-    truncated = len(encoding.overflowing) > 0
+    ids = tokenizer.encode(text).ids
+    truncated = len(ids) > MAX_TOKENS
+    if truncated:
+        ids = ids[:MAX_TOKENS]
+    profile = PROFILES["short"] if len(ids) <= PROFILES["short"]["seq_len"] else PROFILES["long"]
+    seq_len = profile["seq_len"]
+
+    pad_len = seq_len - len(ids)
+    input_ids = [PAD_TOKEN] * pad_len + ids
+    attention_mask = [0] * pad_len + [1] * len(ids)
 
     with single_neural_engine_lock:
-        out = model.predict(
+        out = profile["model"].predict(
             {
-                "input_ids": np.array([encoding.ids], dtype=np.int32),
-                "attention_mask": np.array([encoding.attention_mask], dtype=np.int32),
+                "input_ids": np.array([input_ids], dtype=np.int32),
+                "attention_mask": np.array([attention_mask], dtype=np.int32),
             }
         )
     return np.array(out["embedding"])[0].tolist(), truncated
@@ -92,11 +119,11 @@ def health():
 
 @app.post("/embed/document", response_model=EmbedResponse)
 def embed_document(request: EmbedRequest):
-    values, truncated = run_embed(DOCUMENT_PREFIX + require_text(request))
+    values, truncated = run_embed(require_text(request))
     return EmbedResponse(values=values, model_used=MODEL_NAME, truncated=truncated)
 
 
 @app.post("/embed/query", response_model=EmbedResponse)
 def embed_query(request: EmbedRequest):
-    values, truncated = run_embed(QUERY_PREFIX + require_text(request))
+    values, truncated = run_embed(f"{QUERY_INSTRUCTION} {require_text(request)}")
     return EmbedResponse(values=values, model_used=MODEL_NAME, truncated=truncated)

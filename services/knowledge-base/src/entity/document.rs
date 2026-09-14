@@ -81,7 +81,7 @@ mod tests {
             page_type: Set(PageType::Documentation),
             keywords: Set(vec!["docs".to_owned(), "guide".to_owned()]),
             summary: Set("A short summary.".to_owned()),
-            embedding_model: Set("Qwen/Qwen3-Embedding-0.6B".to_owned()),
+            embedding_model: Set("google/embeddinggemma-300m".to_owned()),
             ingested_at: Set(now),
             updated_at: Set(now),
             ..Default::default()

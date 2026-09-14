@@ -5,13 +5,13 @@ use std::time::Duration;
 use spider::compact_str::CompactString;
 use spider::page::Page;
 use spider::website::Website;
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::mpsc;
 
 use crate::scope::Scope;
 
 const USER_AGENT: &str = "ai-engineering-boilerplate-crawler/0.1";
+pub(crate) const FETCH_CONCURRENCY: usize = 2;
+const FETCHED_PAGE_BUFFER_PAGES: usize = 1;
 
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -92,9 +92,13 @@ pub async fn crawl_into(
     fetched: mpsc::Sender<FetchedPage>,
 ) -> Result<(), CrawlError> {
     let mut website = configured_website(base_url, scope, limits);
-    let mut pages = website.subscribe(0);
+    let (page_sender, mut pages) = mpsc::channel(FETCHED_PAGE_BUFFER_PAGES);
+    website.with_on_should_crawl_callback_closure(Some(move |page: &Page| {
+        let page_sender = page_sender.clone();
+        let page = page.clone();
+        tokio::task::block_in_place(move || page_sender.blocking_send(page).is_ok())
+    }));
 
-    let mut pages_lost = 0_u32;
     let mut progress = CrawlProgress::default();
 
     let crawling = website.crawl();
@@ -103,37 +107,31 @@ pub async fn crawl_into(
         tokio::select! {
             () = &mut crawling => break,
             received = pages.recv() => match received {
-                Ok(page) => {
+                Some(page) => {
                     forward_page(page, scope, limits.max_pages, &mut progress, &counted, &fetched)
                         .await;
                 }
-                Err(RecvError::Lagged(skipped)) => {
-                    pages_lost = pages_lost
-                        .saturating_add(u32::try_from(skipped).unwrap_or(u32::MAX));
-                    tracing::error!(skipped, "crawler page stream lagged");
-                }
-                Err(RecvError::Closed) => {
-                    crawling.as_mut().await;
-                    break;
-                }
+                // page_sender lives inside the closure `website` owns for as long as `crawling`
+                // is unresolved, so the channel's last sender cannot drop — and thus this arm
+                // cannot run — before the `crawling` arm above already broke the loop.
+                None => unreachable!("page_sender outlives crawling by construction"),
             },
         }
     }
-    pages_lost = pages_lost.saturating_add(
-        drain_pages_sent_before_the_crawl_returned(
-            &mut pages,
+    while let Ok(page) = pages.try_recv() {
+        forward_page(
+            page,
             scope,
             limits.max_pages,
             &mut progress,
             &counted,
             &fetched,
         )
-        .await,
-    );
-    pages_lost = pages_lost.saturating_add(progress.pages_lost);
+        .await;
+    }
 
-    if pages_lost > 0 {
-        Err(CrawlError::PagesLost(pages_lost))
+    if progress.pages_lost > 0 {
+        Err(CrawlError::PagesLost(progress.pages_lost))
     } else if progress.any_fetched {
         Ok(())
     } else {
@@ -153,32 +151,11 @@ fn configured_website(base_url: &str, scope: &Scope, limits: Limits) -> Website 
         .with_respect_robots_txt(true)
         .with_subdomains(false)
         .with_limit(limits.max_pages)
+        .with_concurrency_limit(Some(FETCH_CONCURRENCY))
         .with_request_timeout(Some(limits.request_timeout))
         .with_user_agent(Some(USER_AGENT))
         .with_blacklist_url(Some(blacklist));
     website
-}
-
-async fn drain_pages_sent_before_the_crawl_returned(
-    pages: &mut Receiver<Page>,
-    scope: &Scope,
-    max_pages: u32,
-    progress: &mut CrawlProgress,
-    counted: &mpsc::Sender<CountedPage>,
-    fetched: &mpsc::Sender<FetchedPage>,
-) -> u32 {
-    let mut pages_lost = 0_u32;
-    loop {
-        match pages.try_recv() {
-            Ok(page) => forward_page(page, scope, max_pages, progress, counted, fetched).await,
-            Err(TryRecvError::Lagged(skipped)) => {
-                pages_lost = pages_lost.saturating_add(u32::try_from(skipped).unwrap_or(u32::MAX));
-                tracing::error!(skipped, "crawler page stream lagged while draining");
-            }
-            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-        }
-    }
-    pages_lost
 }
 
 #[cfg(test)]
@@ -371,6 +348,43 @@ mod tests {
         let result = crawl_into(&site.url("/"), &everything(), LIMITS, counted, fetched).await;
 
         assert!(matches!(result, Err(CrawlError::PagesLost(pages)) if pages >= 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_pipeline_applies_backpressure_without_losing_pages() {
+        let links: String = (1..=20).map(|i| format!("/p/{i} ")).collect();
+        let site = TestSite::start(
+            std::iter::once(("/".to_owned(), links))
+                .chain((1..=20).map(|i| (format!("/p/{i}"), String::new()))),
+        )
+        .await;
+        let (counted, mut counted_pages) = mpsc::channel(1);
+        let (fetched, mut fetched_pages) = mpsc::channel(1);
+        let base_url = site.url("/");
+        let scope = everything();
+        let crawling = crawl_into(&base_url, &scope, LIMITS, counted, fetched);
+        let counted = async {
+            let mut count = 0;
+            while counted_pages.recv().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                count += 1;
+            }
+            count
+        };
+        let fetched = async {
+            let mut count = 0;
+            while fetched_pages.recv().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                count += 1;
+            }
+            count
+        };
+
+        let (result, counted, fetched) = tokio::join!(crawling, counted, fetched);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(counted, 21);
+        assert_eq!(fetched, 21);
     }
 
     #[tokio::test(flavor = "multi_thread")]

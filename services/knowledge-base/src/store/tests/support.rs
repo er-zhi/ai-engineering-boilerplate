@@ -36,7 +36,7 @@ pub(super) fn document_write(
             page_type: Set(page_type),
             keywords: Set(vec!["docs".to_owned()]),
             summary: Set("A summary.".to_owned()),
-            embedding_model: Set("Qwen/Qwen3-Embedding-0.6B".to_owned()),
+            embedding_model: Set("google/embeddinggemma-300m".to_owned()),
             ..Default::default()
         },
         chunks: chunks

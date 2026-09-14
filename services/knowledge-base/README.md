@@ -24,9 +24,9 @@ A failure at step 2 or 4 fails the whole call; there is no partial write and no 
 
 This is the one place knowledge-base talks to something other than llm-router or its own database, and it is a deliberate, documented exception rather than an oversight: `embedder_client.rs` sends the text over plain HTTP to [`native/embedder-ane`](../../native/embedder-ane/README.md), a process that runs directly on the host (never in Docker) because it needs Apple's Core ML to reach the Neural Engine, which has no Linux/container equivalent. `knowledge-base`'s own container reaches it at `EMBEDDER_URL` (default `http://host.docker.internal:8086`).
 
-Two endpoints, not one: `POST /embed/document` for passages written at ingest, `POST /embed/query` for a query — the model (`Qwen/Qwen3-Embedding-0.6B`) needs an instruction prefix on queries only, per its own documented usage pattern, and getting that backwards would quietly hurt ranking rather than error. `EmbedKind::Document` / `EmbedKind::Query` on `LlmClient::embed` is what picks the route.
+Two endpoints, not one: `POST /embed/document` for passages written at ingest, `POST /embed/query` for a query — the model (`google/embeddinggemma-300m`) needs a different task prefix for each, per its own documented usage pattern, and getting that backwards would quietly hurt ranking rather than error. `EmbedKind::Document` / `EmbedKind::Query` on `LlmClient::embed` is what picks the route.
 
-The embedder's window is 512 tokens. For English prose a 1,200-character passage plus its header is roughly 400 tokens, so it fits; denser text such as non-Latin scripts, code, or URLs can exceed it. In that case the embedder uses the first 512 tokens and `embedder_client` logs a warning. Passage sizing is character-based, not tokenizer-based. The embedder call has its own 10-second timeout, separate from LLM Router's 60-second timeout.
+The embedder's window is a fixed 128 tokens — deliberately small in exchange for Neural Engine speed (see [`native/embedder-ane`](../../native/embedder-ane/README.md)). Passage (`chunk::MAX_CHUNK_CHARS`) and header (`MAX_HEADER_TITLE_CHARS` + `MAX_HEADER_SUMMARY_CHARS`) sizes are set together so a typical English passage plus its header stays comfortably under that, verified against the real tokenizer; denser text such as non-Latin scripts, code, or URLs can still exceed it. In that case the embedder uses the first 128 tokens and `embedder_client` logs a warning. Passage sizing is character-based, not tokenizer-based. The embedder call has its own 10-second timeout, separate from LLM Router's 60-second timeout.
 
 No request or payload logging is kept for these calls, unlike `llm-router`'s `requests` and `request_payloads` tables: the forward pass is local and unmetered. Model and runtime details are in the [`native/embedder-ane` README](../../native/embedder-ane/README.md).
 
@@ -83,7 +83,7 @@ Unit tests use a fake `LlmClient` — no real HTTP call to the embedder or llm-r
 ## Schema (`knowledge_base`)
 
 - `documents` — `source`, `source_id` (unique together), `title`, `content` (complete, untruncated), `content_hash`, `page_type` (smallint discriminant), `keywords` (`varchar(64)[]`), `summary`, `embedding_model`, `ingested_at`, `updated_at`
-- `document_chunks` — `document_id` (foreign key, `ON DELETE CASCADE`), `ordinal` (unique with `document_id`), `content`, `embedding` (`vector(1024)`)
+- `document_chunks` — `document_id` (foreign key, `ON DELETE CASCADE`), `ordinal` (unique with `document_id`), `content`, `embedding` (`vector(768)`)
 
 Indexes, created at startup after schema sync: HNSW on `document_chunks.embedding` (cosine), GIN on `to_tsvector('english', document_chunks.content)`, GIN on `to_tsvector('english', documents.title)`.
 

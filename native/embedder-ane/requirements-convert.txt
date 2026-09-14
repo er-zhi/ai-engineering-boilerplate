@@ -1,0 +1,6 @@
+torch>=2.7,<3
+transformers>=4.57,<5
+sentence-transformers>=3.3,<4
+coremltools>=9.0,<10.0
+numpy>=2.3,<2.4
+huggingface_hub>=0.30
