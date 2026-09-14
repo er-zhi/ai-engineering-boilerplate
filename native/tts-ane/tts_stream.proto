@@ -1,0 +1,16 @@
+syntax = "proto3";
+package tts.v1;
+
+// Half-close the request stream to finish text; cancel the RPC to stop speech.
+service Speech {
+  rpc Synthesize(stream TextPart) returns (stream AudioChunk);
+}
+message TextPart { string text = 1; }
+message AudioChunk {
+  bytes pcm_s16le = 1;
+  uint32 sequence = 2;
+  uint32 sample_rate = 3;
+  uint32 channels = 4;
+  // Server elapsed time from first text receipt; populated on first chunk only.
+  double first_pcm_ms = 5;
+}

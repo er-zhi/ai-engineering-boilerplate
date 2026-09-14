@@ -6,6 +6,7 @@ decoder preserves history, but has not passed full source/audio quality validati
 """
 import argparse
 import gc
+import fcntl
 import hashlib
 import json
 import platform
@@ -13,12 +14,9 @@ import subprocess
 import time
 import threading
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import coremltools as ct
 import numpy as np
-import torch
-from qwen_tts import Qwen3TTSModel
 
 
 def gate_report(stdout):
@@ -63,19 +61,91 @@ def decoder_window(frame):
 
 def compiled_cache_path(package,directory):
     package = package.resolve(strict=True)
-    digest = hashlib.sha256((platform.platform()+ct.__version__).encode())
-    for path in sorted(package.rglob('*')) if package.is_dir() else [package]:
-        if path.is_file():
-            digest.update(str(path.relative_to(package)).encode())
-            with path.open('rb') as source:
-                digest.update(hashlib.file_digest(source,'sha256').digest())
-    return directory/f'{package.stem}-{digest.hexdigest()[:20]}.mlmodelc'
+    files=[path for path in (sorted(package.rglob('*')) if package.is_dir() else [package]) if path.is_file()]
+    base=platform.platform()+ct.__version__
+    signature=[(str(path.relative_to(package)) if package.is_dir() else path.name,
+                path.stat().st_size,path.stat().st_mtime_ns) for path in files]
+    memo_dir=directory/'.source-hashes'; memo_dir.mkdir(parents=True,exist_ok=True)
+    memo=memo_dir/(hashlib.sha256(str(package).encode()).hexdigest()+'.json')
+    if memo.exists():
+        try:
+            saved=json.loads(memo.read_text())
+            if saved['base']==base and saved['signature']==[list(item) for item in signature]:
+                return directory/f'{package.stem}-{saved["digest"][:20]}.mlmodelc'
+        except (KeyError,ValueError,json.JSONDecodeError):
+            pass
+    digest=hashlib.sha256(base.encode())
+    for path,(relative,_,_) in zip(files,signature):
+        digest.update(relative.encode())
+        with path.open('rb') as source:
+            digest.update(hashlib.file_digest(source,'sha256').digest())
+    value=digest.hexdigest(); temporary=memo.with_suffix('.tmp')
+    temporary.write_text(json.dumps({'base':base,'signature':signature,'digest':value})+'\n')
+    temporary.replace(memo)
+    return directory/f'{package.stem}-{value[:20]}.mlmodelc'
 
 
-def prepare(path,text,instruction,speaker=None,history_decoder=False):
-    torch.set_num_threads(4)
-    tts = Qwen3TTSModel.from_pretrained(str(path),dtype=torch.float32,device_map='cpu',
-        local_files_only=True,attn_implementation='eager')
+def admit_ane_package(package,gate,directory=None,fast_prediction=False):
+    def inspect(target):
+        command = [str(gate),str(target)]+(['--fast-prediction'] if fast_prediction else [])
+        checked = subprocess.run(command,capture_output=True,text=True)
+        if checked.returncode:
+            raise RuntimeError(checked.stderr.strip() or checked.stdout.strip())
+        return gate_report(checked.stdout)
+    if directory is None:
+        return inspect(package)
+    directory.mkdir(parents=True,exist_ok=True)
+    target = compiled_cache_path(package,directory)
+    marker = target.with_name(target.name+'.ane-admitted.json')
+    identity = None
+    if gate.is_file():
+        machine = subprocess.run(['sysctl','-n','hw.model'],capture_output=True,text=True)
+        with gate.open('rb') as source:
+            gate_digest=hashlib.file_digest(source,'sha256').hexdigest()
+        identity = {'platform':platform.platform(),'coremltools':ct.__version__,
+                    'hardware':machine.stdout.strip() if machine.returncode==0 else platform.machine(),
+                    'gate_sha256':gate_digest,
+                    'fast_prediction':fast_prediction}
+    with target.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        existing = target.exists()
+        if existing and identity is not None and marker.exists():
+            try:
+                cached=json.loads(marker.read_text())
+                report=gate_report(json.dumps(cached['report']))
+                if cached['identity']==identity and Path(report['compiled_model']).resolve()==target.resolve():
+                    report['admission_cached']=True
+                    return report
+            except (KeyError,ValueError,json.JSONDecodeError,RuntimeError):
+                pass
+        if not existing:
+            ct.models.utils.compile_model(str(package),destination_path=str(target))
+        try:
+            report=inspect(target)
+        except RuntimeError as error:
+            rejected = target.with_name(target.name+'.rejected')
+            if not existing or rejected.exists():
+                raise RuntimeError(f'ANE admission failed; no further automatic rebuild for {target}: {error}') from error
+            target.rename(rejected)
+            print(f'Rebuilding rejected compiled artifact; preserved at {rejected}: {error}',flush=True)
+            ct.models.utils.compile_model(str(package),destination_path=str(target))
+            report = inspect(target)
+            report['rebuilt_after_rejection'] = str(rejected)
+        if identity is not None:
+            temporary=marker.with_suffix(marker.suffix+'.tmp')
+            temporary.write_text(json.dumps({'identity':identity,'report':report},indent=2)+'\n')
+            temporary.replace(marker)
+        return report
+
+
+def capture_prompt(tts,text,instruction,speaker,capacity):
+    if not isinstance(text,str) or not text.strip() or len(text)>32768:
+        raise ValueError('Text must contain 1..32768 characters and not be blank')
+    if hasattr(tts,'capture_prompt'):
+        arrays=tts.capture_prompt(text,speaker)
+        if arrays['inputs_embeds'].shape[1]+64>capacity:
+            raise ValueError('Instruction prefix exceeds prototype capacity')
+        return arrays
     talker = tts.model.talker
     captured = {}
     class StopCapture(Exception):
@@ -102,8 +172,26 @@ def prepare(path,text,instruction,speaker=None,history_decoder=False):
     arrays['min_new_tokens'] = int(captured.get('min_new_tokens',0))
     if not np.isfinite(arrays['repetition_penalty']) or arrays['repetition_penalty'] <= 0:
         raise ValueError('Invalid source repetition penalty')
-    if arrays['inputs_embeds'].shape[1]+64>128:
+    if arrays['inputs_embeds'].shape[1]+64>capacity:
         raise ValueError('Instruction prefix exceeds prototype capacity')
+    return arrays
+
+
+def prepare(path,text,instruction,speaker=None,history_decoder=False,text_projection=None,capacity=128,frontend_sink=None,frontend_assets=None):
+    if capacity not in (128,512):
+        raise ValueError('Unsupported preparation capacity')
+    if frontend_assets is not None:
+        from runtime_frontend import prepare_runtime_assets
+        return prepare_runtime_assets(frontend_assets,text,speaker,text_projection,frontend_sink)
+    import torch
+    from qwen_tts import Qwen3TTSModel
+    torch.set_num_threads(4)
+    tts = Qwen3TTSModel.from_pretrained(str(path),dtype=torch.float32,device_map='cpu',
+        local_files_only=True,attn_implementation='eager')
+    talker = tts.model.talker
+    if text_projection is not None:
+        talker.text_projection = text_projection
+    arrays = capture_prompt(tts,text,instruction,speaker,capacity)
     embeddings = [talker.get_input_embeddings().weight.detach().numpy().copy()]
     embeddings += [layer.weight.detach().numpy().copy() for layer in talker.code_predictor.get_input_embeddings()]
     quantizer = tts.model.speech_tokenizer.model.decoder.quantizer
@@ -114,12 +202,12 @@ def prepare(path,text,instruction,speaker=None,history_decoder=False):
                 table = rvq.output_proj(layer.decode(torch.arange(rvq.bins).view(1,-1)))
                 lookups.append(table[0].T.numpy().copy())
         control_groups = []
-        for model,capacity,multimodal in [(talker.model,128,True),(talker.code_predictor.model,16,False)]:
+        for model,control_capacity,multimodal in [(talker.model,capacity,True),(talker.code_predictor.model,16,False)]:
             controls = []
-            for pos in range(capacity):
-                write = np.zeros((1,1,capacity,1),np.float32)
+            for pos in range(control_capacity):
+                write = np.zeros((1,1,control_capacity,1),np.float32)
                 write[:,:,pos,:] = 1
-                mask = np.full((1,1,1,capacity),-np.inf,np.float32)
+                mask = np.full((1,1,1,control_capacity),-np.inf,np.float32)
                 mask[...,:pos+1] = 0
                 positions = torch.full((3,1,1) if multimodal else (1,1),pos,dtype=torch.long)
                 cos,sin = model.rotary_emb(torch.zeros(1,1,model.config.hidden_size),positions)
@@ -131,7 +219,7 @@ def prepare(path,text,instruction,speaker=None,history_decoder=False):
         if history_decoder:
             decoder = tts.model.speech_tokenizer.model.decoder
             controls = []
-            for pos in range(128):
+            for pos in range(capacity):
                 cos,sin = decoder.pre_transformer.rotary_emb(
                     torch.zeros(1,1,decoder.config.hidden_size),torch.tensor([[pos]]))
                 mask = np.full((1,1,1,decoder.config.sliding_window),-np.inf,np.float32)
@@ -139,11 +227,22 @@ def prepare(path,text,instruction,speaker=None,history_decoder=False):
                 controls.append(dict(cosine=cos.unsqueeze(1).numpy().copy(),
                     sine=sin.unsqueeze(1).numpy().copy(),attention_mask=mask))
             control_groups.append(controls)
+    if frontend_sink is not None:
+        talker.model.layers = torch.nn.ModuleList()
+        talker.model.norm = torch.nn.Identity()
+        talker.model.rotary_emb = torch.nn.Identity()
+        talker.code_predictor = None
+        talker.codec_head = torch.nn.Identity()
+        tts.model.speech_tokenizer = None
+        frontend_sink.append(tts)
     return arrays,embeddings,lookups,control_groups,talker.config.codec_eos_token_id
 
 
 class VoiceStream:
-    def __init__(self,source,packages,gate,text,instruction,compiled_dir=None,predictor_package=None,prefill_packages=None,first_decoder_package=None,speaker=None,model_prefix='qwen17',block_count=4,decoder_package=None,tail_decoder_package=None,decoder_windows=None,startup_decoder_package=None,experimental_history_decoder=False,experimental_prefix_state=False,short_talker_package=None):
+    def __init__(self,source,packages,gate,text,instruction,compiled_dir=None,predictor_package=None,prefill_packages=None,first_decoder_package=None,speaker=None,model_prefix='qwen17',block_count=4,decoder_package=None,tail_decoder_package=None,decoder_windows=None,startup_decoder_package=None,experimental_history_decoder=False,experimental_prefix_state=False,short_talker_package=None,text_projection_package=None,long_talker_package=None,frontend_assets=None):
+        if long_talker_package and (block_count != 1 or not experimental_history_decoder or experimental_prefix_state or short_talker_package):
+            raise ValueError('Long talker requires one block, history decoder, and no cross-request prefix reuse')
+        self.capacity = 512 if long_talker_package else 128
         if short_talker_package is not None and (not experimental_prefix_state or block_count != 1):
             raise ValueError('Short talker requires invariant prefix and one full talker block')
         if experimental_prefix_state and (prefill_packages is not None or model_prefix != 'qwen06' or not speaker):
@@ -152,27 +251,44 @@ class VoiceStream:
             value is not None for value in [first_decoder_package,tail_decoder_package,decoder_windows,startup_decoder_package])):
             raise ValueError('Explicit-history experiment requires only decoder-package, without window decoders')
         self.history_decoder = experimental_history_decoder
-        self.prepared = prepare(source,text,instruction,speaker,experimental_history_decoder)
-        gc.collect()
         def load(name):
             path = packages/name
             print(f'Checking ANE: {name}',flush=True)
-            target = path
-            if compiled_dir is not None:
-                compiled_dir.mkdir(parents=True,exist_ok=True)
-                target = compiled_cache_path(path,compiled_dir)
-                if not target.exists():
-                    ct.models.utils.compile_model(str(path),destination_path=str(target))
-            checked = subprocess.run([str(gate),str(target)],capture_output=True,text=True)
-            if checked.returncode:
-                raise RuntimeError(checked.stderr)
-            report = gate_report(checked.stdout)
+            report = admit_ane_package(path,gate,compiled_dir)
             compiled_path = report['compiled_model']
             model = ct.models.CompiledMLModel(compiled_path,compute_units=ct.ComputeUnit.CPU_AND_NE)
             model.source_spec = ct.utils.load_spec(str(path))
             print(f'Loaded ANE: {name}',flush=True)
             return model
+        self.text_projection = None
+        if text_projection_package is not None:
+            projection = load(str(text_projection_package.resolve()))
+            inputs = {x.name:list(x.type.multiArrayType.shape) for x in projection.source_spec.description.input}
+            outputs = {x.name:list(x.type.multiArrayType.shape) for x in projection.source_spec.description.output}
+            shape = inputs.get('embeddings', [])
+            out = outputs.get('projected', [])
+            if (len(inputs) != 1 or len(outputs) != 1 or len(shape) != 4 or len(out) != 4
+                or shape[0] != 1 or shape[2] != 1 or out[0] != 1 or out[2:] != shape[2:]):
+                raise ValueError('Invalid BC1S text projection contract')
+            if frontend_assets is not None:
+                from runtime_frontend import NumpyANETextProjection
+                self.text_projection = NumpyANETextProjection(projection,shape[1],shape[3],out[1])
+            else:
+                from text_projection_runtime import ANETextProjection
+                self.text_projection = ANETextProjection(projection,shape[1],shape[3],out[1])
+        self.frontends = []
+        self.request_lock = threading.Lock()
+        self.speaker,self.instruction = speaker,instruction
+        self.prepared = prepare(source,text,instruction,speaker,experimental_history_decoder,self.text_projection,self.capacity,self.frontends,frontend_assets)
+        gc.collect()
         self.blocks = [load(f'{model_prefix}_cached_block{i}.mlpackage') for i in range(block_count)]
+        self.long_blocks = [load(str(long_talker_package.resolve()))] if long_talker_package else None
+        if self.long_blocks:
+            description = self.long_blocks[0].source_spec.description
+            masks = {item.name:list(item.type.multiArrayType.shape) for item in description.input}
+            if (not description.state or not self.blocks[0].source_spec.description.state
+                or masks.get('attention_mask') != [1,1,1,512] or masks.get('write_mask') != [1,1,512,1]):
+                raise ValueError('Long talker requires stateful 128-to-512 cache migration')
         self.short_blocks = [load(str(short_talker_package.resolve()))] if short_talker_package else None
         if self.short_blocks:
             spec = self.short_blocks[0].source_spec.description
@@ -265,6 +381,42 @@ class VoiceStream:
                 'frames':len(errors),'max_abs_error':max(errors),'threshold':0.02,
                 'status':'PASS' if max(errors)<=0.02 else 'FAIL'}
 
+    def chunks_for_text(self,text,max_frames=64,*,incremental=False):
+        started = time.perf_counter()
+        if self.prefix_states is not None:
+            raise ValueError('Fresh text requires disabled cross-request prefix reuse')
+        if not 1 <= max_frames <= self.capacity-10:
+            raise ValueError('Requested frame limit exceeds configured capacity')
+        if not self.request_lock.acquire(blocking=False):
+            raise RuntimeError('Voice instance already has an active text request')
+        previous = self.prepared
+        text_source = None
+        try:
+            if incremental:
+                from text_parts import TextParts
+                text_source = TextParts(self.frontends[0],text,lambda value:
+                    capture_prompt(self.frontends[0],value,self.instruction,self.speaker,self.capacity))
+                arrays = text_source.initial
+            else:
+                arrays = capture_prompt(self.frontends[0],text,self.instruction,self.speaker,self.capacity)
+            preparation_ms = (time.perf_counter()-started)*1000
+            self.prepared = (arrays,*previous[1:])
+            stream = self.chunks(max_frames)
+            try:
+                for payload,metadata in stream:
+                    yield payload,dict(metadata,preparation_ms=preparation_ms,
+                        request_ready_ms=(time.perf_counter()-started)*1000,
+                        text_input_streaming=incremental,
+                        text_input_complete=text_source.finished if text_source else True,
+                        text_characters_received=len(text_source.buffer) if text_source else len(text))
+            finally:
+                stream.close()
+        finally:
+            self.prepared = previous
+            self.request_lock.release()
+            if text_source is not None:
+                text_source.close()
+
     def chunks(self,max_frames=64):
         if self.prefix_states is None:
             yield from self._chunks(max_frames)
@@ -280,34 +432,40 @@ class VoiceStream:
 
     def _chunks(self,max_frames=64):
         started = time.perf_counter()
-        if not 1 <= max_frames <= 118:
-            raise ValueError('max_frames must be 1..118')
+        if not 1 <= max_frames <= self.capacity-10:
+            raise ValueError(f'max_frames must be 1..{self.capacity-10}')
         arrays,embeddings,lookups,controls,eos = self.prepared
         # Prefill produces the first frame without a decode state. Allocate and
         # seed that state only when the second frame actually needs it.
         caches = list(self.prefix_states) if self.prefix_states is not None else [None for _ in self.blocks]
         position = 9 if self.prefix_states is not None else 0
         short_active = self.short_blocks is not None and self.prefix_states is not None
+        long_active = False
         def advance(hidden):
-            nonlocal position,short_active
-            if position>=128:
+            nonlocal position,short_active,long_active
+            if position>=self.capacity:
                 raise RuntimeError('Talker KV capacity exceeded')
+            if self.long_blocks and position == 128:
+                caches[0] = tuple(caches[0].read_state(name).copy() for name in ['key_cache','value_cache'])
+                long_active = True
             if short_active and position == 16:
                 for index,state in enumerate(caches):
                     caches[index] = tuple(state.read_state(name).copy() for name in ['key_cache','value_cache'])
                 short_active = False
-            for index,block in enumerate(self.short_blocks if short_active else self.blocks):
+            active_blocks = self.long_blocks if long_active else self.short_blocks if short_active else self.blocks
+            active_capacity = 512 if long_active else 16 if short_active else 128
+            for index,block in enumerate(active_blocks):
                 inputs = dict(controls[0][position],embeddings=hidden)
-                if short_active:
-                    inputs['write_mask'] = inputs['write_mask'][:,:,:16,:].copy()
-                    inputs['attention_mask'] = inputs['attention_mask'][...,:16].copy()
+                if inputs['write_mask'].shape[2] != active_capacity:
+                    inputs['write_mask'] = inputs['write_mask'][:,:,:active_capacity,:].copy()
+                    inputs['attention_mask'] = inputs['attention_mask'][...,:active_capacity].copy()
                 if caches[index] is None:
                     caches[index] = self.zero_cache(block)
                 elif block.source_spec.description.state and isinstance(caches[index],tuple):
                     keys,values = caches[index]
                     state = block.make_state()
-                    if keys.shape[2] < 128:
-                        padding = ((0,0),(0,0),(0,128-keys.shape[2]),(0,0))
+                    if keys.shape[2] < active_capacity:
+                        padding = ((0,0),(0,0),(0,active_capacity-keys.shape[2]),(0,0))
                         keys,values = np.pad(keys,padding),np.pad(values,padding)
                     # The Python bridge accepts FP32 and casts into FP16 storage.
                     state.write_state('key_cache',np.ascontiguousarray(keys,dtype=np.float32))
@@ -329,13 +487,16 @@ class VoiceStream:
             position += 1
             return result['logits'],hidden
         prefix = arrays['inputs_embeds']
-        if prefix.shape[1]+max_frames > 128:
+        if prefix.shape[1]+max_frames > self.capacity:
             raise ValueError('Requested generation exceeds the talker KV capacity')
         if self.prefill_blocks:
             length = next(i for i in self.prefill_blocks[0].source_spec.description.input
                 if i.name=='embeddings').type.multiArrayType.shape[1]
             if prefix.shape[1]>length:
                 raise ValueError('Prefix exceeds exported prefill capacity')
+            last_only = self.prefill_blocks[-1].source_spec.description.output[0].type.multiArrayType.shape[1] == 1
+            if last_only and (len(self.prefill_blocks) != 1 or prefix.shape[1] != length):
+                raise ValueError('Last-token prefill requires one full block and exact prefix length')
             hidden = np.zeros((1,length,prefix.shape[2]),np.float32)
             hidden[:,:prefix.shape[1]] = prefix
             cosine = np.concatenate([controls[0][i]['cosine'] for i in range(length)],axis=2)
@@ -351,8 +512,8 @@ class VoiceStream:
                 values[:,:,prefix.shape[1]:,:] = 0
                 caches[index] = keys,values
             position = prefix.shape[1]
-            logits = result['logits'][:,position-1:position]
-            hidden = hidden[:,position-1:position]
+            logits = result['logits'] if last_only else result['logits'][:,position-1:position]
+            hidden = hidden if last_only else hidden[:,position-1:position]
         else:
             for index in range(position,prefix.shape[1]):
                 logits,hidden = advance(prefix[:,index:index+1])
@@ -367,7 +528,8 @@ class VoiceStream:
             if not np.isfinite(scores).all():
                 raise RuntimeError(f'Non-finite talker logits at frame {frame}')
             scores[2048:] = -np.inf
-            if frame>=arrays['min_new_tokens']:
+            text_source = arrays.get('trailing_text_source')
+            if frame>=arrays['min_new_tokens'] and (text_source is None or text_source.eos_sent):
                 scores[eos] = logits[0,0,eos]
             semantic = int(scores.argmax())
             if semantic==eos:
@@ -381,7 +543,7 @@ class VoiceStream:
             predictor_started = time.perf_counter()
             if self.fused_predictor:
                 residual = self.predictor.predict({'past_hidden':hidden,
-                    'first_embedding':embeddings[0][semantic].reshape(1,1,-1)})['codes'][0]
+                    'first_embedding':embeddings[0][semantic].reshape(1,1,-1).copy()})['codes'][0]
                 if (not np.isfinite(residual).all() or np.any(residual != np.floor(residual))
                     or np.any(residual < 0) or np.any(residual >= 2048)):
                     raise RuntimeError('Invalid fused residual codes')
@@ -442,6 +604,8 @@ class VoiceStream:
                 pcm = decoded[0,:1920] if use_tail else decoded[0,decoder_index*1920:(decoder_index+1)*1920]
             if not np.isfinite(pcm).all():
                 raise RuntimeError('Non-finite PCM')
+            # Preserve PCM16 rounding when a candidate returns FP16 samples.
+            pcm = pcm.astype(np.float32,copy=False)
             payload = (np.clip(pcm,-1,1)*32767).round().astype('<i2').tobytes()
             yield payload,{'frame':frame,'ready_ms':(time.perf_counter()-started)*1000,'codes':codes,
                 'prefill_ms':prefill_ms if frame==0 else 0,
@@ -450,7 +614,8 @@ class VoiceStream:
                 'frame_compute_ms':(time.perf_counter()-frame_started)*1000}
             hidden = np.stack([embedding[code] for embedding,code in zip(embeddings,codes)]).sum(0).reshape(1,1,-1)
             trailing = arrays['trailing_text_hidden']
-            hidden += trailing[:,frame:frame+1] if frame<trailing.shape[1] else arrays['tts_pad_embed']
+            hidden += (text_source.next_hidden() if text_source is not None else
+                trailing[:,frame:frame+1] if frame<trailing.shape[1] else arrays['tts_pad_embed'])
             logits,hidden = advance(hidden)
         self.last_status = {'ended_by_eos':ended,'truncated':not ended,'elapsed_ms':(time.perf_counter()-started)*1000}
 
@@ -464,6 +629,7 @@ def main():
     parser.add_argument('--text',default="I'm sorry about the charge. I'll fix it for you.")
     parser.add_argument('--instruction',default='A natural American English female voice. Start with sincere empathy, pause after charge, then sound confident and reassuring.')
     parser.add_argument('--serve',type=int,help='After the WAV test, serve fresh synthesis of this configured text on localhost')
+    parser.add_argument('--serve-grpc',type=int,help='After the WAV test, accept incremental text and stream PCM over loopback gRPC')
     parser.add_argument('--compiled-dir',type=Path,help='Content-addressed compiled model cache; always rechecks compute plans, never caches audio')
     parser.add_argument('--predictor-package',type=Path,help='Explicit candidate predictor override; still requires strict ANE admission')
     parser.add_argument('--prefill-packages',type=Path,help='Candidate batched-prefill blocks with compatible KV outputs')
@@ -476,21 +642,28 @@ def main():
     parser.add_argument('--experimental-history-decoder',action='store_true',help='Explicit-state decoder experiment; not source/audio quality validated')
     parser.add_argument('--experimental-prefix-state',action='store_true',help='Reuse invariant 9-token CustomVoice KV prefix, not generated audio; serial experimental sessions only')
     parser.add_argument('--short-talker-package',type=Path,help='Experimental 16-position initial KV cache with migration to the full talker')
+    parser.add_argument('--text-projection-package',type=Path,help='Experimental ANE learned text projection; tokenizer and lookups remain host-side')
+    parser.add_argument('--long-talker-package',type=Path,help='Experimental stateful 512-position talker, migrated to only after position 127')
+    parser.add_argument('--frontend-assets',type=Path,help='Minimal exported tokenizer/lookup assets; avoids loading the upstream checkpoint')
     parser.add_argument('--verify-prefix-state',action='store_true',help='Compare every PCM chunk and code against fresh sequential prefill; extra synthesis, outside timing')
     parser.add_argument('--tail-decoder-package',type=Path,help='Experimental exact-tail decoder used once the 32-frame history is full')
     parser.add_argument('--decoder-windows',type=Path,help='Four-output-frame tail graphs for input widths 8,12,...32')
     parser.add_argument('--startup-decoder-package',type=Path,help='One-frame decoder used only at frame zero, never for continuation')
     parser.add_argument('--capture-predictor-inputs',type=Path,help='Save real predictor inputs for experimental activation calibration')
     parser.add_argument('--verify-decoder-windows',action='store_true')
-    parser.add_argument('--max-frames',type=int,default=64,choices=range(1,119),metavar='1..118')
+    parser.add_argument('--max-frames',type=int,default=64,choices=range(1,503),metavar='1..502')
     args = parser.parse_args()
+    if args.serve is not None and args.serve_grpc is not None:
+        parser.error('Choose one diagnostic transport')
+    if any(port is not None and not 1 <= port <= 65535 for port in [args.serve,args.serve_grpc]):
+        parser.error('Server port must be 1..65535')
     if not 0 <= args.first_chunk_trials <= 1000:
         parser.error('first-chunk-trials must be 0..1000')
     if args.verify_prefix_state and not args.experimental_prefix_state:
         parser.error('--verify-prefix-state requires --experimental-prefix-state')
     if args.output.exists() or args.output.with_suffix('.json').exists():
         parser.error('Output already exists; preserve previous audio and reports')
-    voice = VoiceStream(args.source,args.packages,args.gate,args.text,args.instruction,args.compiled_dir,args.predictor_package,args.prefill_packages,args.first_decoder_package,args.speaker,args.model_prefix,args.block_count,args.decoder_package,args.tail_decoder_package,args.decoder_windows,args.startup_decoder_package,args.experimental_history_decoder,args.experimental_prefix_state,args.short_talker_package)
+    voice = VoiceStream(args.source,args.packages,args.gate,args.text,args.instruction,args.compiled_dir,args.predictor_package,args.prefill_packages,args.first_decoder_package,args.speaker,args.model_prefix,args.block_count,args.decoder_package,args.tail_decoder_package,args.decoder_windows,args.startup_decoder_package,args.experimental_history_decoder,args.experimental_prefix_state,args.short_talker_package,args.text_projection_package,args.long_talker_package,args.frontend_assets)
     if args.capture_predictor_inputs:
         if args.capture_predictor_inputs.exists():
             parser.error('Calibration output already exists')
@@ -517,6 +690,9 @@ def main():
         'experimental_history_decoder':args.experimental_history_decoder,
         'experimental_prefix_state':args.experimental_prefix_state,
         'short_talker_package':str(args.short_talker_package) if args.short_talker_package else None,
+        'text_projection_package':str(args.text_projection_package) if args.text_projection_package else None,
+        'long_talker_package':str(args.long_talker_package) if args.long_talker_package else None,
+        'frontend_assets':str(args.frontend_assets) if args.frontend_assets else None,
         'first_decoder_package':str(args.first_decoder_package.resolve()) if args.first_decoder_package else None,
         'tail_decoder_package':str(args.tail_decoder_package.resolve()) if args.tail_decoder_package else None,
         'decoder_windows':str(args.decoder_windows.resolve()) if args.decoder_windows else None,
@@ -580,27 +756,12 @@ def main():
         args.output.with_suffix('.benchmark.json').write_text(json.dumps(benchmark,indent=2)+'\n')
         print(json.dumps(benchmark),flush=True)
     if args.serve is not None:
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = 'HTTP/1.1'
-            def do_GET(self):
-                if self.path != '/stream':
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                self.send_header('Content-Type','audio/pcm; rate=24000; channels=1; format=s16le')
-                self.send_header('Transfer-Encoding','chunked')
-                self.send_header('Cache-Control','no-store')
-                self.end_headers()
-                try:
-                    for payload,_ in voice.chunks():
-                        self.wfile.write(f'{len(payload):X}\r\n'.encode('ascii')+payload+b'\r\n')
-                        self.wfile.flush()
-                    self.wfile.write(b'0\r\n\r\n')
-                    self.wfile.flush()
-                except (BrokenPipeError,ConnectionResetError):
-                    self.close_connection = True
-        print(f'Fresh synthesis at http://127.0.0.1:{args.serve}/stream (fixed configured text)',flush=True)
-        HTTPServer(('127.0.0.1',args.serve),Handler).serve_forever()
+        from voice_http import serve_voice
+        serve_voice(voice,args.serve,args.max_frames)
+    if args.serve_grpc is not None:
+        import asyncio
+        from voice_grpc import serve_grpc
+        asyncio.run(serve_grpc(voice,args.serve_grpc,args.max_frames))
 
 
 if __name__=='__main__':

@@ -1,4 +1,0 @@
-coremltools>=9.0,<10.0
-fastapi>=0.115
-uvicorn[standard]>=0.30
-tokenizers>=0.21

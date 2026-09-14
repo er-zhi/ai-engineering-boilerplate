@@ -16,6 +16,7 @@ from export_qwen_cached_step import controls
 def main():
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('source',type=Path,help='Official Qwen3-TTS 0.6B CustomVoice checkpoint')
     parser.add_argument('--output',type=Path,default=root/'reports/invariant-prefix-probe.json')
     parser.add_argument('--package',type=Path,default=root/'models/qwen06-stateful-fp16/qwen06_cached_block0.mlpackage')
     parser.add_argument('--capacity',type=int,choices=[16,32,64,128],default=128)
@@ -25,7 +26,7 @@ def main():
     if output.exists():
         raise ValueError('Preserve previous probe')
     torch.set_num_threads(4)
-    tts = Qwen3TTSModel.from_pretrained(str(root.parent/'tts-bakeoff/qwen06-customvoice'),
+    tts = Qwen3TTSModel.from_pretrained(str(args.source),
         dtype=torch.float32,device_map='cpu',local_files_only=True,attn_implementation='eager')
     talker = tts.model.talker.eval()
     phrases = ["I'm sorry about the charge. I'll fix it for you.",
@@ -144,6 +145,30 @@ def main():
                 'exact':all(error==0 for row in prefix_errors+continuation_errors for error in row.values())})
         record['migration'] = {'scope':'Three captured prefixes and ten fixed-input continuation steps each; not full speech quality',
             'reference':str(args.migration_reference),'admission':reference_admission,'cases':migration_cases}
+        # Identical text-dependent steps; alternate order to reduce thermal/order bias.
+        paired = {'short':[], 'full':[]}
+        pair_states = {'short':model.make_state(), 'full':reference.make_state()}
+        pair_models = {'short':model, 'full':reference}
+        pair_controls = {'short':control, 'full':long_controls}
+        for name in pair_models:
+            for i in range(position):
+                pair_models[name].predict(dict(pair_controls[name][i],embeddings=values[0][:,i:i+1]),state=pair_states[name])
+        for trial in range(110):
+            results = {}
+            for name in (['short','full'] if trial % 2 else ['full','short']):
+                inputs = dict(pair_controls[name][position],embeddings=values[trial % len(values)][:,-1:])
+                started = time.perf_counter()
+                results[name] = pair_models[name].predict(inputs,state=pair_states[name])
+                duration = (time.perf_counter()-started)*1000
+                if trial >= 10:
+                    paired[name].append(duration)
+            for name in ['logits','hidden']:
+                np.testing.assert_array_equal(results['short'][name],results['full'][name])
+        record['paired_cache_timing'] = {
+            'scope':'Alternating one-step short/full cache; three prepared texts, excludes predictor/PCM and migration',
+            'trials_per_model':100,'warmups_per_model':10,'exact_outputs':True,
+            'timings':{name:{'p50_ms':float(np.percentile(rows,50)),
+                'p95_ms':float(np.percentile(rows,95)),'raw_ms':rows} for name,rows in paired.items()}}
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(record,indent=2)+'\n')
     print(json.dumps({k:v for k,v in record.items() if k not in ['raw_step_ms','admission']}),flush=True)

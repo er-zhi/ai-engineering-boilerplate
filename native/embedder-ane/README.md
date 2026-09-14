@@ -10,7 +10,7 @@ Core ML, the only route to the Neural Engine, is a macOS framework; a Linux cont
 
 [`google/embeddinggemma-300m`](https://huggingface.co/google/embeddinggemma-300m) — 768-dimensional output, Apache 2.0 (Gemma license), a bidirectional encoder adapted from the decoder-only Gemma 3 line, using mean pooling over token embeddings followed by two linear projections (768→3072→768). `google/embeddinggemma-300m` is gated on Hugging Face; [`unsloth/embeddinggemma-300m`](https://huggingface.co/unsloth/embeddinggemma-300m) is the same published weights, ungated, used by `convert.py` so a fresh machine never needs to request the gate.
 
-Replaced `Qwen/Qwen3-Embedding-0.6B` (archived at `../embedder-ane-qwen3-archived`, restorable by moving it back if this ever needs reverting). Qwen3 scores slightly higher on raw MTEB, but at roughly 5x the latency for a page-search corpus where 9ms vs. 20-100ms end-to-end is the more visible difference.
+Replaced the earlier `Qwen/Qwen3-Embedding-0.6B` experiment, which remains available in git history. Qwen3 scores slightly higher on raw MTEB, but at roughly 5x the latency for a page-search corpus where 9ms vs. 20-100ms end-to-end is the more visible difference.
 
 ### Why a hand-written Core ML conversion, not a published one
 

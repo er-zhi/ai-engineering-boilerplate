@@ -20,7 +20,7 @@ class StatefulPredictor(torch.nn.Module):
         self.step = CachedBlock(predictor,0,predictor.config.num_hidden_layers) if talker else Predictor(predictor)
         cfg = predictor.config
         capacity = capacity if capacity is not None else (128 if talker else 16)
-        if capacity not in (16,32,64,128):
+        if capacity not in (16,32,64,128,512):
             raise ValueError('Unsupported cache capacity')
         shape = (cfg.num_hidden_layers, cfg.num_key_value_heads, capacity, cfg.head_dim)
         self.register_buffer('key_cache', torch.zeros(shape))
@@ -40,7 +40,7 @@ def main():
     parser.add_argument('source', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--talker',action='store_true',help='Export the full talker with a 128-position state cache')
-    parser.add_argument('--capacity',type=int,choices=[16,32,64,128],help='Experimental short talker cache; runtime migration must be validated separately')
+    parser.add_argument('--capacity',type=int,choices=[16,32,64,128,512],help='Experimental talker capacity; runtime migration must be validated separately')
     args = parser.parse_args()
     if args.output.exists():
         parser.error('output already exists; never overwrite a candidate')

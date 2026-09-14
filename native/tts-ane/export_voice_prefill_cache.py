@@ -37,6 +37,8 @@ class PrefillCache(CachedBlock):
             output = torch.matmul(probs,repeat_kv(v,attn.num_key_value_groups))
             hidden = residual + attn.o_proj(output.transpose(1,2).reshape(1,length,-1))
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+        if getattr(self,'last_token_only',False):
+            hidden = hidden[:,-1:]
         hidden = self.model.norm(hidden)
         return self.head(hidden),hidden,torch.cat(keys,dim=0),torch.cat(values,dim=0)
 
@@ -50,15 +52,19 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--w8',action='store_true',help='INT8 matrix weights with FP16 activations')
     parser.add_argument('--compact-kv',action='store_true',help='Return only populated prefix KV; runtime pads when continuation begins')
+    parser.add_argument('--last-token-only',action='store_true',help='Only normalize/project the final token; requires all layers and exact-length runtime input')
     args = parser.parse_args()
     if args.output.exists() or not 1 <= args.length <= 64:
         parser.error('output must be new; length must be 1..64')
+    if args.last_token_only and not args.all_layers:
+        parser.error('--last-token-only requires --all-layers')
     torch.set_num_threads(4)
     talker = Qwen3TTSModel.from_pretrained(str(args.source),dtype=torch.float32,
         device_map='cpu',local_files_only=True,attn_implementation='eager').model.talker.eval()
     start,end = (0,talker.config.num_hidden_layers) if args.all_layers else (args.block*7,(args.block+1)*7)
     wrapper = PrefillCache(talker,start,end).eval()
     wrapper.compact_kv = args.compact_kv
+    wrapper.last_token_only = args.last_token_only
     reference = CachedBlock(talker,start,end).eval()
     torch.manual_seed(42)
     embeddings = torch.randn(1,args.length,talker.config.hidden_size)*0.5
@@ -74,7 +80,9 @@ def main():
         for pos in range(args.length):
             logits,hidden,keys,values = reference(embeddings[:,pos:pos+1],keys,values,
                 *controls(talker.model,pos,128))
-            torch.testing.assert_close(actual[0][:,pos:pos+1],logits,atol=1e-3,rtol=1e-3)
+            if not args.last_token_only or pos == args.length-1:
+                observed = actual[0] if args.last_token_only else actual[0][:,pos:pos+1]
+                torch.testing.assert_close(observed,logits,atol=1e-3,rtol=1e-3)
         torch.testing.assert_close(actual[2],keys[:,:,:args.length] if args.compact_kv else keys,atol=1e-3,rtol=1e-3)
         torch.testing.assert_close(actual[3],values[:,:,:args.length] if args.compact_kv else values,atol=1e-3,rtol=1e-3)
         print(f'FP32 prefill/KV parity PASS: {args.length} positions',flush=True)

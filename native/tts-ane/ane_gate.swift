@@ -19,6 +19,9 @@ struct ANEGate {
 
             let configuration = MLModelConfiguration()
             configuration.computeUnits = .cpuAndNeuralEngine
+            if arguments.fastPrediction {
+                configuration.optimizationHints.specializationStrategy = .fastPrediction
+            }
 
             let plan = try await MLComputePlan.load(
                 contentsOf: compiledURL,
@@ -45,6 +48,7 @@ struct ANEGate {
 
             let result: [String: Any] = [
                 "status": "PASS",
+                "fast_prediction": arguments.fastPrediction,
                 "model": arguments.modelURL.path,
                 "compiled_model": compiledURL.path,
                 "minimum_ane_operation_ratio": arguments.minimumANEOperationRatio,
@@ -150,10 +154,17 @@ private struct OperationSummary {
 private struct Arguments {
     let modelURL: URL
     let minimumANEOperationRatio: Double
+    let fastPrediction: Bool
 
     init(_ rawArguments: ArraySlice<String>) throws {
         var arguments = Array(rawArguments)
         var minimumANEOperationRatio = ANEGate.defaultMinimumANEOperationRatio
+        if let index = arguments.firstIndex(of: "--fast-prediction") {
+            arguments.remove(at: index)
+            self.fastPrediction = true
+        } else {
+            self.fastPrediction = false
+        }
 
         if let index = arguments.firstIndex(of: "--min-ane-operation-ratio") {
             guard arguments.indices.contains(index + 1),
@@ -185,7 +196,7 @@ private enum GateError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .usage:
-            return "usage: ane-gate [--min-ane-operation-ratio 0...1] model.mlpackage|model.mlmodelc"
+            return "usage: ane-gate [--fast-prediction] [--min-ane-operation-ratio 0...1] model.mlpackage|model.mlmodelc"
         case .invalidRatio:
             return "--min-ane-operation-ratio must be a number in [0, 1]"
         case .unsupportedModelPath(let path):

@@ -13,6 +13,18 @@ from qwen_tts.core.models.modeling_qwen3_tts import rotate_half, repeat_kv
 
 class GrowingPredictor(Predictor):
     """Unrolled residual steps need only actual past tokens, never future slots."""
+    def pack_projections(self):
+        def packed(layers):
+            if any(layer.bias is not None for layer in layers):
+                raise ValueError('Packed projection experiment requires bias-free layers')
+            result = torch.nn.Linear(layers[0].in_features,sum(layer.out_features for layer in layers),bias=False)
+            result.weight = torch.nn.Parameter(torch.cat([layer.weight.detach() for layer in layers],dim=0))
+            return result
+        self.packed_qkv = torch.nn.ModuleList([packed([layer.self_attn.q_proj,
+            layer.self_attn.k_proj,layer.self_attn.v_proj]) for layer in self.model.layers])
+        self.packed_mlp = torch.nn.ModuleList([packed([layer.mlp.gate_proj,
+            layer.mlp.up_proj]) for layer in self.model.layers])
+
     def forward(self,embeddings,keys,values,cosine,sine):
         hidden = self.projection(embeddings)
         length = embeddings.shape[1]
@@ -24,9 +36,14 @@ class GrowingPredictor(Predictor):
             norm = layer.input_layernorm(hidden)
             attn = layer.self_attn
             shape = (1,length,-1,attn.head_dim)
-            q = attn.q_norm(attn.q_proj(norm).view(shape)).transpose(1,2)
-            k = attn.k_norm(attn.k_proj(norm).view(shape)).transpose(1,2)
-            v = attn.v_proj(norm).view(shape).transpose(1,2)
+            if hasattr(self,'packed_qkv'):
+                q,k,v = self.packed_qkv[index](norm).split(
+                    [attn.q_proj.out_features,attn.k_proj.out_features,attn.v_proj.out_features],dim=-1)
+            else:
+                q,k,v = attn.q_proj(norm),attn.k_proj(norm),attn.v_proj(norm)
+            q = attn.q_norm(q.view(shape)).transpose(1,2)
+            k = attn.k_norm(k.view(shape)).transpose(1,2)
+            v = v.view(shape).transpose(1,2)
             q,k = q*cosine+rotate_half(q)*sine,k*cosine+rotate_half(k)*sine
             if keys is not None:
                 k = torch.cat((keys[index:index+1],k),dim=2)
@@ -38,7 +55,12 @@ class GrowingPredictor(Predictor):
                 scores = scores + torch.triu(torch.full((length,length),float('-inf'),device=scores.device,dtype=scores.dtype),diagonal=1)
             output = torch.softmax(scores,dim=-1) @ repeat_kv(v,attn.num_key_value_groups)
             hidden = residual+attn.o_proj(output.transpose(1,2).reshape(1,length,-1))
-            hidden = hidden+layer.mlp(layer.post_attention_layernorm(hidden))
+            norm = layer.post_attention_layernorm(hidden)
+            if hasattr(self,'packed_mlp'):
+                gate,up = self.packed_mlp[index](norm).chunk(2,dim=-1)
+                hidden = hidden+layer.mlp.down_proj(layer.mlp.act_fn(gate)*up)
+            else:
+                hidden = hidden+layer.mlp(norm)
         hidden = self.model.norm(hidden)
         return hidden,hidden,torch.cat(next_keys,dim=0),torch.cat(next_values,dim=0)
 
@@ -90,7 +112,7 @@ class ChannelFirstPredictor(GrowingPredictor):
 
 
 class Fused(torch.nn.Module):
-    def __init__(self,predictor,count,float_selection=False,growing_cache=False,batch_prefix=False,channel_first=False,re_prefill=False):
+    def __init__(self,predictor,count,float_selection=False,growing_cache=False,batch_prefix=False,channel_first=False,re_prefill=False,gather_embeddings=False,pack_projections=False):
         super().__init__()
         if batch_prefix and not growing_cache:
             raise ValueError('batch_prefix requires growing_cache')
@@ -104,11 +126,18 @@ class Fused(torch.nn.Module):
                 raise ValueError('channel_first requires growing_cache')
             self.core = ChannelFirstPredictor(predictor)
         self.growing_cache = growing_cache
+        if pack_projections:
+            if not growing_cache or channel_first:
+                raise ValueError('Packed projections require ordinary growing-cache layout')
+            self.core.pack_projections()
         self.core.head = torch.nn.Identity()
         self.heads = predictor.lm_head
         self.embeddings = predictor.get_input_embeddings()
         self.count = count
         self.float_selection = float_selection
+        if gather_embeddings and not float_selection:
+            raise ValueError('gather_embeddings requires float_selection')
+        self.gather_embeddings = gather_embeddings
         self.register_buffer('ranks',torch.arange(predictor.lm_head[0].out_features,dtype=torch.float32).reshape(1,1,-1))
         cfg = predictor.config
         self.register_buffer('empty',torch.zeros(cfg.num_hidden_layers,cfg.num_key_value_heads,16,cfg.head_dim))
@@ -163,7 +192,9 @@ class Fused(torch.nn.Module):
                     code = logits.argmax(-1)
                 codes.append(code)
                 if pos < self.count:
-                    if self.float_selection:
+                    if self.gather_embeddings:
+                        current = self.embeddings[pos-1](code.to(torch.long))
+                    elif self.float_selection:
                         selector = (self.ranks == code.unsqueeze(-1)).to(hidden.dtype)
                         current = selector @ self.embeddings[pos-1].weight
                     else:
@@ -177,6 +208,8 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--codes',type=int,default=2)
     parser.add_argument('--float-selection',action='store_true',help='Exact floating-point selection avoids integer argmax and gather')
+    parser.add_argument('--gather-embeddings',action='store_true',help='Diagnostic direct row lookup after floating-point code selection; ANE admission unproven')
+    parser.add_argument('--pack-projections',action='store_true',help='Experimental joint QKV and gate/up linear projections; requires growing-cache')
     parser.add_argument('--growing-cache',action='store_true',help='Specialize each unrolled step to its true causal prefix length')
     parser.add_argument('--batch-prefix',action='store_true',help='Process the two known initial predictor tokens together; requires growing-cache')
     parser.add_argument('--re-prefill',action='store_true',help='Experimental full short-prefix recomputation; requires growing-cache and batch-prefix')
@@ -188,6 +221,8 @@ def main():
     args = parser.parse_args()
     if args.output.exists():
         parser.error('output already exists; preserve previous candidates')
+    if args.gather_embeddings and not args.float_selection:
+        parser.error('--gather-embeddings requires --float-selection')
     if args.outlier_scale and (not args.validation_samples or args.stable_rms or args.channel_first):
         parser.error('Outlier scaling requires source validation and unmodified standard-layout norms')
     if args.batch_prefix and not args.growing_cache:
@@ -216,7 +251,7 @@ def main():
     torch.manual_seed(42)
     hidden = torch.randn(1,1,tts.model.talker.config.hidden_size)
     first = tts.model.talker.get_input_embeddings()(torch.tensor([[765]])).detach()
-    wrapper = Fused(predictor,args.codes,args.float_selection,args.growing_cache,args.batch_prefix,args.channel_first,args.re_prefill).eval()
+    wrapper = Fused(predictor,args.codes,args.float_selection,args.growing_cache,args.batch_prefix,args.channel_first,args.re_prefill,args.gather_embeddings,args.pack_projections).eval()
     with torch.inference_mode():
         expected = source_predictor.generate(inputs_embeds=torch.cat((hidden,first),dim=1),
             max_new_tokens=args.codes,do_sample=False)

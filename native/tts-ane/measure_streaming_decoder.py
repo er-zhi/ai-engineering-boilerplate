@@ -16,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('model', type=Path)
     parser.add_argument('codes', type=Path)
+    parser.add_argument('--source',type=Path,required=True,help='Official Qwen3-TTS 0.6B CustomVoice checkpoint')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--explicit-state', action='store_true')
     parser.add_argument('--teacher-state', action='store_true', help='Diagnostic only: exact FP32 reference histories each frame')
@@ -26,7 +27,7 @@ def main():
     root = Path(__file__).resolve().parent
     torch.set_num_threads(4)
     decoder = Qwen3TTSTokenizerV2Model.from_pretrained(
-        root.parent/'tts-bakeoff/qwen06-customvoice/speech_tokenizer',
+        args.source/'speech_tokenizer',
         dtype=torch.float32, local_files_only=True).eval().decoder
     record = json.loads(args.codes.read_text())
     codes = torch.tensor([chunk['codes'] for chunk in record['chunks']]).T.unsqueeze(0)
