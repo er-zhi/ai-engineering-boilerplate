@@ -3,12 +3,52 @@ target/
 .env.*
 !.env.example
 .agents/skills/code-review/logs/
+:memory:.ses
 
-# Native embedders: model weights are downloaded per README, never committed.
+# Local model weights, environments, audio and generated reports stay untracked.
 native/*/models/
 native/*/.venv/
 native/*/.convert-venv/
 native/*/__pycache__/
+native/qwen-voice-design-test/
+native/tts-bakeoff/
+native/tts-quality-test/
+
+# Maintained Qwen build, runtime and verification sources only.
+native/tts-ane/*
+!native/tts-ane/README.md
+!native/tts-ane/generate_source_fixture.py
+!native/tts-ane/requirements-qwen.txt
+!native/tts-ane/ane_gate.swift
+!native/tts-ane/voice_stream.py
+!native/tts-ane/export_qwen12hz_decoder.py
+!native/tts-ane/export_qwen06_talker_prefill.py
+!native/tts-ane/export_qwen_cached_step.py
+!native/tts-ane/export_qwen_predictor.py
+!native/tts-ane/export_directed_block.py
+!native/tts-ane/export_voice_cached_blocks.py
+!native/tts-ane/export_voice_prefill_cache.py
+!native/tts-ane/export_fused_predictor.py
+!native/tts-ane/export_stateful_predictor.py
+!native/tts-ane/export_streaming_decoder.py
+!native/tts-ane/quantize_qwen_block.py
+!native/tts-ane/quantize_qwen_activations.py
+!native/tts-ane/rescale_predictor_projection.py
+!native/tts-ane/select_activation_boundaries.py
+!native/tts-ane/probe_invariant_prefix.py
+!native/tts-ane/benchmark_fused_predictor.py
+!native/tts-ane/benchmark_stream_http.py
+!native/tts-ane/compare_qwen_quality.py
+!native/tts-ane/measure_streaming_decoder.py
+!native/tts-ane/verify_qwen_decoder.py
+!native/tts-ane/verify_qwen_prefill.py
+!native/tts-ane/verify_qwen_cached_step.py
+!native/tts-ane/verify_stateful_predictor.py
+!native/tts-ane/verify_directed_block.py
+!native/tts-ane/test_ane_gate_report.py
+!native/tts-ane/test_activation_boundaries.py
+!native/tts-ane/test_voice_sampling.py
+!native/tts-ane/test_voice_stream_client.py
 
 .temp
 .lycheecache
