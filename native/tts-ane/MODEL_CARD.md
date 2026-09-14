@@ -25,6 +25,8 @@ tokenizer, Serena frontend tables, runnable server/client, and one audio sample.
 Host embedding tables use FP16 plus sparse FP32 corrections; every reconstructed
 value and the complete sample WAV match the FP32 frontend exactly.
 
+[Listen to the packaged Serena sample](./samples/serena.wav).
+
 ## Measured result
 
 Tested on a 32 GB M4 MacBook Air, macOS 26.5, Xcode 27, Core ML Tools 9.0.
