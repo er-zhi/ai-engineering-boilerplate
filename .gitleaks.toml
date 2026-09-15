@@ -14,3 +14,8 @@ paths = [
   '''(^|/)native/[^/]+/models/''',
   '''(^|/)native/[^/]+/\.venv/''',
 ]
+
+[[allowlists]]
+description = "Historical TTS model API class name, not a credential"
+regexTarget = "line"
+regexes = ['''"python_api"\s*:\s*"qwen3_tts_ane\.Qwen3TTSANE"''']
