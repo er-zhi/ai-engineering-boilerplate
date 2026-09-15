@@ -39,6 +39,10 @@ source snapshot may remain read-only.
   M4 MacBook Air; all seven measured runs finished with identical PCM.
 - **69.3 ms p50 / 76.4 ms p95 to the first PCM body byte** after two warmups.
   This is an in-process streaming boundary, not network or audible latency.
+- **Production KV-state support.** `use_prefix_kv=True` reuses the invariant
+  nine-token voice prefix and restores an immutable state after every completed
+  or cancelled request. The published no-KV latency remains the optimization
+  baseline; the 50 ms p95 no-KV target has not yet been reached.
 - **Quality-first FP16 release.** Packaging, streaming, KV-state migration and
   frontend compaction were accepted only after exact code/PCM comparisons.
 - **ANE-admitted neural graphs.** The strict Core ML compute-plan gate reported
@@ -177,10 +181,13 @@ for chunk in voice.stream("I'm sorry about the charge. I'll fix it for you."):
 ```
 
 `voice.synthesize(text)` is available when a complete PCM byte string is more
-convenient. Transport adapters such as gRPC belong in the application and are
-maintained in the linked source repository rather than this model bundle.
-Component paths and tensor/audio contracts are recorded in `model-config.json`.
-Run `shasum -a 256 -c SHA256SUMS` to verify the downloaded bundle.
+convenient. Construct `Qwen3TTSANE(use_prefix_kv=True)` to enable reusable model
+KV state; this caches Transformer state, never generated audio. It is not the
+quality-reference default yet because the approved packaged sample uses the
+batched-prefill path. Transport adapters such as gRPC belong in the application
+and are maintained in the linked source repository rather than this model
+bundle. Component paths and tensor/audio contracts are recorded in
+`model-config.json`. Run `shasum -a 256 -c SHA256SUMS` to verify the download.
 
 ## Scope and limitations
 

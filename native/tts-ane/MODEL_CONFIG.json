@@ -6,7 +6,9 @@
     "platform": "macos-arm64",
     "framework": "Core ML",
     "compute_units": "CPU_AND_NE",
-    "python_api": "qwen3_tts_ane.Qwen3TTSANE"
+    "python_api": "qwen3_tts_ane.Qwen3TTSANE",
+    "prefix_kv_available": true,
+    "prefix_kv_default": false
   },
   "audio": {
     "sample_rate": 24000,

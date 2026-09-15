@@ -48,11 +48,24 @@ class ModelConfigTests(unittest.TestCase):
                 voice.call_args.kwargs["prefill_packages"],
                 (root / "models/prefill").resolve(),
             )
-            self.assertFalse(voice.call_args.kwargs.get("experimental_prefix_state", False))
+            self.assertFalse(voice.call_args.kwargs["experimental_prefix_state"])
             self.assertEqual(
                 voice.call_args.kwargs["predictor_package"],
                 (root / "models/predictor.mlpackage").resolve(),
             )
+
+    @patch("qwen3_tts_ane.platform.machine", return_value="arm64")
+    @patch("qwen3_tts_ane.platform.system", return_value="Darwin")
+    @patch("qwen3_tts_ane.VoiceStream")
+    @patch("qwen3_tts_ane.materialize_shared_package")
+    def test_runtime_can_enable_prefix_kv(self, materialize, voice, system, machine):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_bundle(root)
+            materialize.side_effect = lambda package, weight, cache: (package, "hard-link")
+            Qwen3TTSANE(root=root, cache=root / "cache", use_prefix_kv=True)
+            self.assertIsNone(voice.call_args.kwargs["prefill_packages"])
+            self.assertTrue(voice.call_args.kwargs["experimental_prefix_state"])
 
     @patch("qwen3_tts_ane.platform.machine", return_value="arm64")
     @patch("qwen3_tts_ane.platform.system", return_value="Darwin")

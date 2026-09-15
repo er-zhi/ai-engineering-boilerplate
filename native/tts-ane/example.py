@@ -14,8 +14,13 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("output.wav"))
     parser.add_argument("--max-frames", type=int, default=502)
     parser.add_argument("--cache", type=Path)
+    parser.add_argument(
+        "--prefix-kv",
+        action="store_true",
+        help="Reuse the invariant Serena prefix state; generated audio is never cached",
+    )
     args = parser.parse_args()
-    voice = Qwen3TTSANE(cache=args.cache)
+    voice = Qwen3TTSANE(cache=args.cache, use_prefix_kv=args.prefix_kv)
     started = time.perf_counter()
     chunks = 0
     with wave.open(str(args.output), "wb") as output:

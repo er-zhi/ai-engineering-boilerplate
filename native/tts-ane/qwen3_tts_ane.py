@@ -24,7 +24,7 @@ class AudioChunk:
 
 
 class Qwen3TTSANE:
-    def __init__(self, root=None, cache=None, gate=None):
+    def __init__(self, root=None, cache=None, gate=None, *, use_prefix_kv=False):
         if platform.system() != "Darwin" or platform.machine() != "arm64":
             raise RuntimeError("Qwen3TTSANE requires Apple Silicon macOS")
         self.root = Path(root or Path(__file__).resolve().parent).resolve()
@@ -66,6 +66,7 @@ class Qwen3TTSANE:
             "long_talker": long_mode,
         }
         self.shared_weight_modes = modes
+        self.use_prefix_kv = bool(use_prefix_kv)
         self._voice = VoiceStream(
             resolved["frontend"],
             talker.parent,
@@ -74,12 +75,13 @@ class Qwen3TTSANE:
             "",
             compiled_dir=self.cache / "compiled",
             predictor_package=resolved["predictor"],
-            prefill_packages=prefill.parent,
+            prefill_packages=None if self.use_prefix_kv else prefill.parent,
             speaker="Serena",
             model_prefix="qwen06",
             block_count=1,
             decoder_package=resolved["decoder"],
             experimental_history_decoder=True,
+            experimental_prefix_state=self.use_prefix_kv,
             text_projection_package=resolved["text_projection"],
             long_talker_package=long_talker,
             frontend_assets=resolved["frontend"],
