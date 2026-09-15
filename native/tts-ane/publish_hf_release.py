@@ -27,6 +27,13 @@ def main():
         "requirements.txt",
     }
     local = local_files(root)
+    transient = sorted(
+        path
+        for path in local
+        if "__pycache__" in Path(path).parts or path.endswith((".pyc", ".pyo"))
+    )
+    if transient:
+        parser.error(f"release folder contains transient Python files: {transient}")
     missing = required - local
     if missing:
         parser.error(f"incomplete release folder; missing {sorted(missing)}")
