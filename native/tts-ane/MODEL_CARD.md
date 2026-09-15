@@ -11,10 +11,14 @@ tags:
 - coreml
 - ane
 - streaming
+- low-latency
+- macos
 - python
 ---
 
-# Qwen3-TTS 0.6B Serena — sub-50 ms warm first PCM on Apple Neural Engine
+# Qwen3-TTS 0.6B Serena — Leading macOS ANE Port, <50 ms Warm First PCM
+
+**Quality-verified · 47.75 ms warm p95 · 1.418x real-time · byte-exact tested output**
 
 An experimental, unofficial Apple Silicon port of
 [Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice).
@@ -38,6 +42,26 @@ first-byte critical path without caching generated audio or changing the
 completed waveform.
 
 [Listen to the Serena sample](https://huggingface.co/erjigit17/Qwen3-TTS-0.6B-ANE/resolve/main/samples/serena.wav).
+
+## Why this is a leading Qwen3-TTS port for macOS
+
+Among the public Qwen3-TTS Apple runtimes reviewed on 2026-09-15, this was the
+only one found with a published sub-50 ms warm first-PCM result. The comparison
+is deliberately limited to Qwen3-TTS; smaller non-Qwen voices may be faster.
+Other projects also measure different hardware and boundaries, so this is a
+discovery claim—not a controlled cross-project benchmark:
+
+| Public implementation | Published first-audio result | Relevant distinction |
+|---|---:|---|
+| **This Core ML / ANE port** | **47.75 ms warm p95** | Prepared-prompt-to-PCM boundary, 300 runs; exact PCM controls |
+| [speech-swift Qwen3-TTS](https://github.com/soniqo/speech-swift/blob/main/docs/benchmarks/ios-coreml.md) | ~120 ms | MLX Swift, one-frame first packet |
+| [qwen3-tts C engine](https://github.com/gabriele-mastrapasqua/qwen3-tts/blob/main/docs/performance.md) | 460–500 ms | M1 CPU streaming |
+| [FluidInference Core ML](https://huggingface.co/FluidInference/qwen3-tts-coreml) | Not published | ~5.9 GB model set; Swift framework integration |
+| [aufklarer Core ML](https://huggingface.co/aufklarer/Qwen3-TTS-CoreML) | Not published | Swift package integration |
+
+The machine-readable measurements are in [`BENCHMARKS.json`](./BENCHMARKS.json),
+and `verify_reference.py` lets an agent or developer regenerate the packaged
+prompt and require byte-for-byte PCM equality instead of trusting this card.
 
 ## Key highlights
 
@@ -174,11 +198,14 @@ python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 python verify_install.py
+python verify_reference.py
 python example.py "I'm sorry about the charge. I'll fix it for you." --output answer.wav
 ```
 
 Run `python verify_install.py --checksums` when a full byte-level download
 integrity check is wanted before the first Core ML compilation.
+Run `python verify_reference.py --runs 3` to execute three complete generations
+and require every raw PCM result to match the packaged reference exactly.
 
 Embed streaming synthesis directly. This default constructor selects the
 quality-verified dual-prefill startup path:

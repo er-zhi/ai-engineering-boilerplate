@@ -93,6 +93,8 @@ native/tts-ane/*
 !native/tts-ane/publish_hf_release.py
 !native/tts-ane/export_fused_first_frame.py
 !native/tts-ane/benchmark_fused_first_frame.py
+!native/tts-ane/BENCHMARKS.json
+!native/tts-ane/verify_reference.py
 
 .temp
 .lycheecache
