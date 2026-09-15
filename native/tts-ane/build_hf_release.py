@@ -82,10 +82,18 @@ def main():
     destination.mkdir()
     talker = args.models / "qwen06-stateful-fp16" / "qwen06_cached_block0.mlpackage"
     prefill = args.models / "qwen06-full-fp16" / "qwen06_prefill_block0.mlpackage"
+    startup_prefill = (
+        args.models
+        / "qwen06-dual-startup-nokv-lut6"
+        / "qwen06_prefill_block0.mlpackage"
+    )
     long_talker = args.models / "qwen06-long512-fp16.mlpackage"
     selected = {
         talker: destination / "talker" / "qwen06_cached_block0.mlpackage",
         prefill: destination / "prefill" / "qwen06_prefill_block0.mlpackage",
+        startup_prefill: destination
+        / "startup-prefill"
+        / "qwen06_prefill_block0.mlpackage",
         args.models / "qwen06-outlier256-w8-safe-down.mlpackage": destination
         / "qwen06-outlier256-w8-safe-down.mlpackage",
         args.models / "streaming-decoder-explicit-noslice-fp16.mlpackage": destination

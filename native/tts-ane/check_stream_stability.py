@@ -2,12 +2,11 @@
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import time
 import wave
+from pathlib import Path
 
 from voice_stream import VoiceStream, prepare
-
 
 CASES = [
     ('short', "I'm sorry about the charge. I'll fix it for you."),
@@ -30,13 +29,15 @@ def collect(voice, frames):
 
 def identical(left, right):
     return len(left) == len(right) and all(
-        a[0] == b[0] and a[1]['codes'] == b[1]['codes'] for a,b in zip(left,right))
+        a[0] == b[0] and a[1]['codes'] == b[1]['codes']
+        for a,b in zip(left,right, strict=True))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('reference', type=Path, help='Runtime JSON identifying explicit model packages')
     parser.add_argument('--gate', type=Path, required=True)
+    parser.add_argument('--compiled-dir',type=Path,default=Path('models/compiled-cache'))
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--frontend-assets',type=Path,help='Override source frontend with an exported runtime bundle')
     parser.add_argument('--case',action='append',choices=[name for name,_ in CASES],help='Run selected cases; default all')
@@ -48,11 +49,12 @@ def main():
         return Path(config[name]) if config.get(name) else None
     frontend_assets=args.frontend_assets or path('frontend_assets')
     voice = VoiceStream(Path(config['source']),path('packages'),args.gate,CASES[0][1],'',
-        compiled_dir=Path('models/compiled-cache'),predictor_package=path('predictor_package'),
+        compiled_dir=args.compiled_dir,predictor_package=path('predictor_package'),
         prefill_packages=path('prefill_packages'),speaker=config['speaker'],model_prefix='qwen06',
         block_count=1,decoder_package=path('decoder_package'),experimental_history_decoder=True,
         text_projection_package=path('text_projection_package'),long_talker_package=path('long_talker_package'),
-        frontend_assets=frontend_assets)
+        frontend_assets=frontend_assets,
+        startup_prefill_packages=path('startup_prefill_packages'))
     args.output.mkdir(parents=True)
     report = {'scope':'Real ANE-admitted runtime stability, not quality acceptance or client latency',
         'reference':str(args.reference),'cross_request_prefix_reuse':False,'audio_cache_used':False,
@@ -71,6 +73,19 @@ def main():
         # Truncation at the selected model capacity is reported, not hidden.
         frames = min(voice.capacity-10,voice.capacity-voice.prepared[0]['inputs_embeds'].shape[1])
         expected,status = collect(voice,frames)
+        exact_prefill_reference = None
+        if voice.startup_prefill_blocks is not None:
+            startup_prefill = voice.startup_prefill_blocks
+            try:
+                voice.startup_prefill_blocks = None
+                reference, reference_status = collect(voice, frames)
+            finally:
+                voice.startup_prefill_blocks = startup_prefill
+            exact_prefill_reference = identical(expected, reference) and (
+                status['ended_by_eos'] == reference_status['ended_by_eos']
+            )
+            if not exact_prefill_reference:
+                raise AssertionError('Dual prefill differs from exact full prefill: '+name)
         repeated,repeated_status = collect(voice,frames)
         if not expected or not identical(expected,repeated) or status['ended_by_eos'] != repeated_status['ended_by_eos']:
             raise AssertionError('Non-repeatable complete generation: '+name)
@@ -98,6 +113,7 @@ def main():
             wav.writeframes(payload)
         row = {'name':name,'text':text,'frames':len(expected),'status':status,
             'preparation_including_model_load_ms':preparation_ms,'repeated_pcm_exact':True,
+            'dual_vs_full_prefill_pcm_exact':exact_prefill_reference,
             'cancel_after_frames_verified':cancellations,'sha256_pcm':hashlib.sha256(payload).hexdigest(),
             'chunks':[meta for _,meta in expected],'wav':str(filename)}
         report['cases'].append(row)

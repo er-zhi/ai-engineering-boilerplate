@@ -10,6 +10,7 @@ from shared_weights import WEIGHT_RELATIVE_PATH
 COMPONENTS = {
     "talker": "models/talker/qwen06_cached_block0.mlpackage",
     "prefill": "models/prefill/qwen06_prefill_block0.mlpackage",
+    "startup_prefill": "models/startup-prefill/qwen06_prefill_block0.mlpackage",
     "long_talker": "models/qwen06-long512-fp16.mlpackage",
     "predictor": "models/predictor.mlpackage",
     "decoder": "models/decoder.mlpackage",
@@ -50,6 +51,10 @@ class ModelConfigTests(unittest.TestCase):
             )
             self.assertFalse(voice.call_args.kwargs["experimental_prefix_state"])
             self.assertEqual(
+                voice.call_args.kwargs["startup_prefill_packages"],
+                (root / "models/startup-prefill").resolve(),
+            )
+            self.assertEqual(
                 voice.call_args.kwargs["predictor_package"],
                 (root / "models/predictor.mlpackage").resolve(),
             )
@@ -65,6 +70,7 @@ class ModelConfigTests(unittest.TestCase):
             materialize.side_effect = lambda package, weight, cache: (package, "hard-link")
             Qwen3TTSANE(root=root, cache=root / "cache", use_prefix_kv=True)
             self.assertIsNone(voice.call_args.kwargs["prefill_packages"])
+            self.assertIsNone(voice.call_args.kwargs["startup_prefill_packages"])
             self.assertTrue(voice.call_args.kwargs["experimental_prefix_state"])
 
     @patch("qwen3_tts_ane.platform.machine", return_value="arm64")

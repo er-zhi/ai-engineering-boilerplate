@@ -67,6 +67,7 @@ class Qwen3TTSANE:
         }
         self.shared_weight_modes = modes
         self.use_prefix_kv = bool(use_prefix_kv)
+        startup_prefill = resolved.get("startup_prefill")
         self._voice = VoiceStream(
             resolved["frontend"],
             talker.parent,
@@ -85,6 +86,11 @@ class Qwen3TTSANE:
             text_projection_package=resolved["text_projection"],
             long_talker_package=long_talker,
             frontend_assets=resolved["frontend"],
+            startup_prefill_packages=(
+                None
+                if self.use_prefix_kv or startup_prefill is None
+                else startup_prefill.parent
+            ),
         )
 
     def stream(self, text, max_frames=MAX_FRAMES):

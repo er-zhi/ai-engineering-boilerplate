@@ -367,6 +367,7 @@ class VoiceStream:
         long_talker_package=None,
         frontend_assets=None,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
+        startup_prefill_packages=None,
     ):
         if long_talker_package and (block_count != 1 or not experimental_history_decoder):
             raise ValueError("Long talker requires one block and the history-preserving decoder")
@@ -560,6 +561,23 @@ class VoiceStream:
             if prefill_packages
             else None
         )
+        self.startup_prefill_blocks = (
+            [
+                load(
+                    str(
+                        (
+                            startup_prefill_packages
+                            / f"{model_prefix}_prefill_block{i}.mlpackage"
+                        ).resolve()
+                    )
+                )
+                for i in range(block_count)
+            ]
+            if startup_prefill_packages
+            else None
+        )
+        if self.startup_prefill_blocks and not self.prefill_blocks:
+            raise ValueError("Startup prefill requires an exact continuation prefill")
         self.last_status = {}
         self.predictor_samples = None
         self.prefix_states = None
@@ -801,47 +819,77 @@ class VoiceStream:
         prefix = arrays["inputs_embeds"]
         if prefix.shape[1] + max_frames > self.capacity:
             raise ValueError("Requested generation exceeds the talker KV capacity")
-        if self.prefill_blocks:
+
+        def run_batched_prefill(blocks, require_cache):
             length = next(
                 i
-                for i in self.prefill_blocks[0].source_spec.description.input
+                for i in blocks[0].source_spec.description.input
                 if i.name == "embeddings"
             ).type.multiArrayType.shape[1]
             if prefix.shape[1] > length:
                 raise ValueError("Prefix exceeds exported prefill capacity")
             last_only = (
-                self.prefill_blocks[-1]
+                blocks[-1]
                 .source_spec.description.output[0]
                 .type.multiArrayType.shape[1]
                 == 1
             )
-            if last_only and (len(self.prefill_blocks) != 1 or prefix.shape[1] != length):
+            if last_only and (len(blocks) != 1 or prefix.shape[1] != length):
                 raise ValueError(
                     "Last-token prefill requires one full block and exact prefix length"
                 )
-            hidden = np.zeros((1, length, prefix.shape[2]), np.float32)
-            hidden[:, : prefix.shape[1]] = prefix
+            prefill_hidden = np.zeros((1, length, prefix.shape[2]), np.float32)
+            prefill_hidden[:, : prefix.shape[1]] = prefix
             cosine = np.concatenate([controls[0][i]["cosine"] for i in range(length)], axis=2)
             sine = np.concatenate([controls[0][i]["sine"] for i in range(length)], axis=2)
             mask = np.triu(np.full((1, 1, length, length), -np.inf, np.float32), k=1)
-            for index, block in enumerate(self.prefill_blocks):
-                result = block.predict(
-                    dict(embeddings=hidden, cosine=cosine, sine=sine, attention_mask=mask)
+            prefill_caches = []
+            for index, block in enumerate(blocks):
+                prefill_result = block.predict(
+                    dict(
+                        embeddings=prefill_hidden,
+                        cosine=cosine,
+                        sine=sine,
+                        attention_mask=mask,
+                    )
                 )
-                hidden = result[block.source_spec.description.output[1].name]
-                keys, values = result["next_keys"], result["next_values"]
-                if not all(np.isfinite(x).all() for x in [hidden, keys, values]):
+                prefill_hidden = prefill_result[block.source_spec.description.output[1].name]
+                keys = prefill_result.get("next_keys")
+                values = prefill_result.get("next_values")
+                checked = [prefill_hidden] + ([keys, values] if keys is not None else [])
+                if not all(np.isfinite(x).all() for x in checked):
                     raise RuntimeError(f"Non-finite prefill block {index}")
-                keys[:, :, prefix.shape[1] :, :] = 0
-                values[:, :, prefix.shape[1] :, :] = 0
-                caches[index] = keys, values
-            position = prefix.shape[1]
-            logits = result["logits"] if last_only else result["logits"][:, position - 1 : position]
-            hidden = hidden if last_only else hidden[:, position - 1 : position]
+                if keys is not None:
+                    keys[:, :, prefix.shape[1] :, :] = 0
+                    values[:, :, prefix.shape[1] :, :] = 0
+                    prefill_caches.append((keys, values))
+            if require_cache and len(prefill_caches) != len(blocks):
+                raise RuntimeError("Continuation prefill did not return KV")
+            prefill_position = prefix.shape[1]
+            prefill_logits = (
+                prefill_result["logits"]
+                if last_only
+                else prefill_result["logits"][:, prefill_position - 1 : prefill_position]
+            )
+            prefill_hidden = (
+                prefill_hidden
+                if last_only
+                else prefill_hidden[:, prefill_position - 1 : prefill_position]
+            )
+            return prefill_logits, prefill_hidden, prefill_caches, prefill_position
+
+        initial_prefill = self.startup_prefill_blocks or self.prefill_blocks
+        if initial_prefill:
+            logits, hidden, initial_caches, position = run_batched_prefill(
+                initial_prefill, require_cache=self.startup_prefill_blocks is None
+            )
+            if self.startup_prefill_blocks is None:
+                caches = initial_caches
         else:
             for index in range(position, prefix.shape[1]):
                 logits, hidden = advance(prefix[:, index : index + 1])
         prefill_ms = (time.perf_counter() - started) * 1000
+        continuation_prefill_ms = 0.0
         latent_history = np.zeros((1, 512, 32), np.float32)
         decoder_state = {
             name: np.zeros(shape, np.float32) for name, shape in self.decoder_state_shapes.items()
@@ -984,8 +1032,15 @@ class VoiceStream:
                     "predictor_ms": predictor_ms,
                     "decode_pcm_ms": (time.perf_counter() - decoder_started) * 1000,
                     "frame_compute_ms": (time.perf_counter() - frame_started) * 1000,
+                    "continuation_prefill_ms": continuation_prefill_ms,
                 },
             )
+            if frame == 0 and self.startup_prefill_blocks is not None and max_frames > 1:
+                continuation_started = time.perf_counter()
+                _, _, caches, position = run_batched_prefill(
+                    self.prefill_blocks, require_cache=True
+                )
+                continuation_prefill_ms = (time.perf_counter() - continuation_started) * 1000
             hidden = (
                 np.stack(
                     [embedding[code] for embedding, code in zip(embeddings, codes, strict=True)]
@@ -1034,6 +1089,13 @@ def main():
         "--prefill-packages",
         type=Path,
         help="Candidate batched-prefill blocks with compatible KV outputs",
+    )
+    parser.add_argument(
+        "--startup-prefill-packages",
+        type=Path,
+        help=(
+            "Fast first-frame-only prefill; exact continuation prefill runs after first PCM"
+        ),
     )
     parser.add_argument(
         "--first-chunk-trials",
@@ -1141,6 +1203,7 @@ def main():
         args.text_projection_package,
         args.long_talker_package,
         args.frontend_assets,
+        startup_prefill_packages=args.startup_prefill_packages,
     )
     if args.capture_predictor_inputs:
         if args.capture_predictor_inputs.exists():
@@ -1149,6 +1212,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     chunks = []
     first_payload = None
+    second_payload = None
     parity_payloads = []
     with wave.open(str(args.output), "wb") as wav:
         wav.setnchannels(1)
@@ -1157,6 +1221,8 @@ def main():
         for payload, metadata in voice.chunks(args.max_frames):
             if first_payload is None:
                 first_payload = payload
+            elif second_payload is None:
+                second_payload = payload
             if args.verify_prefix_state:
                 parity_payloads.append(payload)
             wav.writeframesraw(payload)
@@ -1203,6 +1269,11 @@ def main():
         if args.predictor_package
         else None,
         "prefill_packages": str(args.prefill_packages.resolve()) if args.prefill_packages else None,
+        "startup_prefill_packages": (
+            str(args.startup_prefill_packages.resolve())
+            if args.startup_prefill_packages
+            else None
+        ),
         "format": "pcm_s16le",
         "chunks": chunks,
         "status": voice.last_status,
@@ -1266,6 +1337,7 @@ def main():
             raise RuntimeError("Window decoder parity failed")
     if args.first_chunk_trials:
         timings = []
+        continuation_timings = []
         for trial in range(args.first_chunk_trials + 5):
             generator = voice.chunks()
             try:
@@ -1274,6 +1346,23 @@ def main():
                     raise RuntimeError("Empty benchmark payload")
                 if payload != first_payload:
                     raise RuntimeError("First PCM changed after resetting the generation session")
+                if voice.startup_prefill_blocks is not None:
+                    next_payload, next_metadata = next(generator)
+                    if next_payload != second_payload:
+                        raise RuntimeError(
+                            "Second PCM changed after rebuilding continuation KV"
+                        )
+                    if trial >= 5:
+                        continuation_timings.append(
+                            {
+                                "first_to_second_pcm_ms": (
+                                    next_metadata["ready_ms"] - metadata["ready_ms"]
+                                ),
+                                "continuation_prefill_ms": next_metadata[
+                                    "continuation_prefill_ms"
+                                ],
+                            }
+                        )
                 if trial >= 5:
                     timings.append(metadata)
             finally:
@@ -1292,6 +1381,14 @@ def main():
                 for name in ["ready_ms", "prefill_ms", "predictor_ms", "decode_pcm_ms"]
             },
         }
+        if continuation_timings:
+            benchmark["continuation_ms"] = {
+                name: {
+                    "p50": float(np.percentile([t[name] for t in continuation_timings], 50)),
+                    "p95": float(np.percentile([t[name] for t in continuation_timings], 95)),
+                }
+                for name in ["first_to_second_pcm_ms", "continuation_prefill_ms"]
+            }
         args.output.with_suffix(".benchmark.json").write_text(
             json.dumps(benchmark, indent=2) + "\n"
         )

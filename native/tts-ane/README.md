@@ -440,6 +440,45 @@ Latency work after the quality-first release:
    threshold without cached audio, silent pre-roll or transport headers counted
    as PCM.
 
+Rejected fused-first-frame experiment: `export_fused_first_frame.py` combines
+the no-KV 10-token talker prefill, semantic selection and all 15 residual-code
+predictions in one Core ML graph. Its FP32 wrapper and converted graph produced
+the exact expected 16 first-frame codes, and the strict compute-plan gate
+reported 100% ANE preference. However, 100 warm predictions measured
+68.46/81.34 ms p50/p95 before audio decoding, slower than the separate graphs.
+The 1.1 GB candidate and compiled cache were deleted; the exporter, benchmark
+and JSON result preserve the reproducible negative result. Do not integrate or
+publish this graph.
+
+Verified dual-prefill experiment: the first graph returns only first-frame
+logits and hidden state; it never returns or reuses approximate KV. After the
+first PCM has been yielded, the existing full FP16 prefill rebuilds exact KV
+for every continuation frame. The startup graph uses 6-bit k-means LUT weights
+with FP16 activations. A 300-trial warm two-chunk run measured first PCM at
+44.88/47.75 ms p50/p95, including 7.40/7.77 ms startup prefill. No audio cache
+or cross-request KV was used. The first-to-second PCM interval was
+85.93/91.26 ms, so continuation startup still needs approximately 6--12 ms of
+work or client buffering to remain below the 80 ms chunk duration.
+
+The 51-frame result is byte-identical to the accepted full-prefill WAV
+(`c5c4f657...92a7`). Full-stream dual-vs-full-prefill parity also passed for
+short, technical, numeric, punctuation/pause and 244-frame long inputs, plus
+repetition, cancellation and cross-text restoration. Four-bit LUT changed 15
+of 16 first-frame codes and was rejected. Rebuild the accepted startup graph:
+
+```sh
+qwen-env/bin/python export_voice_prefill_cache.py /path/to/qwen06-customvoice \
+  --all-layers --length 10 --last-token-only --first-frame-only \
+  --palettize-bits 6 \
+  --output models/qwen06-dual-startup-nokv-lut6/qwen06_prefill_block0.mlpackage
+```
+
+Evidence: `reports/qwen06-dual-prefill-lut6-two-chunk-benchmark-02.*`,
+`reports/qwen06-dual-prefill-lut6-full-01.*`, and
+`reports/qwen06-dual-prefill-lut6-stability-01/report.json`. This is the
+quality-verified default startup path in the Hugging Face runtime. Reusable
+cross-request prefix KV remains a separate opt-in mode.
+
 # Bidirectional gRPC (experimental)
 
 Run `qwen-env/bin/python serve.py --port 8766`. This adapter is maintained only

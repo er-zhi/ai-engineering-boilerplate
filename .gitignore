@@ -91,6 +91,8 @@ native/tts-ane/*
 !native/tts-ane/benchmark_cpu_vs_ane.py
 !native/tts-ane/palettize_qwen_block.py
 !native/tts-ane/publish_hf_release.py
+!native/tts-ane/export_fused_first_frame.py
+!native/tts-ane/benchmark_fused_first_frame.py
 
 .temp
 .lycheecache
