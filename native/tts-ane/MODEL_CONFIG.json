@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "base_model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "base_model_revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+  "runtime": {
+    "platform": "macos-arm64",
+    "framework": "Core ML",
+    "compute_units": "CPU_AND_NE",
+    "python_api": "qwen3_tts_ane.Qwen3TTSANE"
+  },
+  "audio": {
+    "sample_rate": 24000,
+    "channels": 1,
+    "format": "pcm_s16le",
+    "chunk_samples": 1920,
+    "chunk_duration_ms": 80
+  },
+  "voice": {
+    "language": "English",
+    "speaker": "Serena"
+  },
+  "limits": {
+    "text_characters": 32768,
+    "audio_frames": 502
+  },
+  "components": {
+    "talker": "models/talker/qwen06_cached_block0.mlpackage",
+    "prefill": "models/prefill/qwen06_prefill_block0.mlpackage",
+    "long_talker": "models/qwen06-long512-fp16.mlpackage",
+    "predictor": "models/qwen06-outlier256-w8-safe-down.mlpackage",
+    "decoder": "models/streaming-decoder-explicit-noslice-fp16.mlpackage",
+    "text_projection": "models/qwen06-text-projection32.mlpackage",
+    "frontend": "frontend"
+  },
+  "precision": {
+    "talker": "fp16",
+    "predictor": "mixed-int8-fp16",
+    "decoder": "fp16",
+    "text_projection": "fp16"
+  },
+  "shared_weight_blob": {
+    "canonical": "models/talker/qwen06_cached_block0.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+    "consumers": [
+      "models/prefill/qwen06_prefill_block0.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+      "models/qwen06-long512-fp16.mlpackage/Data/com.apple.CoreML/weights/weight.bin"
+    ]
+  }
+}

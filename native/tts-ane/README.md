@@ -375,9 +375,76 @@ Next: long-utterance migration validation, broader settings/HTTP isolation tests
 fix source-decoder discrepancies, optimize the residual predictor, and include
 fresh-text preparation and client delivery in end-to-end p95. Do not claim
 30 ms, native emotion control, or lossless quality from component benchmarks.
+
+## Hugging Face publication plan
+
+Before the next public release, rewrite the model card to the same professional
+level of detail as Arm's Qwen3-TTS bundle. Keep the distribution transport-neutral
+and organize the card as: Key Highlights, Quality Evaluation, Performance
+Evaluation, CPU versus ANE, Runtime Architecture, Precision and Quantization,
+Installation, Streaming API, Reproduction, Checksums, and Limitations.
+
+Publication gates:
+
+- Demonstrate more than 1.4x real-time median throughput on the named Apple
+  Silicon device with repeated complete utterances.
+- Demonstrate 50 ms or less warm time to the first PCM body byte for the stated
+  scope. Always publish p50 and p95, trial/warmup counts, chunk size, and every
+  excluded stage; do not relabel internal readiness as network or audible latency.
+- Run CPU-only and CPU+ANE on the same Core ML graphs, prompt, process isolation,
+  warmup policy and number of trials. Publish first-PCM, full-stream time, RTF,
+  peak RSS and PCM equality/difference for both backends.
+- Treat the approved FP16 Serena output as the release voice reference. For every
+  quantized candidate, record exact audio-code agreement, first differing frame,
+  PCM hashes, numerical decoder comparison, repeatability, cancellation and
+  cross-text state restoration. Add listening checks for age, timbre, prosody,
+  pronunciation and artifacts; WER alone is insufficient.
+- State precisely which comparisons are bit-exact. Never imply bitwise identity
+  with upstream PyTorch when only the optimized Core ML baseline matched.
+- Change the default weights only after the quantized candidate passes the
+  quality gate and improves measured latency/throughput. Otherwise publish FP16
+  as the default and keep Q8 experimental.
+- Validate a clean download on supported Python versions without the source
+  repository, `torch`, `transformers`, gRPC or Xcode. Verify every payload using
+  `SHA256SUMS` and mirror the release folder so stale or duplicate HF files are
+  deleted.
+
+Current evidence for the next card revision (M4 MacBook Air, macOS 26.5,
+Core ML Tools 9.0): seven measured FP16 runs after two warmups produced identical
+PCM, 69.3/76.4 ms first-PCM p50/p95 and 1.418x median real-time throughput. Thus
+the throughput gate is met, while the 50 ms first-byte gate remains open. Do not
+round 69.3 ms down or describe the internal PCM boundary as network/audible
+latency.
+
+The same-graph `CPU_ONLY` baseline currently crashes reproducibly at the first
+explicit-history decoder prediction inside Core ML (`SIGSEGV`, exit 139). The
+benchmark now refuses that unsafe path unless explicitly overridden. Publish
+this as an unresolved compatibility result, not an ANE speedup, until CPU-only
+completes the identical workload. Quantization copy must likewise explain that
+the first Q8 talker candidate was rejected despite its size/speed because exact
+code comparison and listening detected a voice-character change.
+
+Latency work after the quality-first release:
+
+1. Fuse the stateful talker step and fused residual predictor into one Core ML
+   program so the hidden tensor stays inside one ANE invocation.
+2. Export a first-subchunk decoder and prove that concatenating its output with
+   the continued history decoder preserves the accepted PCM boundary.
+3. Keep invariant-prefix KV reuse opt-in until both fresh-text and long-context
+   streams pass exact code/PCM comparison. The current production-safe restore
+   path is exact relative to sequential prefill, but its 100-trial result is
+   50.8/56.5 ms p50/p95 and its full WAV differs from the batched-prefill release
+   reference; it is not the HF default.
+4. Re-run at least 100 isolated fresh-text trials after each change. The 50 ms
+   target is achieved only when p95—not the best run or p50—is at or below the
+   threshold without cached audio, silent pre-roll or transport headers counted
+   as PCM.
+
 # Bidirectional gRPC (experimental)
 
-Use `--serve-grpc 8766` with the same ANE model arguments as `voice_stream.py`.
+Run `qwen-env/bin/python serve.py --port 8766`. This adapter is maintained only
+in the source repository and is deliberately excluded from the Hugging Face
+model bundle.
 The loopback-only `tts.v1.Speech/Synthesize` RPC accepts streamed `TextPart`
 messages and returns PCM16 little-endian, mono, 24 kHz `AudioChunk` messages.
 Finish text with client half-close (`done_writing()`); cancel the RPC to stop.

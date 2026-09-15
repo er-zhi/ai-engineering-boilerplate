@@ -79,6 +79,18 @@ native/tts-ane/*
 !native/tts-ane/test_activation_boundaries.py
 !native/tts-ane/test_voice_sampling.py
 !native/tts-ane/test_voice_stream_client.py
+!native/tts-ane/qwen3_tts_ane.py
+!native/tts-ane/example.py
+!native/tts-ane/verify_install.py
+!native/tts-ane/shared_weights.py
+!native/tts-ane/MODEL_CONFIG.json
+!native/tts-ane/requirements-model.txt
+!native/tts-ane/test_model_api.py
+!native/tts-ane/test_shared_weights.py
+!native/tts-ane/test_model_config.py
+!native/tts-ane/benchmark_cpu_vs_ane.py
+!native/tts-ane/palettize_qwen_block.py
+!native/tts-ane/publish_hf_release.py
 
 .temp
 .lycheecache

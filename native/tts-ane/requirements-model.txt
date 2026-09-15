@@ -1,0 +1,4 @@
+coremltools==9.0
+numpy==1.26.4; python_version < '3.13'
+numpy==2.2.6; python_version >= '3.13' and python_version < '3.14'
+tokenizers==0.22.2
