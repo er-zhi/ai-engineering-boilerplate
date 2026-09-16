@@ -6,11 +6,12 @@ use chrono::Utc;
 use common::proto::chat::v1::ChatEvent;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use uuid::Uuid;
 
 use crate::engine_client::EngineClient;
+use crate::entity::session;
 use crate::entity::topic::{self, Status};
 use crate::error::ChatError;
 use crate::events::EventBus;
@@ -18,6 +19,22 @@ use crate::session_manager::SessionManager;
 
 const AGENT_GRAPH_ID: &str = "agent";
 pub const MAX_CONCURRENT_TOPICS: u64 = 3;
+
+/// `SELECT ... FROM chat.sessions WHERE id = $1 FOR UPDATE` — the one serialization point for
+/// everything that changes how many topics are Running in a session (`create_topic`'s
+/// slot-limit check and `promote_next_queued`'s pick-then-start). Postgres holds the row lock
+/// until the enclosing transaction ends, so a second caller for the *same* session waits here
+/// while a different session proceeds untouched.
+async fn lock_session<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    session_id: Uuid,
+) -> Result<session::Model, ChatError> {
+    session::Entity::find_by_id(session_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+        .ok_or_else(|| ChatError::InvalidRequest("session vanished".to_owned()))
+}
 
 pub struct TopicManager {
     pub session: SessionManager,
@@ -42,13 +59,52 @@ impl TopicManager {
         input_json: String,
     ) -> Result<(i64, Status), ChatError> {
         let session = self.session.get_or_create_session(user_id).await?;
-        let running = topic::Entity::find()
-            .filter(topic::Column::SessionId.eq(session.id))
-            .filter(topic::Column::Status.eq(Status::Running))
-            .count(&self.session.db)
+        let row = self
+            .insert_topic(session.id, parent_id, title, &input_json)
             .await?;
 
-        let now = Utc::now();
+        self.events.publish(ChatEvent {
+            topic_id: row.id.to_string(),
+            kind: if row.status == Status::Running {
+                "topic_started"
+            } else {
+                "topic_queued"
+            }
+            .to_owned(),
+            occurred_at: row.created_at.to_rfc3339(),
+            ..Default::default()
+        });
+
+        if let (Status::Running, Some(execution_id)) = (row.status, row.execution_id) {
+            self.spawn_watch(row.id, execution_id);
+        }
+
+        Ok((row.id, row.status))
+    }
+
+    /// `create_topic`'s one atomic decision: how many topics are Running, whether this one gets
+    /// a slot, starting its execution if it does, and inserting the row — plus the spec's "the
+    /// first topic in a session becomes focus" rule.
+    ///
+    /// All of it under the session's row lock, because the count and the insert are otherwise
+    /// two unsynchronized statements: concurrent `CreateTopic` calls for one session could each
+    /// see `running < MAX_CONCURRENT_TOPICS` before any of them inserted, and the cap would be
+    /// breached. Every path that changes how many topics are Running takes this same lock.
+    async fn insert_topic(
+        &self,
+        session_id: Uuid,
+        parent_id: Option<i64>,
+        title: String,
+        input_json: &str,
+    ) -> Result<topic::Model, ChatError> {
+        let txn = self.session.db.begin().await?;
+        let locked = lock_session(&txn, session_id).await?;
+        let running = topic::Entity::find()
+            .filter(topic::Column::SessionId.eq(session_id))
+            .filter(topic::Column::Status.eq(Status::Running))
+            .count(&txn)
+            .await?;
+
         let status = if running < MAX_CONCURRENT_TOPICS {
             Status::Running
         } else {
@@ -57,7 +113,7 @@ impl TopicManager {
         let execution_id = if status == Status::Running {
             Some(
                 self.engine
-                    .start_execution(AGENT_GRAPH_ID, &input_json)
+                    .start_execution(AGENT_GRAPH_ID, input_json)
                     .await
                     .map_err(ChatError::Engine)?,
             )
@@ -65,8 +121,9 @@ impl TopicManager {
             None
         };
 
+        let now = Utc::now();
         let row = topic::ActiveModel {
-            session_id: Set(session.id),
+            session_id: Set(session_id),
             parent_id: Set(parent_id),
             title: Set(title),
             status: Set(status),
@@ -77,45 +134,18 @@ impl TopicManager {
             updated_at: Set(now),
             ..Default::default()
         }
-        .insert(&self.session.db)
+        .insert(&txn)
         .await?;
 
-        if session.focus_topic_id.is_none() {
-            self.set_focus_silently(session.id, row.id).await?;
+        // Read off the *locked* row, not an earlier snapshot, so two concurrent first-topic
+        // creations can't both claim focus.
+        if locked.focus_topic_id.is_none() {
+            let mut active: session::ActiveModel = locked.into();
+            active.focus_topic_id = Set(Some(row.id));
+            active.update(&txn).await?;
         }
-
-        self.events.publish(ChatEvent {
-            topic_id: row.id.to_string(),
-            kind: if status == Status::Running {
-                "topic_started".to_owned()
-            } else {
-                "topic_queued".to_owned()
-            }
-            .to_owned(),
-            occurred_at: now.to_rfc3339(),
-            ..Default::default()
-        });
-
-        if let (Status::Running, Some(execution_id)) = (status, execution_id) {
-            self.spawn_watch(row.id, execution_id);
-        }
-
-        Ok((row.id, status))
-    }
-
-    /// Used only by `create_topic` for the "first topic in a session becomes focus" rule (spec)
-    /// — doesn't emit `focus_changed` itself (there was no prior focus to change from). Task 8's
-    /// `set_focus` is the user-facing operation and does emit it.
-    async fn set_focus_silently(&self, session_id: Uuid, topic_id: i64) -> Result<(), ChatError> {
-        use crate::entity::session;
-        let mut active: session::ActiveModel = session::Entity::find_by_id(session_id)
-            .one(&self.session.db)
-            .await?
-            .ok_or(ChatError::InvalidRequest("session vanished".to_owned()))?
-            .into();
-        active.focus_topic_id = Set(Some(topic_id));
-        active.update(&self.session.db).await?;
-        Ok(())
+        txn.commit().await?;
+        Ok(row)
     }
 
     pub async fn set_focus(&self, user_id: Uuid, topic_id: i64) -> Result<(), ChatError> {
@@ -126,7 +156,6 @@ impl TopicManager {
             .filter(|t| t.session_id == session.id)
             .ok_or(ChatError::TopicNotFound(topic_id))?;
 
-        use crate::entity::session;
         let previous = session.focus_topic_id;
         let mut active: session::ActiveModel = session::Entity::find_by_id(session.id)
             .one(&self.session.db)
@@ -159,6 +188,8 @@ impl TopicManager {
             .await?
             .ok_or(ChatError::TopicNotFound(topic_id))?;
 
+        // The dedup check stays up front, so a retry *after* a successful delivery short-circuits
+        // without interrupting the execution a second time.
         use crate::entity::message;
         if message::Entity::find()
             .filter(message::Column::TopicId.eq(topic_id))
@@ -169,16 +200,15 @@ impl TopicManager {
         {
             return Ok(topic_id); // already applied — idempotent no-op
         }
-        message::ActiveModel {
-            topic_id: Set(topic_id),
-            turn_id: Set(turn_id),
-            content: Set(content.clone()),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        }
-        .insert(&self.session.db)
-        .await?;
 
+        // `execution_id` stays set forever once a topic reaches a terminal status, so its
+        // presence says nothing about whether the execution is still there to interrupt. Only a
+        // Running topic can receive a turn; anything else is rejected outright rather than
+        // routed into a doomed Interrupt. (Auto-creating a child topic for a finished one is
+        // the spec's eventual answer and is deliberately out of scope here.)
+        if topic.status != Status::Running {
+            return Err(ChatError::TopicNotRunning(topic_id));
+        }
         let execution_id = topic.execution_id.ok_or(ChatError::InvalidRequest(format!(
             "topic {topic_id} has no running execution to interrupt"
         )))?;
@@ -187,6 +217,19 @@ impl TopicManager {
             .interrupt(execution_id, &input_json)
             .await
             .map_err(ChatError::Engine)?;
+
+        // Only now is the turn actually delivered, so only now is the dedup marker written. The
+        // other order loses the turn for good on a transient Interrupt failure: the client's
+        // documented same-turn_id retry would find the row and report success as a no-op.
+        message::ActiveModel {
+            topic_id: Set(topic_id),
+            turn_id: Set(turn_id),
+            content: Set(content),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&self.session.db)
+        .await?;
         Ok(topic_id)
     }
 
@@ -300,7 +343,60 @@ impl TopicManager {
             ..Default::default()
         });
 
+        if status == Status::Completed {
+            self.move_focus_off_completed(row.session_id, topic_id)
+                .await?;
+        }
         self.promote_next_queued(row.session_id).await
+    }
+
+    /// Spec: «фокусная тема завершилась → фокус переходит на следующую незавершённую» — when the
+    /// focused topic completes, focus moves to the next unfinished topic in the session (oldest
+    /// first, matching `promote_next_queued`'s ordering), or is cleared if none remain.
+    ///
+    /// Completion only. The spec is explicit that a failed or cancelled topic leaves the pointer
+    /// where it is («фокус не меняется», «фокус не трогаем»), and `send_turn` now rejects a turn
+    /// aimed at a finished topic with a clear message rather than misrouting it, so the user is
+    /// told what happened instead of silently losing the reply.
+    async fn move_focus_off_completed(
+        &self,
+        session_id: Uuid,
+        completed_id: i64,
+    ) -> Result<(), ChatError> {
+        let Some(session) = session::Entity::find_by_id(session_id)
+            .one(&self.session.db)
+            .await?
+        else {
+            return Ok(());
+        };
+        if session.focus_topic_id != Some(completed_id) {
+            return Ok(()); // the user was looking at something else; don't move them
+        }
+
+        let next = topic::Entity::find()
+            .filter(topic::Column::SessionId.eq(session_id))
+            .filter(topic::Column::Status.is_in([Status::Running, Status::Queued]))
+            .order_by_asc(topic::Column::CreatedAt)
+            .one(&self.session.db)
+            .await?
+            .map(|topic| topic.id);
+        let mut active: session::ActiveModel = session.into();
+        active.focus_topic_id = Set(next);
+        active.update(&self.session.db).await?;
+
+        self.events.publish(ChatEvent {
+            topic_id: next.map(|id| id.to_string()).unwrap_or_default(),
+            kind: "focus_changed".to_owned(),
+            payload_json: serde_json::json!({
+                "from": completed_id,
+                "to": next,
+                "reason": "completion",
+            })
+            .to_string(),
+            occurred_at: Utc::now().to_rfc3339(),
+            ..Default::default()
+        });
+        Ok(())
     }
 
     /// Called after any topic leaves `Running` — starts the oldest still-`Queued` topic in the
@@ -310,13 +406,22 @@ impl TopicManager {
         self: &std::sync::Arc<Self>,
         session_id: Uuid,
     ) -> Result<(), ChatError> {
+        // Same serialization point as `create_topic`: picking the queued topic and marking it
+        // Running are two statements, and two `finish_topic` calls racing in the same session
+        // would otherwise both pick the same row — starting two Engine executions for one topic
+        // and leaving the second-oldest queued topic behind. Holding the lock across
+        // `start_execution` keeps a network call inside a transaction, which is a smell; at this
+        // scale (one session, one short call) it is the right trade against a two-phase design.
+        let txn = self.session.db.begin().await?;
+        let _locked = lock_session(&txn, session_id).await?;
         let Some(next) = topic::Entity::find()
             .filter(topic::Column::SessionId.eq(session_id))
             .filter(topic::Column::Status.eq(Status::Queued))
             .order_by_asc(topic::Column::CreatedAt)
-            .one(&self.session.db)
+            .one(&txn)
             .await?
         else {
+            txn.commit().await?; // nothing queued — release the session lock right away
             return Ok(());
         };
         // The queued topic's original creation `input_json` (spec's CreateTopicRequest) isn't
@@ -333,7 +438,8 @@ impl TopicManager {
         active.status = Set(Status::Running);
         active.execution_id = Set(Some(execution_id));
         active.updated_at = Set(Utc::now());
-        active.update(&self.session.db).await?;
+        active.update(&txn).await?;
+        txn.commit().await?;
 
         self.events.publish(ChatEvent {
             topic_id: next.id.to_string(),
@@ -387,11 +493,16 @@ mod tests {
         ServiceStream,
     };
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct FakeEngine {
+        /// Every attempt, failed ones included.
         interrupts: Mutex<Vec<InterruptRequest>>,
+        /// How many of the next `interrupt` calls fail — stands in for a transient Engine
+        /// outage, which is the case the turn_id dedup marker must survive.
+        interrupt_failures_remaining: AtomicUsize,
         start_executions: Mutex<Vec<StartExecutionRequest>>,
         /// execution_id (string) -> the one event `stream_events` replays for it. Registered by
         /// tests after a topic's execution_id is known (it's chosen by `start_execution` below).
@@ -430,6 +541,17 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push(request.to_owned_message());
+            if self
+                .interrupt_failures_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(connectrpc::ConnectError::unavailable(
+                    "configured fake engine interrupt failure",
+                ));
+            }
             Response::ok(InterruptResponse::default())
         }
         async fn resume(
@@ -727,6 +849,318 @@ mod tests {
             start_executions_before + 1,
             "promotion must call start_execution on the Engine for the promoted topic"
         );
+    }
+
+    /// Registers the completion (or failure) event `watch_topic` will replay for a topic, and
+    /// returns the topic's `execution_id`.
+    async fn arm_terminal_event(
+        manager: &Arc<TopicManager>,
+        fake: &FakeEngine,
+        topic_id: i64,
+        payload_kind: &str,
+        payload_json: &str,
+    ) -> Uuid {
+        let execution_id = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic")
+            .execution_id
+            .expect("running topic has an execution_id");
+        fake.completions.lock().expect("lock").insert(
+            execution_id.to_string(),
+            ExecutionEvent {
+                id: "e1".to_owned(),
+                execution_id: execution_id.to_string(),
+                payload_kind: payload_kind.to_owned(),
+                payload_json: payload_json.to_owned(),
+                ..Default::default()
+            },
+        );
+        execution_id
+    }
+
+    async fn focus_of(manager: &Arc<TopicManager>, user_id: Uuid) -> Option<i64> {
+        manager
+            .session
+            .get_session_view(user_id)
+            .await
+            .expect("view")
+            .0
+    }
+
+    async fn set_status(manager: &Arc<TopicManager>, topic_id: i64, status: Status) {
+        let mut active: topic::ActiveModel = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic")
+            .into();
+        active.status = Set(status);
+        active.update(&manager.session.db).await.expect("update");
+    }
+
+    /// The finding: `send_turn` only checked that `execution_id` was set, and that column stays
+    /// set forever after a topic finishes — so a turn aimed at a dead focus topic was routed
+    /// into an `Interrupt` on an execution that had already ended. It must be refused instead,
+    /// and refused before any Engine call is made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_for_a_finished_focus_topic_is_refused_rather_than_interrupted() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, _) = manager
+            .create_topic(user_id, None, "First".into(), "{}".into())
+            .await
+            .expect("create");
+        set_status(&manager, topic_id, Status::Completed).await;
+
+        let error = manager
+            .send_turn(user_id, Uuid::new_v4(), "hello".into())
+            .await
+            .expect_err("a completed focus topic must not accept a turn");
+
+        assert!(matches!(error, ChatError::TopicNotRunning(id) if id == topic_id));
+        assert!(
+            fake.interrupts.lock().expect("lock").is_empty(),
+            "no Interrupt may be attempted against a finished execution"
+        );
+        let error: connectrpc::ConnectError = error.into();
+        assert_eq!(error.code, connectrpc::ErrorCode::FailedPrecondition);
+    }
+
+    /// The finding: the dedup row was written before `interrupt` was called, so a transient
+    /// Engine failure lost the turn for good — the client's documented same-`turn_id` retry
+    /// found the row and reported success without ever delivering anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_whose_interrupt_failed_can_be_retried_with_the_same_turn_id() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, _) = manager
+            .create_topic(user_id, None, "First".into(), "{}".into())
+            .await
+            .expect("create");
+        fake.interrupt_failures_remaining
+            .store(1, Ordering::Relaxed);
+        let turn_id = Uuid::new_v4();
+
+        let error = manager
+            .send_turn(user_id, turn_id, "hello".into())
+            .await
+            .expect_err("the first attempt fails inside Engine");
+        assert!(matches!(error, ChatError::Engine(_)));
+
+        use crate::entity::message;
+        let stored = message::Entity::find()
+            .filter(message::Column::TopicId.eq(topic_id))
+            .filter(message::Column::TurnId.eq(turn_id))
+            .all(&manager.session.db)
+            .await
+            .expect("query messages");
+        assert!(
+            stored.is_empty(),
+            "an undelivered turn must leave no dedup marker, or the retry becomes a silent no-op"
+        );
+
+        let routed = manager
+            .send_turn(user_id, turn_id, "hello".into())
+            .await
+            .expect("the retry with the same turn_id must actually deliver");
+
+        assert_eq!(routed, topic_id);
+        assert_eq!(
+            fake.interrupts.lock().expect("lock").len(),
+            2,
+            "the retry must reach Engine, not short-circuit on a marker from the failed attempt"
+        );
+        let stored = message::Entity::find()
+            .filter(message::Column::TopicId.eq(topic_id))
+            .filter(message::Column::TurnId.eq(turn_id))
+            .all(&manager.session.db)
+            .await
+            .expect("query messages");
+        assert_eq!(stored.len(), 1, "exactly one dedup row after the retry");
+    }
+
+    /// The finding: nothing ever moved `session.focus_topic_id` off a topic that finished, so
+    /// the user was left pointed at a dead topic. Spec: «фокусная тема завершилась → фокус
+    /// переходит на следующую незавершённую».
+    #[tokio::test(flavor = "multi_thread")]
+    async fn focus_moves_to_the_next_unfinished_topic_when_the_focused_one_completes() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (first_id, _) = manager
+            .create_topic(user_id, None, "First".into(), "{}".into())
+            .await
+            .expect("create");
+        let (second_id, _) = manager
+            .create_topic(user_id, None, "Second".into(), "{}".into())
+            .await
+            .expect("create");
+        assert_eq!(focus_of(&manager, user_id).await, Some(first_id));
+
+        let execution_id = arm_terminal_event(
+            &manager,
+            &fake,
+            first_id,
+            "ExecutionCompleted",
+            r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#,
+        )
+        .await;
+        manager.watch_topic(first_id, execution_id).await;
+
+        assert_eq!(
+            focus_of(&manager, user_id).await,
+            Some(second_id),
+            "focus must follow on to the next unfinished topic"
+        );
+
+        // …and is cleared once nothing unfinished is left.
+        let execution_id = arm_terminal_event(
+            &manager,
+            &fake,
+            second_id,
+            "ExecutionCompleted",
+            r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"also done"}}}}"#,
+        )
+        .await;
+        manager.watch_topic(second_id, execution_id).await;
+
+        assert_eq!(
+            focus_of(&manager, user_id).await,
+            None,
+            "with no unfinished topic left, focus is cleared"
+        );
+    }
+
+    /// The other half of the spec's focus rule, which is easy to over-apply: a *failed* topic
+    /// keeps the focus where it is («Падение темы: ... фокус не трогаем»). `send_turn`'s
+    /// `failed_precondition` is what tells the user, not a silent pointer move.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_focus_topic_keeps_the_focus_where_it_is() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (first_id, _) = manager
+            .create_topic(user_id, None, "First".into(), "{}".into())
+            .await
+            .expect("create");
+        manager
+            .create_topic(user_id, None, "Second".into(), "{}".into())
+            .await
+            .expect("create");
+
+        let execution_id = arm_terminal_event(
+            &manager,
+            &fake,
+            first_id,
+            "ExecutionFailed",
+            r#"{"ExecutionFailed":{"error":"boom"}}"#,
+        )
+        .await;
+        manager.watch_topic(first_id, execution_id).await;
+
+        assert_eq!(focus_of(&manager, user_id).await, Some(first_id));
+    }
+
+    /// The finding: `COUNT(Running)` and the `INSERT` were two unsynchronized statements, so
+    /// concurrent `CreateTopic` calls for one session could all pass the check before any of
+    /// them committed and blow past the cap. Sequentially this always passed; only real
+    /// concurrency shows it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_create_topic_calls_cannot_exceed_the_running_limit() {
+        let (_test, manager, _fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        // Create the session up front: the race under test is the slot check, not session
+        // creation (which the unique constraint on user_id already serializes).
+        let session_id = manager
+            .session
+            .get_or_create_session(user_id)
+            .await
+            .expect("session")
+            .id;
+
+        let attempts = 2 * MAX_CONCURRENT_TOPICS;
+        let mut tasks = Vec::new();
+        for i in 0..attempts {
+            let manager = Arc::clone(&manager);
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .create_topic(user_id, None, format!("T{i}"), "{}".into())
+                    .await
+                    .expect("create")
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join");
+        }
+
+        let running = topic::Entity::find()
+            .filter(topic::Column::SessionId.eq(session_id))
+            .filter(topic::Column::Status.eq(Status::Running))
+            .count(&manager.session.db)
+            .await
+            .expect("count");
+        assert_eq!(
+            running, MAX_CONCURRENT_TOPICS,
+            "the per-session concurrency cap must hold under concurrent creation"
+        );
+        let total = topic::Entity::find()
+            .filter(topic::Column::SessionId.eq(session_id))
+            .count(&manager.session.db)
+            .await
+            .expect("count");
+        assert_eq!(total, attempts, "every attempt is recorded, queued or not");
+    }
+
+    /// The finding: two topics finishing at once both ran `promote_next_queued`, both selected
+    /// the same oldest `Queued` row, and both started an Engine execution for it — one topic,
+    /// two executions, and the row updated twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_promotions_cannot_start_the_same_queued_topic_twice() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        for i in 0..MAX_CONCURRENT_TOPICS {
+            manager
+                .create_topic(user_id, None, format!("T{i}"), "{}".into())
+                .await
+                .expect("create");
+        }
+        let (queued_id, status) = manager
+            .create_topic(user_id, None, "Overflow".into(), "{}".into())
+            .await
+            .expect("create");
+        assert_eq!(status, Status::Queued);
+        let session_id = manager
+            .session
+            .get_or_create_session(user_id)
+            .await
+            .expect("session")
+            .id;
+        let before = fake.start_executions.lock().expect("lock").len();
+
+        let (first, second) = tokio::join!(
+            {
+                let manager = Arc::clone(&manager);
+                async move { manager.promote_next_queued(session_id).await }
+            },
+            {
+                let manager = Arc::clone(&manager);
+                async move { manager.promote_next_queued(session_id).await }
+            },
+        );
+        first.expect("promote");
+        second.expect("promote");
+
+        assert_eq!(
+            fake.start_executions.lock().expect("lock").len(),
+            before + 1,
+            "the one queued topic must be started exactly once, not once per concurrent promoter"
+        );
+        let promoted = topic::Entity::find_by_id(queued_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic");
+        assert_eq!(promoted.status, Status::Running);
     }
 
     /// Guards the envelope contract on the failure path: Engine sends

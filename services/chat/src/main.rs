@@ -132,7 +132,12 @@ impl ChatService for ChatServiceImpl {
         _request: ServiceRequest<'_, StreamEventsRequest>,
     ) -> ServiceResult<ServiceStream<ChatEvent>> {
         let user_id = require_principal(&ctx)?;
-        let (_, topics) = self.topics.session.get_session_view(user_id).await?;
+        // Subscribe before reading the snapshot, never after — see `subscribe_then_snapshot`.
+        let (live, (_, topics)) = chat::events::subscribe_then_snapshot(
+            &self.topics.events,
+            self.topics.session.get_session_view(user_id),
+        )
+        .await?;
         let snapshot = topics.into_iter().map(|t| {
             Ok(ChatEvent {
                 topic_id: t.id.to_string(),
@@ -147,7 +152,7 @@ impl ChatService for ChatServiceImpl {
                 ..Default::default()
             })
         });
-        let live = tokio_stream::wrappers::BroadcastStream::new(self.topics.events.subscribe())
+        let live = tokio_stream::wrappers::BroadcastStream::new(live)
             .filter_map(|item| async move { item.ok().map(Ok) });
         Response::stream_ok(futures::stream::iter(snapshot).chain(live))
     }

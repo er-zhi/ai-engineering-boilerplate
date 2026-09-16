@@ -6,19 +6,38 @@ use common::proto::engine::v1::{
     StreamEventsRequest,
 };
 use connectrpc::Protocol;
-use connectrpc::client::{ClientConfig, HttpClient};
+use connectrpc::client::{CallOptions, ClientConfig, HttpClient};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// `StreamEvents` needs its own, far longer deadline. A client timeout is a *whole-call*
+/// deadline, and connectrpc enforces it on every frame poll of a streaming call, not just on
+/// connect (`connectrpc::client`'s `poll_body` wraps each frame in `with_deadline`). Under
+/// `CALL_TIMEOUT` any Engine execution running longer than 20s had its event stream cut
+/// mid-flight, so `TopicManager::finish_topic` never ran and the topic stuck at `Running`
+/// forever. `CallOptions` has no "no deadline" setting (an unset per-call timeout just falls
+/// back to the client's default), so this is a long finite bound instead.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(3_600);
 
 pub struct EngineClient {
     inner: EngineServiceClient<HttpClient>,
+    stream_timeout: Duration,
 }
 
 impl EngineClient {
     pub fn new(engine_url: &str) -> Result<Self, String> {
+        Self::with_timeouts(engine_url, CALL_TIMEOUT, STREAM_TIMEOUT)
+    }
+
+    /// `new`, with both deadlines given explicitly — tests use it to drive the gap between the
+    /// short unary timeout and the long streaming one without waiting out the real values.
+    pub fn with_timeouts(
+        engine_url: &str,
+        call_timeout: Duration,
+        stream_timeout: Duration,
+    ) -> Result<Self, String> {
         let target = engine_url
             .parse()
             .map_err(|e| format!("could not parse ENGINE_URL {engine_url:?}: {e}"))?;
@@ -27,9 +46,10 @@ impl EngineClient {
                 HttpClient::plaintext_http2_only(),
                 ClientConfig::new(target)
                     .with_protocol(Protocol::Grpc)
-                    .with_default_timeout(CALL_TIMEOUT)
+                    .with_default_timeout(call_timeout)
                     .proto(),
             ),
+            stream_timeout,
         })
     }
 
@@ -68,11 +88,14 @@ impl EngineClient {
     ) -> Result<mpsc::UnboundedReceiver<ExecutionEvent>, String> {
         let mut stream = self
             .inner
-            .stream_events(StreamEventsRequest {
-                execution_id: Some(execution_id.to_string()),
-                user_id: None,
-                ..Default::default()
-            })
+            .stream_events_with_options(
+                StreamEventsRequest {
+                    execution_id: Some(execution_id.to_string()),
+                    user_id: None,
+                    ..Default::default()
+                },
+                CallOptions::default().with_timeout(self.stream_timeout),
+            )
             .await
             .map_err(|e| e.to_string())?;
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -114,6 +137,21 @@ mod tests {
     struct FakeEngine {
         execution_id: String,
         received_interrupts: Mutex<Vec<InterruptRequest>>,
+        /// How long `stream_events` waits before emitting its one event — stands in for an
+        /// Engine execution that takes a while to finish.
+        stream_delay: Duration,
+    }
+
+    fn fake_engine(execution_id: Uuid) -> Arc<FakeEngine> {
+        fake_engine_delayed(execution_id, Duration::ZERO)
+    }
+
+    fn fake_engine_delayed(execution_id: Uuid, stream_delay: Duration) -> Arc<FakeEngine> {
+        Arc::new(FakeEngine {
+            execution_id: execution_id.to_string(),
+            received_interrupts: Mutex::new(Vec::new()),
+            stream_delay,
+        })
     }
 
     #[allow(refining_impl_trait)]
@@ -172,13 +210,18 @@ mod tests {
             _ctx: RequestContext,
             _request: ServiceRequest<'_, StreamEventsRequest>,
         ) -> ServiceResult<ServiceStream<ExecutionEvent>> {
-            Response::stream_ok(futures::stream::iter([Ok(ExecutionEvent {
+            let event = ExecutionEvent {
                 id: "e1".to_owned(),
                 execution_id: self.execution_id.clone(),
                 payload_kind: "ExecutionCompleted".to_owned(),
                 payload_json: r#"{"final_state":{}}"#.to_owned(),
                 ..Default::default()
-            })]))
+            };
+            let delay = self.stream_delay;
+            Response::stream_ok(futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok(event)
+            }))
         }
         async fn create_schedule(
             &self,
@@ -210,10 +253,7 @@ mod tests {
     #[tokio::test]
     async fn start_execution_returns_the_parsed_execution_id() {
         let execution_id = Uuid::new_v4();
-        let fake = Arc::new(FakeEngine {
-            execution_id: execution_id.to_string(),
-            received_interrupts: Mutex::new(Vec::new()),
-        });
+        let fake = fake_engine(execution_id);
         let url = serve(fake).await;
         let client = EngineClient::new(&url).expect("client");
 
@@ -228,10 +268,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_sends_the_execution_id_and_input() {
         let execution_id = Uuid::new_v4();
-        let fake = Arc::new(FakeEngine {
-            execution_id: execution_id.to_string(),
-            received_interrupts: Mutex::new(Vec::new()),
-        });
+        let fake = fake_engine(execution_id);
         let url = serve(Arc::clone(&fake)).await;
         let client = EngineClient::new(&url).expect("client");
 
@@ -248,10 +285,7 @@ mod tests {
     #[tokio::test]
     async fn stream_events_yields_the_engine_stream() {
         let execution_id = Uuid::new_v4();
-        let fake = Arc::new(FakeEngine {
-            execution_id: execution_id.to_string(),
-            received_interrupts: Mutex::new(Vec::new()),
-        });
+        let fake = fake_engine(execution_id);
         let url = serve(fake).await;
         let client = EngineClient::new(&url).expect("client");
 
@@ -263,5 +297,38 @@ mod tests {
             events.recv().await.is_none(),
             "stream ends cleanly after one event"
         );
+    }
+
+    /// The finding: a client timeout is a whole-call deadline that connectrpc re-applies to
+    /// every frame of a *streaming* call, so an execution outliving the unary timeout had its
+    /// event stream cut before `ExecutionCompleted` ever arrived — leaving the topic `Running`
+    /// forever. The two halves below are the same fake and the same wait; only the streaming
+    /// deadline differs.
+    #[tokio::test]
+    async fn an_execution_outliving_the_unary_timeout_still_delivers_its_completion() {
+        let unary_timeout = Duration::from_millis(200);
+        let slower_than_unary_timeout = Duration::from_secs(1);
+        let execution_id = Uuid::new_v4();
+        let url = serve(fake_engine_delayed(execution_id, slower_than_unary_timeout)).await;
+
+        // The regression, reproduced: the short deadline applied to the streaming call too.
+        let short = EngineClient::with_timeouts(&url, unary_timeout, unary_timeout)
+            .expect("client with a short streaming deadline");
+        let mut cut = short.stream_events(execution_id).await.expect("stream");
+        assert!(
+            cut.recv().await.is_none(),
+            "a streaming deadline shorter than the execution cuts the stream before its \
+             completion event — this is what left topics stuck at Running"
+        );
+
+        // The fix: the streaming call carries its own, much longer deadline.
+        let client = EngineClient::with_timeouts(&url, unary_timeout, Duration::from_secs(30))
+            .expect("client");
+        let mut events = client.stream_events(execution_id).await.expect("stream");
+        let event = events
+            .recv()
+            .await
+            .expect("the completion event must survive a wait longer than the unary timeout");
+        assert_eq!(event.payload_kind, "ExecutionCompleted");
     }
 }

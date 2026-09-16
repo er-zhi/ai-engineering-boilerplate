@@ -11,8 +11,9 @@ pub(super) async fn start_gateway(gateway: Gateway) -> String {
             &gateway,
         ))
         .add_service::<_, common::proto::knowledge_base::v1::KnowledgeBaseServiceRegisterMarker>(
-            gateway,
-        );
+            Arc::clone(&gateway),
+        )
+        .add_service::<_, common::proto::chat::v1::ChatServiceRegisterMarker>(gateway);
     let app = axum::Router::new().fallback_service(connect.into_axum_service());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -24,3 +25,5 @@ pub(super) async fn start_gateway(gateway: Gateway) -> String {
 mod knowledge_base;
 #[path = "crawler.rs"]
 mod crawler;
+#[path = "chat.rs"]
+mod chat;

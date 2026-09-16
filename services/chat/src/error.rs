@@ -9,6 +9,10 @@ pub enum ChatError {
     InvalidRequest(String),
     #[error("topic not found: {0}")]
     TopicNotFound(i64),
+    #[error(
+        "topic {0} has already finished — create a new topic or choose another one with SetFocus"
+    )]
+    TopicNotRunning(i64),
     #[error("no focus topic set")]
     NoFocus,
     #[error("database error: {0}")]
@@ -22,7 +26,9 @@ impl From<ChatError> for ConnectError {
         match &error {
             ChatError::InvalidRequest(_) => ConnectError::invalid_argument(error.to_string()),
             ChatError::TopicNotFound(_) => ConnectError::not_found(error.to_string()),
-            ChatError::NoFocus => ConnectError::failed_precondition(error.to_string()),
+            ChatError::NoFocus | ChatError::TopicNotRunning(_) => {
+                ConnectError::failed_precondition(error.to_string())
+            }
             ChatError::Db(_) | ChatError::Engine(_) => ConnectError::internal(error.to_string()),
         }
     }
