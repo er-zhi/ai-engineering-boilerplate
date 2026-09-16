@@ -334,24 +334,33 @@
     "topic_cancelled", "focus_changed",
   ]);
 
+  // A single malformed or unexpected event must never kill the stream: `StreamEvents` replays
+  // the session's *entire* persisted history on every reconnect, so an uncaught throw here would
+  // die on the same event every time the client reconnects — freezing the transcript forever,
+  // since every later lifecycle event (including the one that would finish a running topic)
+  // never gets a chance to run again. Any failure is logged to the debug panel instead.
   async function renderEvent(event) {
-    debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
-    if (event.kind === "session_reset") {
-      await startOver();
-      return;
-    }
-    if (LIFECYCLE.has(event.kind)) {
-      scheduleReload();
-      return;
-    }
-    let payload = {};
-    try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
-    if (event.kind === "notification") {
-      appendMessage("·", payload.text || payload.kind || "", "notification", titleOf(event.topicId));
-      return;
-    }
-    if (event.kind === "topic_progress") {
-      appendMessage("·", progressText(event.payloadJson), "notification", titleOf(event.topicId));
+    try {
+      debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
+      if (event.kind === "session_reset") {
+        await startOver();
+        return;
+      }
+      if (LIFECYCLE.has(event.kind)) {
+        scheduleReload();
+        return;
+      }
+      let payload = {};
+      try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
+      if (event.kind === "notification") {
+        appendMessage("·", payload.text || payload.kind || "", "notification", titleOf(event.topicId));
+        return;
+      }
+      if (event.kind === "topic_progress") {
+        appendMessage("·", progressText(event.payloadJson), "notification", titleOf(event.topicId));
+      }
+    } catch (err) {
+      debugLine("err", `render ${event.kind}`, err.message);
     }
   }
 
