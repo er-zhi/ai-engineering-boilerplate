@@ -309,15 +309,9 @@ impl TopicManager {
                     .map(str::to_owned)
             });
 
-        let mut active: topic::ActiveModel = topic::Entity::find_by_id(topic_id)
-            .one(&self.session.db)
-            .await?
-            .ok_or(ChatError::TopicNotFound(topic_id))?
-            .into();
-        active.status = Set(status);
-        active.result_summary = Set(summary.clone());
-        active.updated_at = Set(Utc::now());
-        let row = active.update(&self.session.db).await?;
+        let (row, focus_change) = self
+            .update_topic_status_and_move_focus(topic_id, status, summary.clone())
+            .await?;
 
         let kind = if status == Status::Completed {
             "topic_completed"
@@ -343,11 +337,72 @@ impl TopicManager {
             ..Default::default()
         });
 
-        if status == Status::Completed {
-            self.move_focus_off_completed(row.session_id, topic_id)
-                .await?;
+        if let Some((next, from)) = focus_change {
+            self.events.publish(ChatEvent {
+                topic_id: next.map(|id| id.to_string()).unwrap_or_default(),
+                kind: "focus_changed".to_owned(),
+                payload_json: serde_json::json!({
+                    "from": from,
+                    "to": next,
+                    "reason": "completion",
+                })
+                .to_string(),
+                occurred_at: Utc::now().to_rfc3339(),
+                ..Default::default()
+            });
         }
+
         self.promote_next_queued(row.session_id).await
+    }
+
+    /// `finish_topic`'s one atomic decision: mark the topic terminal and, when it was the
+    /// completing topic's completion and it held focus, move focus off it — both under the
+    /// session's row lock, the same serialization point `create_topic` and `promote_next_queued`
+    /// use.
+    ///
+    /// Without that lock, `move_focus_off_completed`'s select-next + update-focus could
+    /// interleave with a sibling topic's own status commit (two `finish_topic` calls racing) or
+    /// with a concurrent `create_topic` committing a new topic between the select and the write —
+    /// leaving focus dangling on a finished topic, or cleared while an unfinished topic exists.
+    /// Joining the focus move into this same transaction (rather than opening a second one, which
+    /// `finish_topic` didn't have to begin with — its status update ran in plain autocommit)
+    /// avoids a second round trip and the window that would otherwise sit between them.
+    async fn update_topic_status_and_move_focus(
+        &self,
+        topic_id: i64,
+        status: Status,
+        summary: Option<String>,
+    ) -> Result<(topic::Model, Option<(Option<i64>, i64)>), ChatError> {
+        // `session_id` is immutable once a topic is created (nothing ever reassigns a topic to a
+        // different session), so this unlocked read is safe — it's only used to know which
+        // session row to lock next.
+        let session_id = topic::Entity::find_by_id(topic_id)
+            .one(&self.session.db)
+            .await?
+            .ok_or(ChatError::TopicNotFound(topic_id))?
+            .session_id;
+
+        let txn = self.session.db.begin().await?;
+        let locked_session = lock_session(&txn, session_id).await?;
+
+        let mut active: topic::ActiveModel = topic::Entity::find_by_id(topic_id)
+            .one(&txn)
+            .await?
+            .ok_or(ChatError::TopicNotFound(topic_id))?
+            .into();
+        active.status = Set(status);
+        active.result_summary = Set(summary);
+        active.updated_at = Set(Utc::now());
+        let row = active.update(&txn).await?;
+
+        let focus_change = if status == Status::Completed {
+            self.move_focus_off_completed(&txn, locked_session, topic_id)
+                .await?
+        } else {
+            None
+        };
+        txn.commit().await?;
+        Ok((row, focus_change))
     }
 
     /// Spec: «фокусная тема завершилась → фокус переходит на следующую незавершённую» — when the
@@ -358,45 +413,37 @@ impl TopicManager {
     /// where it is («фокус не меняется», «фокус не трогаем»), and `send_turn` now rejects a turn
     /// aimed at a finished topic with a clear message rather than misrouting it, so the user is
     /// told what happened instead of silently losing the reply.
-    async fn move_focus_off_completed(
+    ///
+    /// Called from within `finish_topic`'s locked transaction, on the session row it already
+    /// holds exclusively (`session` here is that locked row, not a fresh read) — so this
+    /// select-next-unfinished + update-focus sequence can't race a concurrent `create_topic`
+    /// (which takes the same lock before deciding whether to claim focus for a brand-new
+    /// session) or a sibling topic's own `finish_topic` call for this session. Returns
+    /// `Some((next, from))` for the caller to publish as `focus_changed` once the transaction
+    /// commits, or `None` if the session wasn't focused on `completed_id` to begin with (the
+    /// user had already looked away, so there's nothing to move).
+    async fn move_focus_off_completed<C: sea_orm::ConnectionTrait>(
         &self,
-        session_id: Uuid,
+        txn: &C,
+        session: session::Model,
         completed_id: i64,
-    ) -> Result<(), ChatError> {
-        let Some(session) = session::Entity::find_by_id(session_id)
-            .one(&self.session.db)
-            .await?
-        else {
-            return Ok(());
-        };
+    ) -> Result<Option<(Option<i64>, i64)>, ChatError> {
         if session.focus_topic_id != Some(completed_id) {
-            return Ok(()); // the user was looking at something else; don't move them
+            return Ok(None); // the user was looking at something else; don't move them
         }
 
         let next = topic::Entity::find()
-            .filter(topic::Column::SessionId.eq(session_id))
+            .filter(topic::Column::SessionId.eq(session.id))
             .filter(topic::Column::Status.is_in([Status::Running, Status::Queued]))
             .order_by_asc(topic::Column::CreatedAt)
-            .one(&self.session.db)
+            .one(txn)
             .await?
             .map(|topic| topic.id);
         let mut active: session::ActiveModel = session.into();
         active.focus_topic_id = Set(next);
-        active.update(&self.session.db).await?;
+        active.update(txn).await?;
 
-        self.events.publish(ChatEvent {
-            topic_id: next.map(|id| id.to_string()).unwrap_or_default(),
-            kind: "focus_changed".to_owned(),
-            payload_json: serde_json::json!({
-                "from": completed_id,
-                "to": next,
-                "reason": "completion",
-            })
-            .to_string(),
-            occurred_at: Utc::now().to_rfc3339(),
-            ..Default::default()
-        });
-        Ok(())
+        Ok(Some((next, completed_id)))
     }
 
     /// Called after any topic leaves `Running` — starts the oldest still-`Queued` topic in the
@@ -1161,6 +1208,75 @@ mod tests {
             .expect("query")
             .expect("topic");
         assert_eq!(promoted.status, Status::Running);
+    }
+
+    /// Builds the terminal event `finish_topic` needs to complete a topic; the `execution_id`
+    /// inside it is irrelevant to `finish_topic` (it only reads `payload_kind`/`payload_json`),
+    /// so each call gets a fresh one rather than needing the caller to look one up.
+    fn completed_event() -> ExecutionEvent {
+        ExecutionEvent {
+            id: "e1".to_owned(),
+            execution_id: Uuid::new_v4().to_string(),
+            payload_kind: "ExecutionCompleted".to_owned(),
+            payload_json: r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#
+                .to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// The finding the re-reviewer caught after Fixes 6 and 7 (which locked `create_topic` and
+    /// `promote_next_queued`): `move_focus_off_completed` ran its select-next-unfinished +
+    /// update-focus sequence outside any lock, so a concurrent `create_topic` for the same
+    /// session could commit a brand-new topic *between* that select and that update — the
+    /// "mirror case" from the finding: focus ends up cleared (or stale) even though an unfinished
+    /// topic exists, because the select ran before the new topic existed and the write landed
+    /// after.
+    ///
+    /// This is exactly the same kind of real-network-timing race Fix 6's test caught (see
+    /// `.superpowers/sdd/2026-09-15-chat-service/task-12-gate-fix-report.md`) — and, like Fix 7's
+    /// honest caveat there, a single trial is not guaranteed to land in the narrow window. Run
+    /// many independent trials and assert the invariant holds in every one: with the session
+    /// properly locked across both operations, the outcome is deterministic (focus always lands
+    /// on the one remaining unfinished topic), so this test does not flake on a fix that works —
+    /// a single missed lock should make at least one of these iterations fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_focus_off_completed_cannot_race_a_concurrent_create_topic() {
+        let (_test, manager, _fake) = manager_with().await;
+
+        for i in 0..25 {
+            let user_id = Uuid::new_v4();
+            let (focus_id, status) = manager
+                .create_topic(user_id, None, format!("Focus{i}"), "{}".into())
+                .await
+                .expect("create focus topic");
+            assert_eq!(status, Status::Running);
+
+            let finisher = Arc::clone(&manager);
+            let creator = Arc::clone(&manager);
+            let (finish_result, create_result) = tokio::join!(
+                async move {
+                    finisher
+                        .finish_topic(focus_id, Status::Completed, &completed_event())
+                        .await
+                },
+                async move {
+                    creator
+                        .create_topic(user_id, None, format!("Sibling{i}"), "{}".into())
+                        .await
+                },
+            );
+            finish_result.expect("finish_topic");
+            let (sibling_id, sibling_status) = create_result.expect("create sibling topic");
+            assert_eq!(sibling_status, Status::Running);
+
+            let focus = focus_of(&manager, user_id).await;
+            assert_eq!(
+                focus,
+                Some(sibling_id),
+                "iteration {i}: focus must land on the only unfinished topic (the sibling), \
+                 not be lost to the create_topic race"
+            );
+        }
     }
 
     /// Guards the envelope contract on the failure path: Engine sends
