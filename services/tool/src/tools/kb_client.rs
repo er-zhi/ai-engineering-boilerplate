@@ -211,3 +211,81 @@ mod tests {
         assert_eq!(content, "Full document text.");
     }
 }
+
+// Exposes a fake knowledge-base server under `feature = "test-support"` (not `cfg(test)`)
+// because Task 10's tests live in a different module (`service.rs`) and need to call
+// `crate::tools::kb_client::tests_support::serve_kb()` from outside this module's own test module.
+#[cfg(feature = "test-support")]
+pub mod tests_support {
+    use std::sync::Arc;
+
+    use common::proto::knowledge_base::v1::{
+        DocumentRef, IngestRequest, IngestResponse, KnowledgeBaseService, ReadDocumentRequest,
+        ReadDocumentResponse, SearchRequest, SearchResponse, SearchResult,
+    };
+    use connectrpc::{
+        RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
+    };
+
+    struct FakeKnowledgeBase;
+
+    #[allow(refining_impl_trait)]
+    impl KnowledgeBaseService for FakeKnowledgeBase {
+        async fn search(
+            &self,
+            _ctx: RequestContext,
+            _request: ServiceRequest<'_, SearchRequest>,
+        ) -> ServiceResult<SearchResponse> {
+            Response::ok(SearchResponse {
+                results: vec![SearchResult {
+                    source: "academy.claude.com".to_owned(),
+                    source_id: "/courses/x".to_owned(),
+                    title: "X".to_owned(),
+                    snippet: "x".to_owned(),
+                    document: DocumentRef {
+                        source: "academy.claude.com".to_owned(),
+                        source_id: "/courses/x".to_owned(),
+                        version: "v1".to_owned(),
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        }
+
+        async fn read_document(
+            &self,
+            _ctx: RequestContext,
+            _request: ServiceRequest<'_, ReadDocumentRequest>,
+        ) -> ServiceResult<ReadDocumentResponse> {
+            Response::ok(ReadDocumentResponse {
+                content: "content".to_owned(),
+                ..Default::default()
+            })
+        }
+
+        async fn ingest(
+            &self,
+            _ctx: RequestContext,
+            _request: ServiceRequest<'_, IngestRequest>,
+        ) -> ServiceResult<IngestResponse> {
+            Response::ok(IngestResponse::default())
+        }
+    }
+
+    /// A fake knowledge-base server for tests outside this module that just need `Service::new`
+    /// to have somewhere to point — not a source of test assertions itself (Task 8's own tests
+    /// already cover mapping correctness).
+    pub async fn serve_kb() -> String {
+        let connect = ConnectRouter::new().add_service(Arc::new(FakeKnowledgeBase));
+        let app = axum::Router::new().fallback_service(connect.into_axum_service());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}")
+    }
+}

@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 use crate::entity::tool::{ActiveModel, Entity, Risk, Status};
 use crate::error::ToolError;
+use crate::providers::brave::{BraveSearchProvider, SearchProvider};
+use crate::tools::kb_client::KnowledgeBaseClient;
 
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
 const VALIDATE_SYSTEM_PROMPT: &str = r#"You validate a tool definition against 2026 API design standards. You will be given a tool's name, description, JSON Schema input_schema, JSON Schema output_schema, risk level, and timeout_seconds. Respond with exactly this JSON and nothing else: {"approved": true or false, "feedback": "one or two sentences"}. Approve only if input_schema and output_schema are each a plausible JSON Schema object, description clearly states what the tool does (and, for risk "write" or "destructive", what it changes), and timeout_seconds is between 1 and 300."#;
@@ -25,10 +27,18 @@ const VALIDATE_SYSTEM_PROMPT: &str = r#"You validate a tool definition against 2
 pub struct Service {
     db: DatabaseConnection,
     llm: LlmRouterServiceClient<HttpClient>,
+    search: BraveSearchProvider,
+    http: reqwest::Client,
+    kb: KnowledgeBaseClient,
 }
 
 impl Service {
-    pub fn new(db: DatabaseConnection, llm_router_url: &str) -> Result<Self, String> {
+    pub fn new(
+        db: DatabaseConnection,
+        llm_router_url: &str,
+        brave_api_key: String,
+        knowledge_base_url: &str,
+    ) -> Result<Self, String> {
         let target = llm_router_url
             .parse()
             .map_err(|e| format!("could not parse LLM_ROUTER_URL {llm_router_url:?}: {e}"))?;
@@ -41,6 +51,9 @@ impl Service {
                     .with_default_timeout(VALIDATE_TIMEOUT)
                     .proto(),
             ),
+            search: BraveSearchProvider::new(brave_api_key),
+            http: reqwest::Client::new(),
+            kb: KnowledgeBaseClient::new(knowledge_base_url)?,
         })
     }
 
@@ -179,6 +192,140 @@ impl Service {
             .await?
             .ok_or(ToolError::NotFound(tool_id))
     }
+
+    pub async fn execute(
+        &self,
+        caller: Option<Uuid>,
+        slug: &str,
+        input_json: &str,
+        idempotency_key: &str,
+    ) -> Result<ExecuteOutcome, ToolError> {
+        tracing::debug!(
+            idempotency_key,
+            slug,
+            "tool execute (key logged, not enforced — no destructive side effect here yet, see the spec's Порты-equivalent note)"
+        );
+        let Some(tool) = self.find_tool(caller, slug).await? else {
+            return Ok(ExecuteOutcome::Error(format!("no tool with slug {slug:?}")));
+        };
+        if crate::policy::check_policy(tool.risk) == crate::policy::PolicyDecision::RequiresApproval
+        {
+            return Ok(ExecuteOutcome::RequiresApproval);
+        }
+        let input: Value = serde_json::from_str(input_json)
+            .map_err(|e| ToolError::InvalidRequest(e.to_string()))?;
+        self.run_system_tool(slug, &input).await
+    }
+
+    async fn find_tool(
+        &self,
+        caller: Option<Uuid>,
+        slug: &str,
+    ) -> Result<Option<crate::entity::tool::Model>, ToolError> {
+        if let Some(user_id) = caller {
+            let own = Entity::find()
+                .filter(crate::entity::tool::Column::UserId.eq(user_id))
+                .filter(crate::entity::tool::Column::Slug.eq(slug))
+                .one(&self.db)
+                .await?;
+            if own.is_some() {
+                return Ok(own);
+            }
+        }
+        Ok(Entity::find()
+            .filter(crate::entity::tool::Column::UserId.is_null())
+            .filter(crate::entity::tool::Column::Slug.eq(slug))
+            .one(&self.db)
+            .await?)
+    }
+
+    // Split by slug into one small helper per system tool (rather than one long match arm body)
+    // purely to stay under this workspace's clippy::too_many_lines — semantically this is still
+    // exactly the four-way dispatch the brief lays out.
+    async fn run_system_tool(
+        &self,
+        slug: &str,
+        input: &Value,
+    ) -> Result<ExecuteOutcome, ToolError> {
+        match slug {
+            crate::slugs::WEB_SEARCH => self.run_web_search(input).await,
+            crate::slugs::WEB_FETCH => self.run_web_fetch(input).await,
+            crate::slugs::KB_SEARCH => self.run_kb_search(input).await,
+            crate::slugs::KB_READ_DOCUMENT => self.run_kb_read_document(input).await,
+            other => Ok(ExecuteOutcome::NotExecutable(format!(
+                "tool {other:?} has no runnable implementation yet — user-created tools need Integrations Service"
+            ))),
+        }
+    }
+
+    async fn run_web_search(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
+        let (query, limit) = query_and_limit(input);
+        Ok(match self.search.search(query, limit).await {
+            Ok(results) => ExecuteOutcome::Ok(serde_json::to_value(results)?),
+            Err(error) => ExecuteOutcome::Error(error),
+        })
+    }
+
+    async fn run_web_fetch(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
+        let url = input.get("url").and_then(Value::as_str).unwrap_or_default();
+        Ok(
+            match crate::tools::web_fetch::fetch(&self.http, url).await {
+                Ok(page) => ExecuteOutcome::Ok(serde_json::to_value(page)?),
+                Err(error) => ExecuteOutcome::Error(error),
+            },
+        )
+    }
+
+    async fn run_kb_search(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
+        let (query, limit) = query_and_limit(input);
+        Ok(match self.kb.search(query, limit).await {
+            Ok(results) => ExecuteOutcome::Ok(serde_json::to_value(results)?),
+            Err(error) => ExecuteOutcome::Error(error),
+        })
+    }
+
+    async fn run_kb_read_document(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
+        let source = input
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let source_id = input
+            .get("source_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let version = input
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(
+            match self.kb.read_document(source, source_id, version).await {
+                Ok(content) => ExecuteOutcome::Ok(serde_json::json!({"content": content})),
+                Err(error) => ExecuteOutcome::Error(error),
+            },
+        )
+    }
+}
+
+/// Shared by `run_web_search` and `run_kb_search`: both slugs take the same `{query, limit}`
+/// shape, `limit` defaulting to 5 and capped at 20.
+fn query_and_limit(input: &Value) -> (&str, u8) {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(5, |v| u8::try_from(Ord::min(v, 20)).unwrap_or(20));
+    (query, limit)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecuteOutcome {
+    Ok(Value),
+    RequiresApproval,
+    NotExecutable(String),
+    Error(String),
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -234,7 +381,25 @@ mod tests {
 
     async fn service_with(llm_url: &str) -> (crate::test_db::TestDb, Service) {
         let test = crate::test_db::start().await;
-        let service = Service::new(test.db.clone(), llm_url).expect("service");
+        let service = Service::new(
+            test.db.clone(),
+            llm_url,
+            "unused-in-these-tests".to_owned(),
+            "http://127.0.0.1:1",
+        )
+        .expect("service");
+        (test, service)
+    }
+
+    async fn full_service_with(llm_url: &str, kb_url: &str) -> (crate::test_db::TestDb, Service) {
+        let test = crate::test_db::start().await;
+        let service = Service::new(
+            test.db.clone(),
+            llm_url,
+            "unused-in-these-tests".to_owned(),
+            kb_url,
+        )
+        .expect("service");
         (test, service)
     }
 
@@ -385,5 +550,112 @@ mod tests {
         let seen_by_stranger = service.list_tools(Some(stranger)).await.expect("list");
 
         assert!(seen_by_stranger.iter().all(|t| t.slug != "mine"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_on_a_read_only_system_tool_runs_it() {
+        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let (_test, service) = full_service_with(&llm_url, &kb_url).await;
+        seed_system_tools(&service).await;
+
+        let outcome = service
+            .execute(
+                None,
+                crate::slugs::KB_SEARCH,
+                r#"{"query": "borrow checker"}"#,
+                "e:kb_search:0",
+            )
+            .await
+            .expect("execute");
+
+        assert!(matches!(outcome, ExecuteOutcome::Ok(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_on_an_unregistered_slug_is_an_error() {
+        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let (_test, service) = full_service_with(&llm_url, &kb_url).await;
+
+        let outcome = service
+            .execute(None, "nonexistent", "{}", "e:x:0")
+            .await
+            .expect("execute");
+
+        assert!(matches!(outcome, ExecuteOutcome::Error(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_on_a_write_tool_requires_approval_without_running_it() {
+        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let (_test, service) = full_service_with(&llm_url, &kb_url).await;
+        let user_id = Uuid::new_v4();
+        service
+            .create_tool(
+                Some(user_id),
+                "send_email".into(),
+                "Send Email".into(),
+                "Sends an email".into(),
+                json!({}),
+                json!({}),
+                Risk::Write,
+                30,
+            )
+            .await
+            .expect("create");
+
+        let outcome = service
+            .execute(Some(user_id), "send_email", "{}", "e:mail:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(outcome, ExecuteOutcome::RequiresApproval);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_on_a_user_created_tool_is_not_executable() {
+        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let (_test, service) = full_service_with(&llm_url, &kb_url).await;
+        let user_id = Uuid::new_v4();
+        service
+            .create_tool(
+                Some(user_id),
+                "custom_thing".into(),
+                "Custom".into(),
+                "d".into(),
+                json!({}),
+                json!({}),
+                Risk::ReadOnly,
+                30,
+            )
+            .await
+            .expect("create");
+
+        let outcome = service
+            .execute(Some(user_id), "custom_thing", "{}", "e:c:0")
+            .await
+            .expect("execute");
+
+        assert!(matches!(outcome, ExecuteOutcome::NotExecutable(_)));
+    }
+
+    async fn seed_system_tools(service: &Service) {
+        // Mirrors Task 11's real seeding, scoped to just what Task 10's tests need.
+        service
+            .create_tool(
+                None, // system tool — create_tool takes Option<Uuid> exactly so this is expressible
+                crate::slugs::KB_SEARCH.into(),
+                "Knowledge base search".into(),
+                "Searches the knowledge base".into(),
+                json!({"type": "object"}),
+                json!({"type": "object"}),
+                Risk::ReadOnly,
+                30,
+            )
+            .await
+            .expect("seed kb_search");
     }
 }

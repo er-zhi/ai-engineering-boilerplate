@@ -6,6 +6,7 @@ pub mod error;
 pub mod policy;
 pub mod providers;
 pub mod service;
+pub mod slugs;
 #[cfg(feature = "test-support")]
 pub mod test_db;
 pub mod tools;
