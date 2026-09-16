@@ -172,7 +172,11 @@ pub fn agent_graph() -> Graph {
         .task(
             "llm",
             "llm",
-            serde_json::json!({"state_key": "llm", "reducer": "Replace"}),
+            // tool_calling: true is what makes the Dispatcher (services/engine/src/dispatch.rs)
+            // inject the live tool catalog into this node's prompt before each call — without
+            // it the llm/tool loop below is structurally wired but the model never learns any
+            // tool exists to call.
+            serde_json::json!({"state_key": "llm", "reducer": "Replace", "tool_calling": true}),
         )
         // Append, not Replace: a topic can call more than one tool across loop iterations (the
         // day's own scenario asks for one integration call and one kb_search/web_search per

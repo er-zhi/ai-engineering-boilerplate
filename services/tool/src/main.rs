@@ -13,7 +13,10 @@ use common::proto::tools::v1::{
 use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
 };
-use sea_orm::{ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database, EntityTrait,
+    QueryFilter,
+};
 
 use tool::entity::tool::{Entity, INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC, Risk, Status};
 use tool::service::{ExecuteOutcome, Service};
@@ -238,22 +241,78 @@ async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) 
         if exists {
             continue;
         }
-        match service
-            .create_tool(
-                None,
-                slug.to_owned(),
-                name.to_owned(),
-                description.to_owned(),
-                serde_json::json!({"type": "object"}),
-                serde_json::json!({"type": "object"}),
-                risk,
-                30,
-            )
-            .await
-        {
-            Ok(_) => tracing::info!(slug, "seeded system tool"),
-            Err(error) => tracing::error!(slug, %error, "failed to seed system tool"),
+        seed_one_system_tool(service, db, slug, name, description, risk).await;
+    }
+}
+
+/// System tools are pre-vetted Rust implementations, not user-submitted schemas — they skip the
+/// Draft -> Validated LLM-review step and go straight to Active.
+async fn seed_one_system_tool(
+    service: &Service,
+    db: &sea_orm::DatabaseConnection,
+    slug: &str,
+    name: &str,
+    description: &str,
+    risk: Risk,
+) {
+    match create_and_activate_system_tool(service, db, slug, name, description, risk).await {
+        Ok(()) => tracing::info!(slug, "seeded system tool"),
+        Err(error) => tracing::error!(slug, %error, "failed to seed system tool"),
+    }
+}
+
+async fn create_and_activate_system_tool(
+    service: &Service,
+    db: &sea_orm::DatabaseConnection,
+    slug: &str,
+    name: &str,
+    description: &str,
+    risk: Risk,
+) -> Result<(), String> {
+    let tool_id = service
+        .create_tool(
+            None,
+            slug.to_owned(),
+            name.to_owned(),
+            description.to_owned(),
+            serde_json::json!({"type": "object"}),
+            serde_json::json!({"type": "object"}),
+            risk,
+            30,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let row = Entity::find_by_id(tool_id)
+        .one(db)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "row vanished before activation".to_owned())?;
+    let mut active: tool::entity::tool::ActiveModel = row.into();
+    active.status = Set(Status::Active);
+    active.update(db).await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// sea-orm's schema-sync (2.0.3) always drops an unmatched Postgres unique index via
+/// `ALTER TABLE ... DROP CONSTRAINT`, assuming it's constraint-owned — but `tools_owner_slug_idx`
+/// is a plain `CREATE UNIQUE INDEX` (the manual COALESCE-based escape hatch this entity's own
+/// header comment documents; SeaORM's `unique_key` can't express it). Postgres rejects DROP
+/// CONSTRAINT on a plain index (42704 "constraint ... does not exist"), which otherwise crashes
+/// this service on every restart after the index first exists. The index itself is untouched by
+/// the failed drop; the caller re-asserts it unconditionally right after this call, so it's safe
+/// to ignore specifically this known error and continue.
+async fn sync_schema(db: &sea_orm::DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
+    match db.get_schema_registry("tool::entity::*").sync(db).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("tools_owner_slug_idx") => {
+            tracing::warn!(
+                %error,
+                "schema-sync tried to drop the manual unique index via DROP CONSTRAINT \
+                 (known sea-orm limitation, see sync_schema's doc comment) — ignoring"
+            );
+            Ok(())
         }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -263,7 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = env("DATABASE_URL")?;
     let db = Database::connect(&database_url).await?;
-    db.get_schema_registry("tool::entity::*").sync(&db).await?;
+    sync_schema(&db).await?;
     for statement in INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC {
         db.execute_unprepared(statement).await?;
     }
