@@ -204,9 +204,20 @@ impl TopicManager {
             }
         };
         while let Some(event) = events.recv().await {
-            if let Err(error) = self.handle_engine_event(topic_id, &event).await {
-                tracing::error!(topic_id, %error, "failed to handle an Engine event");
-            }
+            self.handle_engine_event_logged(topic_id, &event).await;
+        }
+    }
+
+    /// `watch_topic`'s per-event step. Split out of the loop body so a failed event doesn't
+    /// abort the stream: there is no caller to propagate to (the watcher is a background task),
+    /// so the error is logged and the next event is taken.
+    async fn handle_engine_event_logged(
+        self: &std::sync::Arc<Self>,
+        topic_id: i64,
+        event: &common::proto::engine::v1::ExecutionEvent,
+    ) {
+        if let Err(error) = self.handle_engine_event(topic_id, event).await {
+            tracing::error!(topic_id, %error, "failed to handle an Engine event");
         }
     }
 
@@ -237,16 +248,20 @@ impl TopicManager {
         status: Status,
         event: &common::proto::engine::v1::ExecutionEvent,
     ) -> Result<(), ChatError> {
+        // Engine puts the whole externally-tagged envelope into `payload_json` — e.g.
+        // `{"ExecutionCompleted": {"final_state": ..}}` — and repeats the outer key in
+        // `payload_kind` (see services/engine/src/stream.rs::row_to_proto). Unwrap that envelope
+        // before reading the body; reading `final_state`/`error` off the top level always misses.
         let payload: serde_json::Value =
             serde_json::from_str(&event.payload_json).unwrap_or(serde_json::Value::Null);
-        let summary = payload
+        let body = payload.get(event.payload_kind.as_str()).unwrap_or(&payload);
+        let summary = body
             .get("final_state")
             .and_then(|state| state.pointer("/llm/reply"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .or_else(|| {
-                payload
-                    .get("error")
+                body.get("error")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             });
@@ -677,7 +692,10 @@ mod tests {
                 id: "e1".to_owned(),
                 execution_id: execution_id.to_string(),
                 payload_kind: "ExecutionCompleted".to_owned(),
-                payload_json: r#"{"final_state":{"llm":{"reply":"done"}}}"#.to_owned(),
+                // The real Engine's envelope shape, verbatim (stream.rs::row_to_proto sends the
+                // whole externally-tagged payload, not the inner body).
+                payload_json: r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#
+                    .to_owned(),
                 ..Default::default()
             },
         );
@@ -708,6 +726,50 @@ mod tests {
             start_executions_after,
             start_executions_before + 1,
             "promotion must call start_execution on the Engine for the promoted topic"
+        );
+    }
+
+    /// Guards the envelope contract on the failure path: Engine sends
+    /// `{"ExecutionFailed":{"error": ..}}`, and that error text must land in `result_summary`
+    /// rather than being silently dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_execution_records_the_engine_error_as_the_summary() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, _) = manager
+            .create_topic(user_id, None, "Rust news".into(), "{}".into())
+            .await
+            .expect("create");
+        let execution_id = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic")
+            .execution_id
+            .expect("running topic has an execution_id");
+        fake.completions.lock().expect("lock").insert(
+            execution_id.to_string(),
+            ExecutionEvent {
+                id: "e1".to_owned(),
+                execution_id: execution_id.to_string(),
+                payload_kind: "ExecutionFailed".to_owned(),
+                payload_json: r#"{"ExecutionFailed":{"error":"brave search returned 422"}}"#
+                    .to_owned(),
+                ..Default::default()
+            },
+        );
+
+        manager.watch_topic(topic_id, execution_id).await;
+
+        let finished = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic");
+        assert_eq!(finished.status, Status::Failed);
+        assert_eq!(
+            finished.result_summary,
+            Some("brave search returned 422".to_owned())
         );
     }
 }

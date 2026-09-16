@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use chat::entity::topic::Status;
-use chat::error::ChatError;
 use chat::topic_manager::TopicManager;
 use common::proto::chat::v1::{
     ChatEvent, ChatService, CreateTopicRequest, CreateTopicResponse, GetSessionRequest,
@@ -108,12 +107,7 @@ impl ChatService for ChatServiceImpl {
         _request: ServiceRequest<'_, GetSessionRequest>,
     ) -> ServiceResult<GetSessionResponse> {
         let user_id = require_principal(&ctx)?;
-        let (focus_topic_id, topics) = self
-            .topics
-            .session
-            .get_session_view(user_id)
-            .await
-            .map_err(ChatError::from)?;
+        let (focus_topic_id, topics) = self.topics.session.get_session_view(user_id).await?;
         Response::ok(GetSessionResponse {
             focus_topic_id: focus_topic_id.map(|id| id.to_string()),
             topics: topics
@@ -138,12 +132,7 @@ impl ChatService for ChatServiceImpl {
         _request: ServiceRequest<'_, StreamEventsRequest>,
     ) -> ServiceResult<ServiceStream<ChatEvent>> {
         let user_id = require_principal(&ctx)?;
-        let (_, topics) = self
-            .topics
-            .session
-            .get_session_view(user_id)
-            .await
-            .map_err(ChatError::from)?;
+        let (_, topics) = self.topics.session.get_session_view(user_id).await?;
         let snapshot = topics.into_iter().map(|t| {
             Ok(ChatEvent {
                 topic_id: t.id.to_string(),
