@@ -1,0 +1,206 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Chat</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; display: flex; gap: 1.5rem; }
+  .logout { position: absolute; top: 2rem; right: 1rem; }
+  .logout button { background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  aside { width: 16rem; flex-shrink: 0; }
+  aside h2 { font-size: 0.9rem; color: #666; margin: 0 0 .5rem; }
+  .topic-row { padding: .5rem; border-radius: 4px; cursor: pointer; margin-bottom: .25rem; }
+  .topic-row:hover { background: #f4f4f4; }
+  .topic-row.focus { background: #eef; font-weight: 600; }
+  .topic-row .status { color: #666; font-size: .8em; }
+  #newTopic { width: 100%; margin-top: .5rem; padding: .5rem; cursor: pointer; }
+  #transcript { flex: 1; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; padding: .75rem; margin-bottom: .75rem; min-height: 20rem; }
+  .msg { padding: .4rem 0; border-bottom: 1px solid #f4f4f4; }
+  .msg.notification { color: #444; font-style: italic; }
+  .msg .kind { color: #999; font-size: .75em; }
+  form#sendForm { display: flex; gap: .5rem; }
+  #content { flex: 1; padding: .5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }
+  button { padding: .5rem 1.2rem; font: inherit; cursor: pointer; }
+  .error { color: #b00; }
+</style>
+
+<form class="logout" method="post" action="/logout"><button type="submit">Log out</button></form>
+
+<main>
+  <h1>Chat</h1>
+  <div id="transcript"></div>
+  <form id="sendForm">
+    <input id="content" placeholder="Ask something…" autofocus>
+    <button type="submit">Send</button>
+  </form>
+</main>
+
+<aside>
+  <h2>Topics</h2>
+  <div id="topics"></div>
+  <button id="newTopic" type="button">New topic</button>
+</aside>
+
+<script>
+  const SERVICE = "/chat.v1.ChatService";
+  const transcript = document.getElementById("transcript");
+  const topicsEl = document.getElementById("topics");
+  let focusTopicId = null;
+  let topics = [];
+
+  function element(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  async function callRpc(method, message) {
+    const res = await fetch(`${SERVICE}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "connect-protocol-version": "1" },
+      body: JSON.stringify(message),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.message || `${method} failed with ${res.status}`);
+    return body;
+  }
+
+  // Connect streaming wire format: each message is a 5-byte header (1 flag byte, 0x02 =
+  // end-stream; 4 big-endian length bytes) followed by that many bytes of JSON. The single
+  // request message for a server-streaming call is itself one such envelope, not bare JSON.
+  function encodeEnvelope(message) {
+    const json = new TextEncoder().encode(JSON.stringify(message));
+    const out = new Uint8Array(5 + json.length);
+    new DataView(out.buffer).setUint32(1, json.length, false);
+    out.set(json, 5);
+    return out;
+  }
+
+  function concatBytes(a, b) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  }
+
+  async function* streamChatEvents() {
+    const res = await fetch(`${SERVICE}/StreamEvents`, {
+      method: "POST",
+      headers: { "content-type": "application/connect+json", "connect-protocol-version": "1" },
+      body: encodeEnvelope({}),
+    });
+    if (!res.ok || !res.body) throw new Error(`StreamEvents failed with ${res.status}`);
+    const reader = res.body.getReader();
+    let buffer = new Uint8Array(0);
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer = concatBytes(buffer, value);
+      while (buffer.length >= 5) {
+        const flag = buffer[0];
+        const length = new DataView(buffer.buffer, buffer.byteOffset + 1, 4).getUint32(0, false);
+        if (buffer.length < 5 + length) break;
+        const payload = buffer.slice(5, 5 + length);
+        buffer = buffer.slice(5 + length);
+        if (flag & 0x02) return; // end-stream envelope
+        yield JSON.parse(new TextDecoder().decode(payload));
+      }
+    }
+  }
+
+  function progressText(payloadJson) {
+    let payload;
+    try { payload = JSON.parse(payloadJson); } catch { return payloadJson; }
+    const [kind, body] = Object.entries(payload)[0] || ["", {}];
+    if (kind === "NodeStarted") return `Running ${body.node}…`;
+    if (kind === "TaskOutput" && typeof body.chunk === "string") return body.chunk;
+    if (kind === "NodeCompleted") return `${body.node} done`;
+    return kind;
+  }
+
+  function renderEvent(event) {
+    if (event.topicId !== focusTopicId) return;
+    const div = element("div", `msg ${event.kind === "notification" ? "notification" : ""}`);
+    div.appendChild(element("span", "kind", `${event.kind} `));
+    const text = event.kind === "notification"
+      ? (JSON.parse(event.payloadJson || "{}").text || "")
+      : event.kind === "topic_progress"
+      ? progressText(event.payloadJson)
+      : event.kind;
+    div.appendChild(document.createTextNode(text));
+    transcript.appendChild(div);
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  function renderTopics() {
+    topicsEl.textContent = "";
+    topics.forEach((topic) => {
+      const row = element("div", `topic-row ${topic.id === focusTopicId ? "focus" : ""}`);
+      row.appendChild(element("div", "", topic.title));
+      row.appendChild(element("div", "status", topic.status));
+      row.onclick = () => setFocus(topic.id);
+      topicsEl.appendChild(row);
+    });
+  }
+
+  async function setFocus(topicId) {
+    if (topicId === focusTopicId) return;
+    await callRpc("SetFocus", { topicId });
+    focusTopicId = topicId;
+    transcript.textContent = "";
+    renderTopics();
+  }
+
+  async function loadSession() {
+    const session = await callRpc("GetSession", {});
+    topics = session.topics || [];
+    focusTopicId = session.focusTopicId || (topics[0] && topics[0].id) || null;
+    renderTopics();
+  }
+
+  document.getElementById("sendForm").onsubmit = async (event) => {
+    event.preventDefault();
+    const input = document.getElementById("content");
+    const content = input.value.trim();
+    if (!content || !focusTopicId) return;
+    input.value = "";
+    try {
+      await callRpc("SendTurn", { turnId: crypto.randomUUID(), content });
+    } catch (err) {
+      transcript.appendChild(element("div", "msg error", err.message));
+    }
+  };
+
+  document.getElementById("newTopic").onclick = async () => {
+    const title = prompt("What's this topic about?");
+    if (!title) return;
+    try {
+      const created = await callRpc("CreateTopic", {
+        title,
+        inputJson: JSON.stringify({ question: title }),
+      });
+      await loadSession();
+      await setFocus(created.topicId);
+    } catch (err) {
+      transcript.appendChild(element("div", "msg error", err.message));
+    }
+  };
+
+  (async () => {
+    await loadSession();
+    for (;;) {
+      try {
+        for await (const event of streamChatEvents()) {
+          if (event.kind === "topic_completed" || event.kind === "topic_failed" || event.kind === "topic_started" || event.kind === "topic_queued") {
+            await loadSession();
+          }
+          renderEvent(event);
+        }
+      } catch (err) {
+        transcript.appendChild(element("div", "msg error", `Stream error: ${err.message} — retrying…`));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  })();
+</script>

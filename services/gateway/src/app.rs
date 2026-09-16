@@ -56,6 +56,10 @@ fn routes(config: &GatewayConfig, db: DatabaseConnection) -> axum::Router {
             "/sources",
             ServeFile::new(config.frontend_dir().join("sources.html")),
         )
+        .route_service(
+            "/chat",
+            ServeFile::new(config.frontend_dir().join("chat.html")),
+        )
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static(PAGE_CACHE_HEADER),
