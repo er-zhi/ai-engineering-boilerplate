@@ -3,6 +3,7 @@
 
 pub mod entity;
 pub mod error;
+pub mod events;
 pub mod session_manager;
 
 #[cfg(feature = "test-support")]
