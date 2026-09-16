@@ -1,6 +1,6 @@
 // Reads the two headers Gateway will stamp on every proxied request once it starts fronting
-// Engine (Chat Service's plan — Engine doesn't write these, only trusts and reads them; see the
-// spec's "Principal и user_id" section for why there's no write side here yet).
+// Engine/Tool Service — trusted, not the request body. Shared by every service that reads
+// Principal from Connect metadata (engine, tool — see each spec's "Principal и user_id").
 
 use http::HeaderMap;
 use uuid::Uuid;

@@ -801,11 +801,13 @@ dependencies = [
  "buffa-types",
  "connectrpc",
  "connectrpc-build",
+ "http",
  "sea-orm",
  "serde",
  "testcontainers",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

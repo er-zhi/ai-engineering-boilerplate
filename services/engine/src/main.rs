@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use axum::routing::get;
+use common::principal;
 use common::proto::engine::v1::{
     CancelRequest, CancelResponse, CreateScheduleRequest, CreateScheduleResponse, EngineService,
     Execution as ExecutionProto, GetExecutionRequest, InterruptRequest, InterruptResponse,
@@ -26,9 +27,7 @@ use connectrpc::{
 use engine::executors::llm::LlmTaskExecutor;
 use engine::service::Service;
 use engine::tick::Tick;
-use engine::{
-    dispatch, entity, execution_event, partition, principal, scheduler, stream, wakeup, wire,
-};
+use engine::{dispatch, entity, execution_event, partition, scheduler, stream, wakeup, wire};
 use sea_orm::{ConnectionTrait, Database};
 use uuid::Uuid;
 
