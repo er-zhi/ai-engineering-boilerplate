@@ -32,15 +32,44 @@ independent task being worked on in the background. Your job is to decide, for t
 which existing topics it continues and which new topics it opens.
 
 Rules:
-- A message that names several separate themes opens one new topic per theme.
-- A message that adds a new, unrelated request mid-conversation opens a new topic.
+- A follow-up, complaint, clarification, or nudge about the same subject is ALWAYS `continue` on \
+that topic — this includes things like \"i'm still waiting\", \"and?\", \"more details please\", \
+\"that's not what I asked\", or a rephrasing of the same request. Never turn these into a `new` \
+topic, and never turn them into a meta-instruction about \"the user\" — they continue the \
+existing topic exactly as the classifier is asked to route them.
+- A message that adds a new, unrelated request — \"also tell me about X\" where X is a different \
+subject — opens a new topic for X (and continues the existing topic for the rest of the message, \
+if any).
+- A first message that names several separate themes opens one new topic per theme.
 - Otherwise the message continues the focused topic, or another existing topic it clearly \
 matches.
-- Prefer continuing over creating. Only create a topic for a genuinely separate task.
-- For every new topic, `question` must be self-contained: it is the only text the worker for \
-that topic will see, so it must restate what the user asked plus any context needed to answer \
-it, without referring to \"the previous message\" or to other topics.
+- When in doubt, continue the focused topic. Only create a topic for a genuinely separate task.
+- For every new topic, `question` must be the user's OWN request, first person, near-verbatim — \
+copy their wording. Only minimally expand it with necessary context that is missing from the \
+message itself (e.g. a place or name mentioned earlier in the session). Never write a \
+paraphrased instruction about \"the user\" (e.g. never \"the user asked about X, please answer \
+it\") — `question` is what the user themselves would have typed, not a description of their \
+request.
 - `title` is a short label (at most 60 characters) for the topic list.
+
+Examples (existing topic id=7, title \"Weather in San Francisco today\", focused):
+
+User: \"i'm still waiting\"
+{\"actions\":[{\"kind\":\"continue\",\"topic_id\":7}]}
+
+User: \"and?\"
+{\"actions\":[{\"kind\":\"continue\",\"topic_id\":7}]}
+
+User: \"also, what is Rust's latest stable version?\"
+{\"actions\":[{\"kind\":\"continue\",\"topic_id\":7},\
+{\"kind\":\"new\",\"title\":\"Rust's latest stable version\",\
+\"question\":\"What is Rust's latest stable version?\"}]}
+
+User (first message of the session, no existing topics): \"What is Claude Code? And which \
+Academy courses exist?\"
+{\"actions\":[{\"kind\":\"new\",\"title\":\"Claude Code\",\"question\":\"What is Claude Code?\"},\
+{\"kind\":\"new\",\"title\":\"Academy courses\",\
+\"question\":\"Which Academy courses exist?\"}]}
 
 Answer with strict JSON and nothing else, in exactly this shape:
 {\"actions\":[{\"kind\":\"continue\",\"topic_id\":123},\
@@ -317,6 +346,45 @@ mod tests {
             fallback(&topics(), Some(99), "hi").as_slice(),
             [Action::New { .. }]
         ));
+    }
+
+    #[test]
+    fn the_system_prompt_biases_toward_continuing_the_focus_topic() {
+        assert!(
+            SYSTEM_PROMPT.contains("i'm still waiting"),
+            "must give a still-waiting/follow-up example"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("ALWAYS `continue`"),
+            "must state the continue-on-follow-up rule explicitly"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("When in doubt, continue the focused topic"),
+            "must state the bias toward continuing"
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_requires_first_person_near_verbatim_questions() {
+        assert!(
+            SYSTEM_PROMPT.contains("first person, near-verbatim"),
+            "must require the user's own wording for a new topic's question"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("Never write a paraphrased instruction about \"the user\""),
+            "must forbid third-person meta-instructions as the question"
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_has_few_shot_examples_for_each_rule() {
+        // Follow-up / "still waiting" -> continue.
+        assert!(SYSTEM_PROMPT.contains("\"actions\":[{\"kind\":\"continue\",\"topic_id\":7}]"));
+        // "also tell me about X" where X is a different subject -> continue + new.
+        assert!(SYSTEM_PROMPT.contains("also, what is Rust's latest stable version?"));
+        assert!(SYSTEM_PROMPT.contains("Rust's latest stable version"));
+        // First message naming two unrelated subjects -> two new topics.
+        assert!(SYSTEM_PROMPT.contains("Academy courses"));
     }
 
     #[test]
