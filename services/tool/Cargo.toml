@@ -18,6 +18,7 @@ buffa = { workspace = true }
 chrono = { workspace = true }
 common = { workspace = true }
 connectrpc = { workspace = true, features = ["axum", "client"] }
+http = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }

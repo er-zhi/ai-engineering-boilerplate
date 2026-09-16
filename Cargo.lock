@@ -4991,6 +4991,7 @@ dependencies = [
  "chrono",
  "common",
  "connectrpc",
+ "http",
  "reqwest 0.13.5",
  "sea-orm",
  "serde",

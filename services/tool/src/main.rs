@@ -231,22 +231,29 @@ async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) 
         ),
     ];
     for (slug, name, description, risk) in system_tools {
-        let exists = Entity::find()
+        let existing = Entity::find()
             .filter(tool::entity::tool::Column::UserId.is_null())
             .filter(tool::entity::tool::Column::Slug.eq(slug))
             .one(db)
             .await
-            .unwrap_or(None)
-            .is_some();
-        if exists {
+            .unwrap_or(None);
+        // A row already at Active needs nothing further. One still stuck below Active — e.g.
+        // a prior boot's create succeeded but the process died before the activation update
+        // ran — is retried rather than skipped forever, so a one-time partial failure doesn't
+        // become a permanent one.
+        if existing
+            .as_ref()
+            .is_some_and(|row| row.status == Status::Active)
+        {
             continue;
         }
-        seed_one_system_tool(service, db, slug, name, description, risk).await;
+        seed_one_system_tool(service, db, slug, name, description, risk, existing).await;
     }
 }
 
 /// System tools are pre-vetted Rust implementations, not user-submitted schemas — they skip the
 /// Draft -> Validated LLM-review step and go straight to Active.
+#[allow(clippy::too_many_arguments)]
 async fn seed_one_system_tool(
     service: &Service,
     db: &sea_orm::DatabaseConnection,
@@ -254,8 +261,13 @@ async fn seed_one_system_tool(
     name: &str,
     description: &str,
     risk: Risk,
+    existing: Option<tool::entity::tool::Model>,
 ) {
-    match create_and_activate_system_tool(service, db, slug, name, description, risk).await {
+    let result = match existing {
+        Some(row) => activate_system_tool(db, row).await,
+        None => create_and_activate_system_tool(service, db, slug, name, description, risk).await,
+    };
+    match result {
         Ok(()) => tracing::info!(slug, "seeded system tool"),
         Err(error) => tracing::error!(slug, %error, "failed to seed system tool"),
     }
@@ -287,6 +299,13 @@ async fn create_and_activate_system_tool(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "row vanished before activation".to_owned())?;
+    activate_system_tool(db, row).await
+}
+
+async fn activate_system_tool(
+    db: &sea_orm::DatabaseConnection,
+    row: tool::entity::tool::Model,
+) -> Result<(), String> {
     let mut active: tool::entity::tool::ActiveModel = row.into();
     active.status = Set(Status::Active);
     active.update(db).await.map_err(|error| error.to_string())?;
@@ -304,7 +323,7 @@ async fn create_and_activate_system_tool(
 async fn sync_schema(db: &sea_orm::DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
     match db.get_schema_registry("tool::entity::*").sync(db).await {
         Ok(()) => Ok(()),
-        Err(error) if error.to_string().contains("tools_owner_slug_idx") => {
+        Err(ref error) if is_known_drop_constraint_error(error) => {
             tracing::warn!(
                 %error,
                 "schema-sync tried to drop the manual unique index via DROP CONSTRAINT \
@@ -314,6 +333,23 @@ async fn sync_schema(db: &sea_orm::DatabaseConnection) -> Result<(), Box<dyn std
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// True only for Postgres SQLSTATE 42704 ("undefined object") against `tools_owner_slug_idx`
+/// specifically — narrower than a message substring, so a real unique-violation or permissions
+/// error that happens to mention the index name is never mistaken for the known, harmless
+/// DROP-CONSTRAINT-on-a-plain-index failure `sync_schema` swallows.
+fn is_known_drop_constraint_error(error: &sea_orm::DbErr) -> bool {
+    let (sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_error))
+    | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_error))) = error
+    else {
+        return false;
+    };
+    let Some(db_error) = sqlx_error.as_database_error() else {
+        return false;
+    };
+    db_error.code().as_deref() == Some("42704")
+        && db_error.message().contains("tools_owner_slug_idx")
 }
 
 #[tokio::main]

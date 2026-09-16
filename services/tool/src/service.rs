@@ -74,6 +74,17 @@ impl Service {
                 "input_schema and output_schema must be JSON objects".to_owned(),
             ));
         }
+        // A user-created tool cannot claim a system tool's slug: `execute`/`run_system_tool`
+        // dispatch the real system implementation by slug string alone, so a user row sharing
+        // one of these names would run as the real web_search/web_fetch/kb_search/
+        // kb_read_document — silently bypassing that row's own Draft/Validated/Active lifecycle
+        // (seeding, which legitimately owns these slugs, passes `user_id: None` and skips this
+        // check).
+        if user_id.is_some() && crate::slugs::ALL.contains(&slug.as_str()) {
+            return Err(ToolError::InvalidRequest(format!(
+                "slug {slug:?} is reserved for a system tool"
+            )));
+        }
         let now = Utc::now();
         let row = ActiveModel {
             user_id: Set(user_id),
@@ -163,19 +174,25 @@ impl Service {
         Ok(())
     }
 
+    /// The catalog `Dispatcher` (Task 14) injects into an LLM's tool-calling prompt — only
+    /// `Active` tools are eligible, since `Draft`/`Validated` rows haven't cleared review yet.
     pub async fn list_tools(
         &self,
         user_id: Option<Uuid>,
     ) -> Result<Vec<crate::entity::tool::Model>, ToolError> {
-        let mut query = Entity::find().filter(crate::entity::tool::Column::UserId.is_null());
-        if let Some(id) = user_id {
-            query = Entity::find().filter(
+        let owner_filter = user_id.map_or_else(
+            || crate::entity::tool::Column::UserId.is_null(),
+            |id| {
                 crate::entity::tool::Column::UserId
                     .is_null()
-                    .or(crate::entity::tool::Column::UserId.eq(id)),
-            );
-        }
-        Ok(query.all(&self.db).await?)
+                    .or(crate::entity::tool::Column::UserId.eq(id))
+            },
+        );
+        Ok(Entity::find()
+            .filter(owner_filter)
+            .filter(crate::entity::tool::Column::Status.eq(Status::Active))
+            .all(&self.db)
+            .await?)
     }
 
     /// A tool the caller owns — used by `validate_tool`/`activate_tool`, which only ever act on
@@ -268,6 +285,9 @@ impl Service {
 
     async fn run_web_fetch(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
         let url = input.get("url").and_then(Value::as_str).unwrap_or_default();
+        if let Err(error) = crate::tools::web_fetch::ensure_public_url(url).await {
+            return Ok(ExecuteOutcome::Error(error));
+        }
         Ok(
             match crate::tools::web_fetch::fetch(&self.http, url).await {
                 Ok(page) => ExecuteOutcome::Ok(serde_json::to_value(page)?),
@@ -316,6 +336,7 @@ fn query_and_limit(input: &Value) -> (&str, u8) {
     let limit = input
         .get("limit")
         .and_then(Value::as_u64)
+        .filter(|&v| v > 0)
         .map_or(5, |v| u8::try_from(Ord::min(v, 20)).unwrap_or(20));
     (query, limit)
 }
@@ -401,6 +422,29 @@ mod tests {
         )
         .expect("service");
         (test, service)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_tool_rejects_a_user_owned_system_slug() {
+        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (_test, service) = service_with(&llm_url).await;
+        let user_id = Uuid::new_v4();
+
+        let error = service
+            .create_tool(
+                Some(user_id),
+                crate::slugs::WEB_SEARCH.into(),
+                "Shadow web search".into(),
+                "d".into(),
+                json!({}),
+                json!({}),
+                Risk::ReadOnly,
+                30,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidRequest(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -533,7 +577,7 @@ mod tests {
         let (_test, service) = service_with(&llm_url).await;
         let owner = Uuid::new_v4();
         let stranger = Uuid::new_v4();
-        service
+        let tool_id = service
             .create_tool(
                 Some(owner),
                 "mine".into(),
@@ -546,10 +590,23 @@ mod tests {
             )
             .await
             .expect("create");
+        // list_tools only ever returns Active rows (see its doc comment) — activate first so
+        // this genuinely exercises the ownership filter rather than passing vacuously because
+        // a Draft row is excluded from every caller's view regardless of who owns it.
+        service
+            .validate_tool(tool_id, owner)
+            .await
+            .expect("validate");
+        service
+            .activate_tool(tool_id, owner)
+            .await
+            .expect("activate");
 
         let seen_by_stranger = service.list_tools(Some(stranger)).await.expect("list");
+        let seen_by_owner = service.list_tools(Some(owner)).await.expect("list");
 
         assert!(seen_by_stranger.iter().all(|t| t.slug != "mine"));
+        assert!(seen_by_owner.iter().any(|t| t.slug == "mine"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
