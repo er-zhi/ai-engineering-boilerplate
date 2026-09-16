@@ -128,6 +128,7 @@ impl TopicManager {
             title: Set(title),
             status: Set(status),
             execution_id: Set(execution_id),
+            input_json: Set(input_json.to_owned()),
             result_summary: Set(None),
             artifact_ids: Set(serde_json::json!([])),
             created_at: Set(now),
@@ -471,14 +472,9 @@ impl TopicManager {
             txn.commit().await?; // nothing queued — release the session lock right away
             return Ok(());
         };
-        // The queued topic's original creation `input_json` (spec's CreateTopicRequest) isn't
-        // persisted anywhere in this plan's schema (Task 1's `topic` entity has no such column),
-        // so promotion starts the execution with an empty initial state — the queued topic's
-        // original intent is lost by the time it actually runs. Accepted gap for tonight's scope.
-        let input_json = "{}".to_owned();
         let execution_id = self
             .engine
-            .start_execution("agent", &input_json)
+            .start_execution("agent", &next.input_json)
             .await
             .map_err(ChatError::Engine)?;
         let mut active: topic::ActiveModel = next.clone().into();
@@ -841,33 +837,24 @@ mod tests {
             assert_eq!(status, Status::Running);
             running_ids.push(id);
         }
+        let queued_input_json = r#"{"question":"overflow question"}"#;
         let (queued_id, status) = manager
-            .create_topic(user_id, None, "Overflow".into(), "{}".into())
+            .create_topic(user_id, None, "Overflow".into(), queued_input_json.into())
             .await
             .expect("create");
         assert_eq!(status, Status::Queued);
 
         let finishing_id = running_ids[0];
-        let execution_id = topic::Entity::find_by_id(finishing_id)
-            .one(&manager.session.db)
-            .await
-            .expect("query")
-            .expect("topic")
-            .execution_id
-            .expect("running topic has an execution_id");
-        fake.completions.lock().expect("lock").insert(
-            execution_id.to_string(),
-            ExecutionEvent {
-                id: "e1".to_owned(),
-                execution_id: execution_id.to_string(),
-                payload_kind: "ExecutionCompleted".to_owned(),
-                // The real Engine's envelope shape, verbatim (stream.rs::row_to_proto sends the
-                // whole externally-tagged payload, not the inner body).
-                payload_json: r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#
-                    .to_owned(),
-                ..Default::default()
-            },
-        );
+        // The real Engine's envelope shape, verbatim (stream.rs::row_to_proto sends the whole
+        // externally-tagged payload, not the inner body).
+        let execution_id = arm_terminal_event(
+            &manager,
+            &fake,
+            finishing_id,
+            "ExecutionCompleted",
+            r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#,
+        )
+        .await;
         let start_executions_before = fake.start_executions.lock().expect("lock").len();
 
         // watch_topic drains the (fake) completion event to the end, so finish_topic and
@@ -890,11 +877,15 @@ mod tests {
         assert_eq!(promoted.status, Status::Running);
         assert!(promoted.execution_id.is_some());
 
-        let start_executions_after = fake.start_executions.lock().expect("lock").len();
+        let start_executions = fake.start_executions.lock().expect("lock");
         assert_eq!(
-            start_executions_after,
+            start_executions.len(),
             start_executions_before + 1,
             "promotion must call start_execution on the Engine for the promoted topic"
+        );
+        assert_eq!(
+            start_executions.last().expect("promotion call").input_json,
+            queued_input_json
         );
     }
 
