@@ -155,6 +155,7 @@ services:
     develop: *rebuild-on-save
     environment:
       LLM_ROUTER_URL: http://llm-router:8083
+      TOOL_SERVICE_URL: http://tool:8087
       ENGINE_TERMINAL_RETENTION:
       ENGINE_EVENTS_RETENTION_MONTHS:
       DATABASE_URL: postgres://engine_user:${ENGINE_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
@@ -162,6 +163,8 @@ services:
       postgres:
         condition: service_healthy
       llm-router:
+        condition: service_healthy
+      tool:
         condition: service_healthy
     init: true
     restart: unless-stopped

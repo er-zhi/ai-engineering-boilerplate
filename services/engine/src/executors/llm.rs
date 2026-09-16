@@ -40,6 +40,17 @@ pub fn build_prompt(config: &Value, state: &Value) -> (String, String) {
     if config.get("tool_calling").and_then(Value::as_bool) == Some(true) {
         system.push_str(TOOL_CALLING_INSTRUCTIONS);
     }
+    if let Some(tools) = config.get("available_tools").and_then(Value::as_array) {
+        system.push_str("\n\nAvailable tools:\n");
+        for tool in tools {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            system.push_str(&format!("- {name}: {description}\n"));
+        }
+    }
 
     let question = state
         .get("question")
@@ -171,6 +182,15 @@ mod tests {
     fn build_prompt_appends_tool_instructions_when_requested() {
         let (system, _) = build_prompt(&json!({"tool_calling": true}), &json!({}));
         assert!(system.contains("tool_call"));
+    }
+
+    #[test]
+    fn build_prompt_renders_available_tools_into_the_system_prompt() {
+        let config =
+            json!({"available_tools": [{"name": "web_search", "description": "search the web"}]});
+        let (system, _) = build_prompt(&config, &json!({}));
+        assert!(system.contains("web_search"));
+        assert!(system.contains("search the web"));
     }
 
     #[test]

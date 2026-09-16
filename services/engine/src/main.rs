@@ -25,6 +25,7 @@ use connectrpc::{
     ServiceStream,
 };
 use engine::executors::llm::LlmTaskExecutor;
+use engine::executors::tool::ToolTaskExecutor;
 use engine::service::Service;
 use engine::tick::Tick;
 use engine::{dispatch, entity, execution_event, partition, scheduler, stream, wakeup, wire};
@@ -351,6 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let executor = dispatch::Dispatcher {
         llm: LlmTaskExecutor::new(&env("LLM_ROUTER_URL")?)?,
+        tool: ToolTaskExecutor::new(&env("TOOL_SERVICE_URL")?)?,
     };
     let owner = format!("engine-{}", Uuid::new_v4());
     let tick = Arc::new(Tick::new(db.clone(), executor, owner));
