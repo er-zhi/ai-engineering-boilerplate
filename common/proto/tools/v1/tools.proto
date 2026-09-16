@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package tools.v1;
+
+service ToolService {
+  rpc CreateTool(CreateToolRequest) returns (CreateToolResponse);
+  rpc ValidateTool(ValidateToolRequest) returns (ValidateToolResponse);
+  rpc ActivateTool(ActivateToolRequest) returns (ActivateToolResponse);
+  rpc ListTools(ListToolsRequest) returns (ListToolsResponse);
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+}
+
+message CreateToolRequest {
+  string slug = 1;
+  string name = 2;
+  string description = 3;
+  string input_schema_json = 4;
+  string output_schema_json = 5;
+  string risk = 6;             // "read_only" | "write" | "destructive"
+  int32 timeout_seconds = 7;
+}
+message CreateToolResponse {
+  string tool_id = 1;
+}
+
+message ValidateToolRequest {
+  string tool_id = 1;
+}
+message ValidateToolResponse {
+  bool approved = 1;
+  string feedback = 2;
+}
+
+message ActivateToolRequest {
+  string tool_id = 1;
+}
+message ActivateToolResponse {}
+
+message ListToolsRequest {}
+message ListToolsResponse {
+  repeated Tool tools = 1;
+}
+message Tool {
+  string id = 1;
+  string slug = 2;
+  string name = 3;
+  string description = 4;
+  string input_schema_json = 5;
+  string risk = 6;
+  string status = 7;           // "draft" | "validated" | "active"
+}
+
+message ExecuteRequest {
+  string slug = 1;
+  string input_json = 2;
+  string idempotency_key = 3;
+}
+message ExecuteResponse {
+  string status = 1;           // "ok" | "requires_approval" | "error" | "not_executable"
+  string output_json = 2;
+  string error_message = 3;
+}
