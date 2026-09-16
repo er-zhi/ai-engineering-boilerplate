@@ -366,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = Service::new(
         db.clone(),
         &env("LLM_ROUTER_URL")?,
+        std::env::var("YOU_SEARCH_API_KEY").unwrap_or_default(),
         std::env::var("BRAVE_SEARCH_API_KEY").unwrap_or_default(),
         &env("KNOWLEDGE_BASE_URL")?,
     )?;

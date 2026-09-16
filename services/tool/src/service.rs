@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use crate::entity::tool::{ActiveModel, Entity, Risk, Status};
 use crate::error::ToolError;
-use crate::providers::brave::{BraveSearchProvider, SearchProvider};
+use crate::providers::AnySearchProvider;
+use crate::providers::brave::SearchProvider;
 use crate::tools::kb_client::KnowledgeBaseClient;
 
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -27,7 +28,7 @@ const VALIDATE_SYSTEM_PROMPT: &str = r#"You validate a tool definition against 2
 pub struct Service {
     db: DatabaseConnection,
     llm: LlmRouterServiceClient<HttpClient>,
-    search: BraveSearchProvider,
+    search: AnySearchProvider,
     http: reqwest::Client,
     kb: KnowledgeBaseClient,
 }
@@ -36,6 +37,7 @@ impl Service {
     pub fn new(
         db: DatabaseConnection,
         llm_router_url: &str,
+        you_api_key: String,
         brave_api_key: String,
         knowledge_base_url: &str,
     ) -> Result<Self, String> {
@@ -51,7 +53,7 @@ impl Service {
                     .with_default_timeout(VALIDATE_TIMEOUT)
                     .proto(),
             ),
-            search: BraveSearchProvider::new(brave_api_key),
+            search: AnySearchProvider::from_env(you_api_key, brave_api_key),
             http: reqwest::Client::new(),
             kb: KnowledgeBaseClient::new(knowledge_base_url)?,
         })
@@ -414,6 +416,7 @@ mod tests {
             test.db.clone(),
             llm_url,
             "unused-in-these-tests".to_owned(),
+            "unused-in-these-tests".to_owned(),
             "http://127.0.0.1:1",
         )
         .expect("service");
@@ -425,6 +428,7 @@ mod tests {
         let service = Service::new(
             test.db.clone(),
             llm_url,
+            "unused-in-these-tests".to_owned(),
             "unused-in-these-tests".to_owned(),
             kb_url,
         )

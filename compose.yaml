@@ -185,6 +185,7 @@ services:
     environment:
       LLM_ROUTER_URL: http://llm-router:8083
       KNOWLEDGE_BASE_URL: http://knowledge-base:8084
+      YOU_SEARCH_API_KEY: ${YOU_SEARCH_API_KEY:-}
       BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
       DATABASE_URL: postgres://tool_user:${TOOL_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
     depends_on:
@@ -206,11 +207,14 @@ services:
     develop: *rebuild-on-save
     environment:
       ENGINE_URL: http://engine:8085
+      LLM_ROUTER_URL: http://llm-router:8083
       DATABASE_URL: postgres://chat_user:${CHAT_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
     depends_on:
       postgres:
         condition: service_healthy
       engine:
+        condition: service_healthy
+      llm-router:
         condition: service_healthy
     init: true
     restart: unless-stopped
