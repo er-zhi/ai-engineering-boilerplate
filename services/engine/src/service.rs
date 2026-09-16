@@ -25,7 +25,9 @@ const DEFAULT_TOOL_CALL_BUDGET: u32 = 50;
 const DEFAULT_WALL_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct Service {
-    db: DatabaseConnection,
+    // pub(crate) so schedule_service.rs can carry the CreateSchedule/ListSchedules half of this
+    // same type without service.rs growing a second subsystem's worth of code.
+    pub(crate) db: DatabaseConnection,
 }
 
 impl Service {

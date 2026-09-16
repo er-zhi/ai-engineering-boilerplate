@@ -1,13 +1,23 @@
 // Claiming and releasing an execution's lease: the only place engine touches
 // FOR UPDATE SKIP LOCKED. A single UPDATE...WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT
-// 1)...RETURNING claims either a fresh Ready row or one whose lease expired (its owner crashed
-// mid-tick) — one query serves both "new work" and "crash recovery", no separate sweep.
+// 1)...RETURNING claims a fresh Ready row, one whose lease expired (its owner crashed mid-tick),
+// or one parked on a WaitKind::Timer whose `until` has passed — one query serves "new work",
+// "crash recovery" and "the clock is the external event", no separate sweep and no timer daemon.
 
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Claims one execution for this worker, or `None` when nothing is due.
+///
+/// The third `WHERE` disjunct is what makes `WaitKind::Timer` actually tick: `wait_kind` is jsonb
+/// holding `WaitKind`'s plain externally tagged serde shape (`{"Timer": {"until": "<rfc3339>"}}`),
+/// so "this timer elapsed" is a jsonb path plus a `timestamptz` cast. The claim deliberately
+/// leaves `wait_kind` untouched — the tick that picks the row up re-runs its `current_nodes` (still
+/// the `Wait` node) with a synthetic `Ok(Value::Null)` output, and `step()`'s ordinary per-output
+/// edge evaluation walks past the `Wait` node, which is the same unparking path `resume()` already
+/// relies on. `release_lease` then overwrites `status`/`wait_kind` at commit time.
 pub async fn claim_one_ready(
     db: &DatabaseConnection,
     owner: &str,
@@ -22,7 +32,14 @@ pub async fn claim_one_ready(
         SET status = 'running', lease_owner = $1, lease_until = $2, updated_at = now()
         WHERE id = (
             SELECT id FROM engine.executions
-            WHERE status = 'ready' OR (status = 'running' AND lease_until < now())
+            WHERE status = 'ready'
+               OR (status = 'running' AND lease_until < now())
+               -- a Waiting(Timer) row whose until has passed (see the doc comment above)
+               OR (
+                   status = 'waiting'
+                   AND wait_kind ? 'Timer'
+                   AND (wait_kind -> 'Timer' ->> 'until')::timestamptz <= now()
+               )
             ORDER BY updated_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1

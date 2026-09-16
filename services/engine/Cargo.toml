@@ -18,6 +18,7 @@ buffa = { workspace = true }
 chrono = { workspace = true }
 common = { workspace = true }
 connectrpc = { workspace = true, features = ["axum", "client"] }
+cron = { workspace = true }
 engine-core = { path = "../../engine-core" }
 http = { workspace = true }
 reqwest = { workspace = true }

@@ -10,6 +10,8 @@ service EngineService {
   rpc Cancel(CancelRequest) returns (CancelResponse);
   rpc GetExecution(GetExecutionRequest) returns (Execution);
   rpc StreamEvents(StreamEventsRequest) returns (stream ExecutionEvent);
+  rpc CreateSchedule(CreateScheduleRequest) returns (CreateScheduleResponse);
+  rpc ListSchedules(ListSchedulesRequest) returns (ListSchedulesResponse);
 }
 
 message RegisterGraphRequest {
@@ -87,4 +89,35 @@ message ExecutionEvent {
   string occurred_at = 6; // RFC 3339
   string payload_kind = 7; // "NodeCompleted", "ExecutionCompleted", ... — engine_core::ExecutionPayload's variant name
   string payload_json = 8;
+}
+
+// A standing instruction to start a fresh execution of `graph_id` on a cron schedule — a cron
+// daemon over the same StartExecution every other client calls, not a second execution model.
+message CreateScheduleRequest {
+  string graph_id = 1;
+  optional int32 version = 2; // unset = whichever version is latest when the schedule fires
+  // Six fields (sec min hour day-of-month month day-of-week) plus an optional year, the `cron`
+  // crate's format — "0 0 * * * *" is hourly on the hour, not classic 5-field crontab.
+  string cron_expr = 3;
+  string input_json = 4; // the initial state of every execution this schedule starts
+}
+
+message CreateScheduleResponse {
+  string schedule_id = 1;
+}
+
+// Scoped to the caller's Principal, like StartExecution — no body field selects another user.
+message ListSchedulesRequest {}
+
+message ListSchedulesResponse {
+  repeated Schedule schedules = 1;
+}
+
+message Schedule {
+  string id = 1;
+  string graph_id = 2;
+  string cron_expr = 3;
+  bool enabled = 4;
+  string next_run_at = 5; // RFC 3339
+  optional string last_execution_id = 6;
 }

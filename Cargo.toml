@@ -36,6 +36,7 @@ dom_smoothie = "0.18"
 scraper = "0.25"
 url = "2.5"
 sha2 = "0.11"
+cron = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # Entity-first: schema sync creates missing tables and columns from the entities on startup.

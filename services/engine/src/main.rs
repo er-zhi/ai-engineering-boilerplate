@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use common::proto::engine::v1::{
-    CancelRequest, CancelResponse, EngineService, Execution as ExecutionProto, GetExecutionRequest,
-    InterruptRequest, InterruptResponse, RegisterGraphRequest, RegisterGraphResponse,
-    ResumeRequest, ResumeResponse, StartExecutionRequest, StartExecutionResponse,
-    StreamEventsRequest,
+    CancelRequest, CancelResponse, CreateScheduleRequest, CreateScheduleResponse, EngineService,
+    Execution as ExecutionProto, GetExecutionRequest, InterruptRequest, InterruptResponse,
+    ListSchedulesRequest, ListSchedulesResponse, RegisterGraphRequest, RegisterGraphResponse,
+    ResumeRequest, ResumeResponse, Schedule as ScheduleProto, StartExecutionRequest,
+    StartExecutionResponse, StreamEventsRequest,
 };
 use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
@@ -26,19 +27,24 @@ use engine::entity::execution_event::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC;
 use engine::executors::llm::LlmTaskExecutor;
 use engine::service::Service;
 use engine::tick::Tick;
-use engine::{dispatch, principal, stream, wakeup, wire};
+use engine::{dispatch, principal, scheduler, stream, wakeup, wire};
 use sea_orm::{ConnectionTrait, Database};
 use uuid::Uuid;
 
 const ENGINE_PORT: &str = "0.0.0.0:8085";
 const LEASE_CONCURRENCY: usize = 8;
+// Schedule firing is not latency-sensitive the way a chat reply is: a cron run a few seconds late
+// is invisible, so a plain interval replaces the tick loop's LISTEN/NOTIFY here.
+const SCHEDULER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
 }
 
 struct EngineServiceImpl {
-    service: Service,
+    // Arc, not a plain Service: the scheduler task started in main() drives the very same
+    // Service (its start_execution is what a due schedule fires), so both hold one instance.
+    service: Arc<Service>,
     db: sea_orm::DatabaseConnection,
 }
 
@@ -180,6 +186,56 @@ impl EngineService for EngineServiceImpl {
             user_id,
         ))
     }
+
+    async fn create_schedule(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateScheduleRequest>,
+    ) -> ServiceResult<CreateScheduleResponse> {
+        let msg = request.to_owned_message();
+        // Ownership comes from the Principal headers Gateway stamps, never from the body — the
+        // same rule start_execution and stream_events already follow.
+        let user_id = principal::from_metadata(ctx.headers()).map(|p| p.user_id);
+        let schedule_id = self
+            .service
+            .create_schedule(
+                msg.graph_id,
+                msg.version,
+                &msg.cron_expr,
+                &msg.input_json,
+                user_id,
+            )
+            .await?;
+        Response::ok(CreateScheduleResponse {
+            schedule_id: schedule_id.to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_schedules(
+        &self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListSchedulesRequest>,
+    ) -> ServiceResult<ListSchedulesResponse> {
+        let user_id = principal::from_metadata(ctx.headers()).map(|p| p.user_id);
+        let schedules = self.service.list_schedules(user_id).await?;
+        Response::ok(ListSchedulesResponse {
+            schedules: schedules.iter().map(schedule_to_proto).collect(),
+            ..Default::default()
+        })
+    }
+}
+
+fn schedule_to_proto(row: &engine::entity::schedule::Model) -> ScheduleProto {
+    ScheduleProto {
+        id: row.id.to_string(),
+        graph_id: row.graph_id.clone(),
+        cron_expr: row.cron_expr.clone(),
+        enabled: row.enabled,
+        next_run_at: row.next_run_at.to_rfc3339(),
+        last_execution_id: row.last_execution_id.map(|id| id.to_string()),
+        ..Default::default()
+    }
 }
 
 fn execution_to_proto(execution: &engine_core::Execution) -> ExecutionProto {
@@ -244,8 +300,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wakeup::run_forever(tick, &wakeup_database_url, LEASE_CONCURRENCY).await;
     });
 
-    let service = Service::new(db.clone());
+    let service = Arc::new(Service::new(db.clone()));
     register_builtin_graphs(&service).await;
+
+    // The cron half of the runtime, alongside the tick loop above: one due schedule per poll,
+    // starting ordinary executions through the same Service the RPC handlers use.
+    let scheduler_db = db.clone();
+    let scheduler_service = Arc::clone(&service);
+    tokio::spawn(async move {
+        scheduler::run_forever(scheduler_db, scheduler_service, SCHEDULER_POLL_INTERVAL).await;
+    });
 
     let engine_service = EngineServiceImpl { service, db };
     let connect = ConnectRouter::new().add_service(Arc::new(engine_service));
