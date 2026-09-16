@@ -2,3 +2,4 @@
 // directly (main.rs stays a thin binary entry point). Each later task adds its own `pub mod`.
 
 pub mod entity;
+pub mod policy;
