@@ -112,6 +112,14 @@ impl Service {
         user_id: Uuid,
     ) -> Result<(bool, String), ToolError> {
         let tool = self.owned_tool(tool_id, user_id).await?;
+        // Re-validating an already-reviewed tool would let a duplicate/retried call silently
+        // regress it out of Active (dropping it from list_tools' catalog) or back to Draft —
+        // only a fresh Draft tool is eligible, mirroring activate_tool's own Validated-only gate.
+        if tool.status != Status::Draft {
+            return Err(ToolError::InvalidRequest(format!(
+                "tool {tool_id} is not Draft"
+            )));
+        }
         let user_prompt = format!(
             "name: {}\ndescription: {}\ninput_schema: {}\noutput_schema: {}\nrisk: {:?}\ntimeout_seconds: {}",
             tool.name,
@@ -507,6 +515,34 @@ mod tests {
             .expect("query")
             .expect("row");
         assert_eq!(row.status, Status::Validated);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_tool_rejects_a_tool_that_is_no_longer_draft() {
+        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (_test, service) = service_with(&llm_url).await;
+        let user_id = Uuid::new_v4();
+        let tool_id = service
+            .create_tool(
+                Some(user_id),
+                "echo".into(),
+                "Echo".into(),
+                "Echoes input".into(),
+                json!({}),
+                json!({}),
+                Risk::ReadOnly,
+                30,
+            )
+            .await
+            .expect("create");
+        service
+            .validate_tool(tool_id, user_id)
+            .await
+            .expect("first validate");
+
+        let error = service.validate_tool(tool_id, user_id).await.unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidRequest(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

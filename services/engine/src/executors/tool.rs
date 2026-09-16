@@ -1,6 +1,10 @@
-// TaskExecutor for kind="tool": calls Tool Service's Execute, reading the call itself from
-// state["llm"]["tool_call"] (agent_graph's own convention, not from `config` — see
-// engine-core/src/builder.rs's doc comment on the "tool" node).
+// TaskExecutor for kind="tool": calls Tool Service's Execute. Two graphs give it the call two
+// different ways: agent_graph's tool node has empty config and an LLM decides the call, so it
+// lands at state["llm"]["tool_call"] (see engine-core/src/builder.rs's doc comment on that
+// node); rag_graph's tool node IS the entry point — no llm node has run yet, so there is no
+// state["llm"] to read — and instead fixes its slug in config["tool_slug"], searching
+// state["question"] (StartExecution's own initial state). A config-given tool_slug wins when
+// present; otherwise this falls back to the state["llm"]["tool_call"] convention.
 
 use common::proto::tools::v1::{ExecuteRequest, ListToolsRequest, Tool, ToolServiceClient};
 use connectrpc::Protocol;
@@ -48,27 +52,17 @@ impl TaskExecutor for ToolTaskExecutor {
     async fn execute(
         &self,
         kind: &str,
-        _config: &Value,
+        config: &Value,
         state: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TaskError> {
         debug_assert_eq!(kind, "tool");
-        let call = state.pointer("/llm/tool_call").ok_or_else(|| {
-            TaskError::Failed("no tool_call at state[\"llm\"][\"tool_call\"]".to_owned())
-        })?;
-        let slug = call
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| TaskError::Failed("tool_call.name is missing".to_owned()))?;
-        let args = call
-            .get("args")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        let (slug, args) = tool_call(config, state)?;
 
         let response = self
             .client
             .execute(ExecuteRequest {
-                slug: slug.to_owned(),
+                slug,
                 input_json: args.to_string(),
                 idempotency_key: idempotency_key.to_owned(),
                 ..Default::default()
@@ -86,6 +80,32 @@ impl TaskExecutor for ToolTaskExecutor {
             _ => Err(TaskError::Failed(response.error_message)),
         }
     }
+}
+
+/// `(slug, args)` for this call, resolved per the two conventions documented at the top of this
+/// file: a config-fixed `tool_slug` (rag_graph) wins; otherwise the LLM-decided
+/// `state["llm"]["tool_call"]` (agent_graph).
+fn tool_call(config: &Value, state: &Value) -> Result<(String, Value), TaskError> {
+    if let Some(slug) = config.get("tool_slug").and_then(Value::as_str) {
+        let query = state
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Ok((slug.to_owned(), serde_json::json!({"query": query})));
+    }
+    let call = state.pointer("/llm/tool_call").ok_or_else(|| {
+        TaskError::Failed("no tool_call at state[\"llm\"][\"tool_call\"]".to_owned())
+    })?;
+    let slug = call
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| TaskError::Failed("tool_call.name is missing".to_owned()))?
+        .to_owned();
+    let args = call
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    Ok((slug, args))
 }
 
 #[cfg(test)]
@@ -168,6 +188,32 @@ mod tests {
         let address = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
         format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn execute_reads_a_config_fixed_tool_slug_and_searches_the_question() {
+        let fake = Arc::new(FakeToolService {
+            received: Mutex::new(Vec::new()),
+            status: "ok".to_owned(),
+            output_json: r#"{"results": []}"#.to_owned(),
+        });
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = ToolTaskExecutor::new(&url).expect("client");
+        let config = serde_json::json!({"tool_slug": "kb_search"});
+        let state = serde_json::json!({"question": "what is claude code?"});
+
+        let output = executor
+            .execute("tool", &config, &state, "e:tool:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output, serde_json::json!({"results": []}));
+        let received = fake.received.lock().expect("lock");
+        assert_eq!(received[0].slug, "kb_search");
+        assert_eq!(
+            received[0].input_json,
+            r#"{"query":"what is claude code?"}"#
+        );
     }
 
     #[tokio::test]
