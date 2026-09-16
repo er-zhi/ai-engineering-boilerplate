@@ -20,9 +20,9 @@ const AGENT_GRAPH_ID: &str = "agent";
 pub const MAX_CONCURRENT_TOPICS: u64 = 3;
 
 pub struct TopicManager {
-    pub(crate) session: SessionManager,
+    pub session: SessionManager,
     pub(crate) engine: EngineClient,
-    pub(crate) events: EventBus,
+    pub events: EventBus,
 }
 
 impl TopicManager {
