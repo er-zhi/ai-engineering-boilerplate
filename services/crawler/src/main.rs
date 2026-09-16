@@ -3,7 +3,6 @@
 mod config;
 mod crawl;
 mod entity;
-mod extract;
 mod graph;
 mod instance_guard;
 mod job_store;

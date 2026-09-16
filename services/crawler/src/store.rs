@@ -6,7 +6,7 @@ use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTr
 
 use crate::crawl::CountedPage;
 use crate::entity::page;
-use crate::extract::extract;
+use common::extract::extract;
 
 pub struct Saved {
     pub title: String,
