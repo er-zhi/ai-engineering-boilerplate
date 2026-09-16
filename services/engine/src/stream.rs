@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use crate::entity::execution_event;
+use crate::execution_event;
 
 const CHANNEL_CAPACITY: usize = 64;
 const POLL_BATCH: u64 = 100;

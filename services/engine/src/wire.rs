@@ -7,7 +7,8 @@ use engine_core::{Checkpoint, ExecutionEvent, Status, WaitKind};
 use sea_orm::ActiveValue::Set;
 use serde_json::Value;
 
-use crate::entity::{checkpoint, execution_event};
+use crate::entity::checkpoint;
+use crate::execution_event;
 
 #[must_use]
 pub fn status_to_columns(status: &Status) -> (String, Option<Value>) {

@@ -149,6 +149,8 @@ services:
     develop: *rebuild-on-save
     environment:
       LLM_ROUTER_URL: http://llm-router:8083
+      ENGINE_TERMINAL_RETENTION:
+      ENGINE_EVENTS_RETENTION_MONTHS:
       DATABASE_URL: postgres://engine_user:${ENGINE_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
     depends_on:
       postgres:

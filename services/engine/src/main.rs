@@ -23,22 +23,65 @@ use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
     ServiceStream,
 };
-use engine::entity::execution_event::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC;
 use engine::executors::llm::LlmTaskExecutor;
 use engine::service::Service;
 use engine::tick::Tick;
-use engine::{dispatch, principal, scheduler, stream, wakeup, wire};
+use engine::{
+    dispatch, entity, execution_event, partition, principal, scheduler, stream, wakeup, wire,
+};
 use sea_orm::{ConnectionTrait, Database};
 use uuid::Uuid;
 
 const ENGINE_PORT: &str = "0.0.0.0:8085";
 const LEASE_CONCURRENCY: usize = 8;
+/// How long a terminal execution's row and checkpoints survive before `sweep` takes them: long
+/// enough that a client which just called `StartExecution` still finds its result with
+/// `GetExecution`, after which `StreamEvents` is the contract for history.
+const DEFAULT_TERMINAL_RETENTION: std::time::Duration = std::time::Duration::from_secs(3600);
 // Schedule firing is not latency-sensitive the way a chat reply is: a cron run a few seconds late
 // is invisible, so a plain interval replaces the tick loop's LISTEN/NOTIFY here.
 const SCHEDULER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
+}
+
+/// `ENGINE_TERMINAL_RETENTION`, in seconds. Unset or unreadable falls back to the default rather
+/// than refusing to start: a misspelt retention must not take the service down.
+fn terminal_retention() -> std::time::Duration {
+    match std::env::var("ENGINE_TERMINAL_RETENTION") {
+        Err(_) => DEFAULT_TERMINAL_RETENTION,
+        Ok(value) => match value.parse::<u64>() {
+            Ok(seconds) => std::time::Duration::from_secs(seconds),
+            Err(_) => {
+                tracing::warn!(
+                    value,
+                    "ENGINE_TERMINAL_RETENTION is not a whole number of seconds, using the default"
+                );
+                DEFAULT_TERMINAL_RETENTION
+            }
+        },
+    }
+}
+
+/// `ENGINE_EVENTS_RETENTION_MONTHS`. Unset — the default — keeps every partition forever: the
+/// event log is the durable history everything else in this service is allowed to be swept
+/// against, so dropping from it is an explicit decision, never one made by omission.
+fn events_retention_months() -> Option<u32> {
+    let value = std::env::var("ENGINE_EVENTS_RETENTION_MONTHS").ok()?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    match value.parse::<u32>() {
+        Ok(months) if months > 0 => Some(months),
+        _ => {
+            tracing::warn!(
+                value,
+                "ENGINE_EVENTS_RETENTION_MONTHS is not a positive number of months, keeping every partition"
+            );
+            None
+        }
+    }
 }
 
 struct EngineServiceImpl {
@@ -274,18 +317,38 @@ async fn register_builtin_graphs(service: &Service) {
     }
 }
 
+/// Schema-sync for the four entities under `engine::entity::*`, then the pieces it cannot express:
+/// the partitioned `execution_events` parent, the two startup indexes, and this month's and next
+/// month's event partitions. All `IF NOT EXISTS` — every start after the first is a no-op.
+async fn prepare_schema(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    db.get_schema_registry("engine::entity::*").sync(db).await?;
+    for statement in execution_event::TABLE_STATEMENTS
+        .iter()
+        .chain(entity::execution::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC.iter())
+        .chain(execution_event::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC.iter())
+    {
+        db.execute_unprepared(statement).await?;
+    }
+    if !partition::is_partitioned(db).await? {
+        tracing::error!(
+            "engine.execution_events exists as a plain table, so the partitioned CREATE TABLE was \
+             a no-op: the event log will grow without a DROP PARTITION retention path. Drop the \
+             table (its contents are reproducible history, not working state) and restart."
+        );
+    }
+    partition::maintain(db, chrono::Utc::now(), events_retention_months()).await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     common::logging::init();
 
     let database_url = env("DATABASE_URL")?;
     let db = Database::connect(&database_url).await?;
-    db.get_schema_registry("engine::entity::*")
-        .sync(&db)
-        .await?;
-    for statement in INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC {
-        db.execute_unprepared(statement).await?;
-    }
+    prepare_schema(&db).await?;
 
     let executor = dispatch::Dispatcher {
         llm: LlmTaskExecutor::new(&env("LLM_ROUTER_URL")?)?,
@@ -296,8 +359,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is moved into the spawned block as an owned String and borrowed only from within it — a
     // bare `&database_url` here would borrow a local that doesn't outlive the spawn.
     let wakeup_database_url = database_url.clone();
+    let maintenance = wakeup::Maintenance {
+        db: db.clone(),
+        terminal_retention: terminal_retention(),
+        events_retention_months: events_retention_months(),
+    };
     tokio::spawn(async move {
-        wakeup::run_forever(tick, &wakeup_database_url, LEASE_CONCURRENCY).await;
+        wakeup::run_forever(tick, &wakeup_database_url, LEASE_CONCURRENCY, maintenance).await;
     });
 
     let service = Arc::new(Service::new(db.clone()));

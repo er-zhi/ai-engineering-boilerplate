@@ -2,6 +2,11 @@
 // denormalized copy of the latest checkpoint's position — written in the same transaction as
 // that checkpoint — so GetExecution never needs to join checkpoints (see the spec's "Схема БД").
 // state is intentionally NOT a column here: it lives only in checkpoints.
+//
+// Row-count bound (gate-database → "Growth"): a hot working set, not history — it holds only
+// executions that are still live, plus terminal ones inside `ENGINE_TERMINAL_RETENTION`, after
+// which `sweep::sweep_terminal` deletes them. Hot-path query: `lease::claim_one_ready`, once per
+// tick, covered by the partial index below.
 
 use sea_orm::entity::prelude::*;
 
@@ -33,3 +38,18 @@ pub struct Model {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// Partial index under `lease::claim_one_ready`: only rows a claim can pick enter it, so the
+/// terminal rows the claim will never want (the bulk of the table until `sweep::sweep_terminal`
+/// takes them away) cost it nothing. Same sanctioned mechanism as the `execution_events` lookup
+/// index — schema-sync has no way to express a partial index, so main.rs runs this right after it.
+///
+/// The predicate lists `waiting` as well, which the spec's version (`ready`/`running`) predates:
+/// `claim_one_ready` grew a third disjunct for elapsed `WaitKind::Timer` rows, and Postgres only
+/// uses a partial index when the query's own `WHERE` implies the index predicate. Leaving
+/// `waiting` out would put claimable rows outside the index and the claim would go back to a seq
+/// scan — the three statuses here are exactly the ones that query can return.
+pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 1] = [
+    "CREATE INDEX IF NOT EXISTS executions_claimable_updated_at_idx \
+     ON engine.executions (updated_at) WHERE status IN ('ready', 'running', 'waiting')",
+];

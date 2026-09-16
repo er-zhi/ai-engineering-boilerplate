@@ -1,15 +1,22 @@
 // Integration tests: the tick loop against a real (testcontainers) Postgres, a fake
 // TaskExecutor. Proves what a unit test can't — that claim/run/step/commit actually compose
-// correctly against the database, and that a crashed worker's lease is reclaimed.
+// correctly against the database, that a crashed worker's lease is reclaimed, and (at the bottom)
+// that the sweep takes finished executions out of the hot tables without touching the event log
+// they left behind.
 
 use std::time::Duration;
 
 use chrono::Utc;
+use engine::error::EngineError;
 use engine::lease::claim_one_ready;
 use engine::service::Service;
+use engine::sweep::sweep_terminal;
 use engine::tick::Tick;
 use engine_core::fakes::FakeTaskExecutor;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder,
+};
 use serde_json::json;
 
 async fn register_simple(service: &Service) {
@@ -204,5 +211,155 @@ async fn a_timer_that_has_not_elapsed_yet_is_left_alone() {
         execution.status,
         engine_core::Status::Waiting(engine_core::WaitKind::Timer { until }),
         "the row is untouched, wait_kind included"
+    );
+}
+
+// --- Task 26: sweeping terminal executions out of the hot tables ---
+
+/// Runs `simple` to `Completed` through a real tick, and returns its id.
+async fn run_to_completion(test: &common::test_db::TestDb, service: &Service) -> uuid::Uuid {
+    let execution_id = service
+        .start_execution("simple".to_owned(), None, r#"{"question": "hi"}"#, None)
+        .await
+        .expect("start");
+    let executor = FakeTaskExecutor::default();
+    executor.respond("llm", Ok(json!({"tool_call": null, "reply": "done"})));
+    let tick = Tick::new(test.db.clone(), executor, "sweeper-test".to_owned());
+    assert!(tick.run_one().await.expect("tick"));
+    execution_id
+}
+
+async fn checkpoint_count(db: &sea_orm::DatabaseConnection, execution_id: uuid::Uuid) -> u64 {
+    engine::entity::checkpoint::Entity::find()
+        .filter(engine::entity::checkpoint::Column::ExecutionId.eq(execution_id))
+        .count(db)
+        .await
+        .expect("count checkpoints")
+}
+
+async fn event_payload_kinds(
+    db: &sea_orm::DatabaseConnection,
+    execution_id: uuid::Uuid,
+) -> Vec<String> {
+    engine::execution_event::Entity::find()
+        .filter(engine::execution_event::Column::ExecutionId.eq(execution_id))
+        .order_by_asc(engine::execution_event::Column::Id)
+        .all(db)
+        .await
+        .expect("read events")
+        .into_iter()
+        .map(|row| {
+            row.payload
+                .as_object()
+                .and_then(|object| object.keys().next().cloned())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_takes_a_finished_execution_but_never_its_events() {
+    let test = engine::test_db::start().await;
+    let service = Service::new(test.db.clone());
+    register_simple(&service).await;
+    let execution_id = run_to_completion(&test, &service).await;
+    assert!(
+        checkpoint_count(&test.db, execution_id).await > 0,
+        "it checkpointed while running"
+    );
+
+    let swept = sweep_terminal(&test.db, Duration::ZERO, 500)
+        .await
+        .expect("sweep");
+
+    assert_eq!(swept, 1, "the one completed execution");
+    assert!(
+        engine::entity::execution::Entity::find_by_id(execution_id)
+            .one(&test.db)
+            .await
+            .expect("query")
+            .is_none(),
+        "the hot row is gone"
+    );
+    assert_eq!(
+        checkpoint_count(&test.db, execution_id).await,
+        0,
+        "and so are its checkpoints — they are a restart point, not history"
+    );
+    let kinds = event_payload_kinds(&test.db, execution_id).await;
+    assert!(!kinds.is_empty(), "the event log is untouched: {kinds:?}");
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("ExecutionCompleted"),
+        "and it still ends with the final word on this execution: {kinds:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_execution_on_a_swept_id_is_not_found() {
+    let test = engine::test_db::start().await;
+    let service = Service::new(test.db.clone());
+    register_simple(&service).await;
+    let execution_id = run_to_completion(&test, &service).await;
+    sweep_terminal(&test.db, Duration::ZERO, 500)
+        .await
+        .expect("sweep");
+
+    // The client contract for a result older than the retention window is StreamEvents, which
+    // still has every event for this id — GetExecution is for the live working set.
+    let result = service.get_execution(execution_id).await;
+
+    assert!(
+        matches!(result, Err(EngineError::ExecutionNotFound(id)) if id == execution_id),
+        "expected NotFound after the sweep, got {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_leaves_unfinished_work_and_fresh_results_alone() {
+    let test = engine::test_db::start().await;
+    let service = Service::new(test.db.clone());
+    register_simple(&service).await;
+    let completed = run_to_completion(&test, &service).await;
+    // A second execution nobody has ticked yet: still `ready`, i.e. still the working set.
+    let ready = service
+        .start_execution("simple".to_owned(), None, r#"{"question": "later"}"#, None)
+        .await
+        .expect("start");
+
+    // One hour of retention: the row above finished seconds ago, so nothing is due at all.
+    let swept = sweep_terminal(&test.db, Duration::from_secs(3600), 500)
+        .await
+        .expect("sweep");
+
+    assert_eq!(
+        swept, 0,
+        "a just-completed execution is still inside its grace period"
+    );
+    for (id, what) in [(completed, "the completed one"), (ready, "the ready one")] {
+        assert!(
+            engine::entity::execution::Entity::find_by_id(id)
+                .one(&test.db)
+                .await
+                .expect("query")
+                .is_some(),
+            "{what} is still there"
+        );
+    }
+
+    // And with no grace period at all, only the terminal row goes — `ready` is never sweepable.
+    assert_eq!(
+        sweep_terminal(&test.db, Duration::ZERO, 500)
+            .await
+            .expect("sweep"),
+        1
+    );
+    assert!(
+        engine::entity::execution::Entity::find_by_id(ready)
+            .one(&test.db)
+            .await
+            .expect("query")
+            .is_some(),
+        "an execution that has not run yet is working set, whatever the retention says"
     );
 }

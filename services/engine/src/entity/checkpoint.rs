@@ -1,5 +1,11 @@
 // engine.checkpoints: append-only, one row per super-step. state here is the source of truth —
 // executions.current_nodes is a denormalized read-optimization, this table is not.
+//
+// Row-count bound (gate-database → "Growth"): hot working set, like `executions` — at most
+// `max_iterations` rows per live execution, and `sweep::sweep_terminal` deletes an execution's
+// whole set with its row once the retention passes. After a terminal status a checkpoint is a
+// restart point nobody will ever restart from; the history lives in `execution_events`.
+// Hot-path query: `store::PgCheckpointStore::latest`, once per tick, by `(execution_id, step)`.
 
 use sea_orm::entity::prelude::*;
 
