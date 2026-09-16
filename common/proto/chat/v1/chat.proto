@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package chat.v1;
+
+service ChatService {
+  rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
+  rpc SetFocus(SetFocusRequest) returns (SetFocusResponse);
+  rpc SendTurn(SendTurnRequest) returns (SendTurnResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc StreamEvents(StreamEventsRequest) returns (stream ChatEvent);
+}
+
+message CreateTopicRequest {
+  optional string parent_id = 1;  // unset = new root topic
+  string title = 2;
+  string input_json = 3;          // merged into the new topic's execution's initial state
+}
+message CreateTopicResponse {
+  string topic_id = 1;
+  string status = 2;              // "running" | "queued" — see policy in Task 3
+}
+
+message SetFocusRequest {
+  string topic_id = 1;
+}
+message SetFocusResponse {}
+
+message SendTurnRequest {
+  string turn_id = 1;   // idempotency key: a repeat with the same turn_id is a no-op
+  string content = 2;   // routed to the session's current focus topic
+}
+message SendTurnResponse {
+  string topic_id = 1;  // the topic that actually received it (the focus at send time)
+}
+
+message GetSessionRequest {}
+message GetSessionResponse {
+  optional string focus_topic_id = 1;
+  repeated Topic topics = 2;
+}
+message Topic {
+  string id = 1;
+  optional string parent_id = 2;
+  string title = 3;
+  string status = 4;              // "queued"|"running"|"completed"|"failed"|"cancelled"
+  optional string execution_id = 5;
+  optional string result_summary = 6;
+}
+
+message StreamEventsRequest {}
+message ChatEvent {
+  string topic_id = 1;
+  // "topic_created"|"topic_queued"|"topic_started"|"focus_changed"|"topic_progress"|
+  // "topic_completed"|"topic_failed"|"topic_cancelled"|"notification"
+  string kind = 2;
+  string payload_json = 3;
+  string occurred_at = 4;         // RFC 3339
+}
