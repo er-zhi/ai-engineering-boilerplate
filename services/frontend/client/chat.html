@@ -7,10 +7,11 @@
      however many topics the session accumulates. Every ancestor of a scrolling pane needs
      `min-height: 0` — a flex item's default `min-height: auto` refuses to shrink below its
      content, which is what would otherwise push the page past 100vh. */
-  body { font: 14px/1.5 system-ui, sans-serif; max-width: 60rem; height: 100vh; box-sizing: border-box; margin: 0 auto; padding: 1.5rem 1rem; overflow: hidden; display: flex; gap: 1.5rem; }
+  body { font: 14px/1.5 system-ui, sans-serif; height: 100vh; box-sizing: border-box; margin: 0; padding: 1.5rem 1rem; overflow: hidden; display: flex; gap: 1.5rem; }
   .logout { position: absolute; top: 1.5rem; right: 1rem; }
   .logout button { background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
   h1 { font-size: 1.25rem; margin: 0 0 1rem; flex-shrink: 0; }
+  .left { flex: 0 0 50%; min-width: 0; min-height: 0; overflow: hidden; display: flex; gap: 1.5rem; }
   main { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
   aside { width: 16rem; flex-shrink: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
   #topics { flex: 1; min-height: 0; overflow-y: auto; }
@@ -25,13 +26,15 @@
   .msg { padding: .4rem 0; border-bottom: 1px solid #f4f4f4; }
   .msg.notification { color: #444; font-style: italic; }
   .msg .kind { color: #999; font-size: .75em; }
+  .msg code { background: #f4f4f4; border-radius: 3px; padding: .1em .3em; font: 12px/1.4 ui-monospace, monospace; }
+  .msg strong { font-weight: 600; }
+  .msg ul, .msg ol { margin: .3em 0; padding-left: 1.4em; }
+  .msg h1, .msg h2, .msg h3 { font-size: 1em; margin: .5em 0 .2em; }
   form#sendForm { display: flex; gap: .5rem; flex-shrink: 0; }
   #content { flex: 1; padding: .5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }
   button { padding: .5rem 1.2rem; font: inherit; cursor: pointer; }
   .error { color: #b00; }
-  #debugToggle { position: absolute; top: 1.5rem; right: 6rem; background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
-  aside.debug { width: 22rem; display: flex; flex-direction: column; }
-  aside.debug[hidden] { display: none; }
+  aside.debug { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; }
   aside.debug h2 { display: flex; justify-content: space-between; align-items: center; }
   aside.debug h2 button { font-size: .75em; padding: .15rem .5rem; }
   aside.debug h2 { flex-shrink: 0; }
@@ -45,24 +48,25 @@
 </style>
 
 <form class="logout" method="post" action="/logout"><button type="submit">Log out</button></form>
-<button id="debugToggle" type="button">Debug: off</button>
 
-<main>
-  <h1>Chat</h1>
-  <div id="transcript"></div>
-  <form id="sendForm">
-    <input id="content" placeholder="Ask something…" autofocus>
-    <button type="submit">Send</button>
-  </form>
-</main>
+<div class="left">
+  <main>
+    <h1>Chat</h1>
+    <div id="transcript"></div>
+    <form id="sendForm">
+      <input id="content" placeholder="Ask something…" autofocus>
+      <button type="submit">Send</button>
+    </form>
+  </main>
 
-<aside>
-  <h2>Topics</h2>
-  <div id="topics"></div>
-  <button id="newTopic" type="button">New topic</button>
-</aside>
+  <aside>
+    <h2>Topics</h2>
+    <div id="topics"></div>
+    <button id="newTopic" type="button">New topic</button>
+  </aside>
+</div>
 
-<aside class="debug" id="debugPanel" hidden>
+<aside class="debug" id="debugPanel">
   <h2>Session debug <button id="debugClear" type="button">clear</button></h2>
   <div id="debugLog"></div>
 </aside>
@@ -71,11 +75,8 @@
   const SERVICE = "/chat.v1.ChatService";
   const transcript = document.getElementById("transcript");
   const topicsEl = document.getElementById("topics");
-  const debugPanel = document.getElementById("debugPanel");
   const debugLog = document.getElementById("debugLog");
-  const debugToggle = document.getElementById("debugToggle");
   const DEBUG_MAX_ENTRIES = 500;
-  let debugOn = false;
   let focusTopicId = null;
   // What the server last told us its focus is — `focusTopicId` is what we're *showing*, and the
   // two diverge whenever a topic completes (the server moves focus on, or clears it).
@@ -99,15 +100,9 @@
     entry.appendChild(document.createTextNode(detail));
     debugLog.appendChild(entry);
     while (debugLog.children.length > DEBUG_MAX_ENTRIES) debugLog.removeChild(debugLog.firstChild);
-    if (debugOn) debugLog.scrollTop = debugLog.scrollHeight;
+    debugLog.scrollTop = debugLog.scrollHeight;
   }
 
-  debugToggle.onclick = () => {
-    debugOn = !debugOn;
-    debugPanel.hidden = !debugOn;
-    debugToggle.textContent = `Debug: ${debugOn ? "on" : "off"}`;
-    if (debugOn) debugLog.scrollTop = debugLog.scrollHeight;
-  };
   document.getElementById("debugClear").onclick = () => { debugLog.textContent = ""; };
 
   async function callRpc(method, message) {
@@ -185,10 +180,87 @@
     return kind;
   }
 
+  // Tiny, safe markdown renderer for assistant answers: escapes HTML first (so the input can
+  // never inject markup), then converts a small subset of markdown syntax to tags. No external
+  // libraries — CSP allows none.
+  function escapeHtml(text) {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function renderInline(text) {
+    return escapeHtml(text)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
+      .replace(/_([^_\n]+)_/g, "<em>$1</em>");
+  }
+
+  function renderMarkdown(text) {
+    const lines = text.split("\n");
+    const htmlParts = [];
+    let listTag = null; // "ul" or "ol" while inside a list
+    let paragraph = [];
+
+    function flushParagraph() {
+      if (paragraph.length) {
+        htmlParts.push(`<p>${paragraph.map(renderInline).join("<br>")}</p>`);
+        paragraph = [];
+      }
+    }
+    function closeList() {
+      if (listTag) {
+        htmlParts.push(`</${listTag}>`);
+        listTag = null;
+      }
+    }
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      const heading = /^(#{1,3})\s+(.*)$/.exec(line);
+      const listItem = /^(?:[-*]\s+|\d+\.\s+)(.*)$/.exec(line);
+      if (line === "") {
+        flushParagraph();
+        closeList();
+      } else if (heading) {
+        flushParagraph();
+        closeList();
+        const level = heading[1].length;
+        htmlParts.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+      } else if (listItem) {
+        flushParagraph();
+        const isOrdered = /^\d+\.\s+/.test(line);
+        const tag = isOrdered ? "ol" : "ul";
+        if (listTag !== tag) {
+          closeList();
+          htmlParts.push(`<${tag}>`);
+          listTag = tag;
+        }
+        htmlParts.push(`<li>${renderInline(listItem[1])}</li>`);
+      } else {
+        closeList();
+        paragraph.push(line);
+      }
+    }
+    flushParagraph();
+    closeList();
+    return htmlParts.join("");
+  }
+
   function appendMessage(who, text, className) {
     const div = element("div", `msg ${className || ""}`);
     div.appendChild(element("span", "kind", `${who} `));
-    div.appendChild(document.createTextNode(text));
+    if (who === "assistant") {
+      const body = element("span");
+      body.innerHTML = renderMarkdown(text);
+      div.appendChild(body);
+    } else {
+      div.appendChild(document.createTextNode(text));
+    }
     transcript.appendChild(div);
     transcript.scrollTop = transcript.scrollHeight;
     return div;
