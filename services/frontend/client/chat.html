@@ -275,36 +275,50 @@
     return div;
   }
 
-  function titleOf(topicId) {
-    const topic = topics.find((t) => t.id === topicId);
-    return topic ? topic.title : topicId;
+  // The label tag always names the root conversation, never a child's own (possibly synthesized)
+  // title — a child topic is just more turns in the same thread, so its tag must not "flip" to
+  // whatever the classifier called the follow-up.
+  function rootTitleOf(topicId) {
+    const byId = new Map(topics.map((t) => [t.id, t]));
+    let cur = byId.get(topicId);
+    if (!cur) return topicId;
+    const seen = new Set();
+    while (cur.parentId && byId.has(cur.parentId) && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      cur = byId.get(cur.parentId);
+    }
+    return cur.title;
   }
 
   // Rebuilt from GetSession alone, so it is idempotent: a reload, a topic switch and a lifecycle
   // event all produce the same transcript for the same server state.
   //
-  // Per topic it contributes the question that started it (skipped when the first stored message
-  // already says the same thing — a topic the classifier opened from a message carries both), the
-  // user turns delivered to it, and its answer. Everything is then sorted by timestamp, which is
-  // what interleaves parallel topics into one readable thread.
+  // `Topic.question` is never trusted as something the user said: it is synthesized by the
+  // backend for child topics ("Earlier answer: … Follow-up: …") and may be rephrased by the
+  // classifier even for a root topic. The user's real turns live only in `messages`. So: a topic
+  // with at least one message contributes only those messages as user lines; a topic with zero
+  // messages (a root topic the classifier split out of a multi-topic first message, whose message
+  // row lives on a sibling topic) contributes its `title` instead, once. Everything is then
+  // sorted by timestamp, which is what interleaves parallel topics into one readable thread.
   function transcriptEntries() {
     const entries = [];
     topics.forEach((topic) => {
       const messages = topic.messages || [];
-      const question = topic.question || topic.title;
-      if (question && !(messages.length && messages[0].content === question)) {
-        entries.push({ at: topic.createdAt, who: "you", text: question, topic: topic.title });
+      const tag = rootTitleOf(topic.id);
+      if (messages.length) {
+        messages.forEach((message) => {
+          entries.push({ at: message.createdAt, who: "you", text: message.content, topic: tag });
+        });
+      } else if (topic.title) {
+        entries.push({ at: topic.createdAt, who: "you", text: topic.title, topic: tag });
       }
-      messages.forEach((message) => {
-        entries.push({ at: message.createdAt, who: "you", text: message.content, topic: topic.title });
-      });
       if (topic.resultSummary && (topic.status === "completed" || topic.status === "failed")) {
         entries.push({
           at: topic.updatedAt,
           who: "assistant",
           text: topic.resultSummary,
           className: topic.status === "failed" ? "error" : "",
-          topic: topic.title,
+          topic: tag,
         });
       } else if (topic.status === "running" || topic.status === "queued") {
         entries.push({
@@ -312,7 +326,7 @@
           who: "assistant",
           text: `(${topic.status}…)`,
           className: "notification",
-          topic: topic.title,
+          topic: tag,
         });
       }
     });
@@ -353,11 +367,11 @@
       let payload = {};
       try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
       if (event.kind === "notification") {
-        appendMessage("·", payload.text || payload.kind || "", "notification", titleOf(event.topicId));
+        appendMessage("·", payload.text || payload.kind || "", "notification", rootTitleOf(event.topicId));
         return;
       }
       if (event.kind === "topic_progress") {
-        appendMessage("·", progressText(event.payloadJson), "notification", titleOf(event.topicId));
+        appendMessage("·", progressText(event.payloadJson), "notification", rootTitleOf(event.topicId));
       }
     } catch (err) {
       debugLine("err", `render ${event.kind}`, err.message);
