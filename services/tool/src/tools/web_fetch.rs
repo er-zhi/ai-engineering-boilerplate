@@ -98,8 +98,48 @@ pub struct FetchedPage {
     pub text: String,
 }
 
+/// Why a `reqwest` send failed, in words an LLM can act on. reqwest's own Display for a transport
+/// failure is the near-useless "error sending request for url (...)" whatever went wrong, so an
+/// agent reading the error back as an observation can't tell "try again" from "this host will
+/// never answer me, use web_search instead".
+fn send_error(url: &str, error: &reqwest::Error) -> String {
+    let reason = if error.is_timeout() {
+        "timed out".to_owned()
+    } else if error.is_connect() {
+        // DNS failure, refused connection and TLS failure all surface as connect errors; the
+        // source chain is the only thing that separates them.
+        let mut source: Option<&dyn std::error::Error> = std::error::Error::source(error);
+        let mut detail = String::new();
+        while let Some(current) = source {
+            detail = current.to_string();
+            source = current.source();
+        }
+        let lowered = detail.to_lowercase();
+        if lowered.contains("dns") || lowered.contains("name or service not known") {
+            format!("host could not be resolved ({detail})")
+        } else if lowered.contains("refused") {
+            format!("connection refused ({detail})")
+        } else if detail.is_empty() {
+            "could not connect".to_owned()
+        } else {
+            format!("could not connect ({detail})")
+        }
+    } else if error.is_redirect() {
+        "too many redirects".to_owned()
+    } else if error.is_body() || error.is_decode() {
+        "the response body could not be read".to_owned()
+    } else {
+        format!("the request failed ({error})")
+    };
+    format!("fetch {url} failed: {reason}")
+}
+
 pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<FetchedPage, String> {
-    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| send_error(url, &e))?;
     if !response.status().is_success() {
         return Err(format!("fetch {url} returned {}", response.status()));
     }
@@ -196,5 +236,46 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_says_what_actually_went_wrong() {
+        let client = reqwest::Client::new();
+
+        // Nothing listens on port 1 — a connect failure, not reqwest's generic "error sending
+        // request for url".
+        let error = fetch(&client, "http://127.0.0.1:1/page").await.unwrap_err();
+        assert!(error.contains("http://127.0.0.1:1/page"), "{error}");
+        assert!(
+            error.contains("connect") || error.contains("refused"),
+            "{error}"
+        );
+        assert!(!error.starts_with("error sending request"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_reported_as_a_timeout() {
+        let app = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                "never"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .expect("client");
+
+        let error = fetch(&client, &format!("http://{address}/slow"))
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("timed out"), "{error}");
     }
 }

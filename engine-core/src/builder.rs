@@ -165,6 +165,18 @@ pub fn rag_graph() -> Graph {
 /// `state["llm"]["tool_call"]` by the convention this graph and that executor share, not from
 /// `config`, since `state` (unlike `config`) is already passed to every `TaskExecutor::execute`
 /// call.
+///
+/// Tool *errors* are observations, not crashes. A tool that ran and refused (bad arguments, a
+/// site that blocks bots, a timeout) makes the tool node succeed with `{"error": "<message>"}`,
+/// which the node's Append reducer lands in `state["tool_result"]` like any other result, so the
+/// unconditional `tool → llm` edge carries it straight back into the next prompt and the model
+/// can retry with fixed arguments, choose another tool, or answer with what it has. The bound is
+/// in the tool executor rather than in an edge, because only it can see the tail of
+/// `state["tool_result"]`: `MAX_CONSECUTIVE_TOOL_ERRORS` (3) error observations in a row make it
+/// return `TaskError::Failed` instead, and — this graph having no `Condition::Failed` edge — that
+/// fails the execution with the last error in the message. A tool that could not be *asked* at
+/// all (Tool Service unreachable) or needs an approval Engine can't give still fails on the first
+/// try, by the same path.
 #[must_use]
 pub fn agent_graph() -> Graph {
     GraphBuilder::new()
@@ -206,11 +218,139 @@ pub fn agent_graph() -> Graph {
 mod tests {
     use super::*;
 
+    use crate::budget::Budget;
+    use crate::execution::{ActiveNode, Execution, Status};
+    use crate::ids::{ExecutionId, NodeId};
+    use crate::step::{NodeOutput, step};
+    use serde_json::json;
+
     #[test]
     fn agent_graph_loops_llm_and_tool_until_no_tool_call() {
         let g = agent_graph();
         assert_eq!(g.entry, crate::ids::NodeId("llm".into()));
         assert!(g.node(&crate::ids::NodeId("tool".into())).is_some());
         assert!(g.node(&crate::ids::NodeId("end".into())).is_some());
+    }
+
+    fn agent_execution() -> Execution {
+        Execution {
+            id: ExecutionId(uuid::Uuid::new_v4()),
+            graph_id: GraphId("agent".to_owned()),
+            graph_version: 1,
+            user_id: None,
+            status: Status::Ready,
+            current_nodes: vec![ActiveNode::plain(NodeId("llm".to_owned()))],
+            state: json!({"question": "weather in SF?"}),
+            iteration: 0,
+            max_iterations: 20,
+            deadline: None,
+            budget: Budget::new(100_000, 100, std::time::Duration::from_secs(3600)),
+        }
+    }
+
+    fn output(node: &str, result: Result<serde_json::Value, String>) -> Vec<NodeOutput> {
+        vec![NodeOutput {
+            node: ActiveNode::plain(NodeId(node.to_owned())),
+            result,
+        }]
+    }
+
+    /// (a) A tool error arriving as an `{"error": ...}` *observation* keeps the loop running: the
+    /// tool → llm edge fires, the error is in state["tool_result"] for the next prompt, and the
+    /// execution is Ready on the llm node rather than Failed.
+    #[test]
+    fn a_tool_error_observation_feeds_the_loop_instead_of_failing_the_execution() {
+        let g = agent_graph();
+        let exec = agent_execution();
+        let now = chrono::Utc::now();
+
+        let (exec, _) = step(
+            &g,
+            exec,
+            output(
+                "llm",
+                Ok(json!({"tool_call": {"name": "web_fetch"}, "reply": null})),
+            ),
+            now,
+        );
+        assert_eq!(
+            exec.current_nodes,
+            vec![ActiveNode::plain(NodeId("tool".to_owned()))]
+        );
+
+        let (exec, _) = step(
+            &g,
+            exec,
+            output(
+                "tool",
+                Ok(json!({"error": "error sending request for url"})),
+            ),
+            now,
+        );
+
+        assert_eq!(exec.status, Status::Ready);
+        assert_eq!(
+            exec.current_nodes,
+            vec![ActiveNode::plain(NodeId("llm".to_owned()))]
+        );
+        assert_eq!(
+            exec.state["tool_result"],
+            json!([{"error": "error sending request for url"}])
+        );
+    }
+
+    /// (b) ...and when the model then answers instead of calling another tool, the execution ends
+    /// Completed with that reply — a failed tool call costs the answer nothing.
+    #[test]
+    fn the_llm_answering_after_a_tool_error_completes_the_execution() {
+        let g = agent_graph();
+        let now = chrono::Utc::now();
+        let mut exec = agent_execution();
+        exec.state["tool_result"] = json!([{"error": "invalid_argument: query is required"}]);
+        exec.current_nodes = vec![ActiveNode::plain(NodeId("llm".to_owned()))];
+
+        let (exec, _) = step(
+            &g,
+            exec,
+            output(
+                "llm",
+                Ok(json!({"tool_call": null, "reply": "It's about 62F and foggy."})),
+            ),
+            now,
+        );
+
+        assert_eq!(exec.status, Status::Completed);
+        assert_eq!(
+            exec.state["llm"]["reply"],
+            json!("It's about 62F and foggy.")
+        );
+    }
+
+    /// (c) The bound: once the tool executor gives up (3 consecutive errors), its TaskError is an
+    /// ordinary failed Task — agent_graph has no `Condition::Failed` edge, so the execution fails,
+    /// and the message carries the last tool error through to whoever is watching.
+    #[test]
+    fn a_tool_node_failure_fails_the_execution_with_the_last_error_text() {
+        let g = agent_graph();
+        let now = chrono::Utc::now();
+        let mut exec = agent_execution();
+        exec.current_nodes = vec![ActiveNode::plain(NodeId("tool".to_owned()))];
+
+        let (exec, events) = step(
+            &g,
+            exec,
+            output(
+                "tool",
+                Err("3 consecutive tool errors, giving up; last error: error sending request for url (https://www.accuweather.com/)".to_owned()),
+            ),
+            now,
+        );
+
+        assert_eq!(exec.status, Status::Failed);
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            crate::event::ExecutionPayload::ExecutionFailed { error }
+                if error.contains("3 consecutive tool errors") && error.contains("accuweather.com")
+        )));
     }
 }

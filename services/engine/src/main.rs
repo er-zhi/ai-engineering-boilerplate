@@ -354,6 +354,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         llm: LlmTaskExecutor::new(&env("LLM_ROUTER_URL")?)?,
         tool: ToolTaskExecutor::new(&env("TOOL_SERVICE_URL")?)?,
     };
+    // Before any tick runs: hand back whatever a previous engine process was holding when it was
+    // replaced, so an execution frozen mid-tick resumes now instead of after its 5-minute lease.
+    match engine::lease::expire_abandoned_leases(&db).await {
+        Ok(0) => {}
+        Ok(freed) => tracing::info!(
+            freed,
+            "recovered executions left running by a previous engine"
+        ),
+        Err(error) => tracing::error!(%error, "could not recover abandoned leases at startup"),
+    }
+
     let owner = format!("engine-{}", Uuid::new_v4());
     let tick = Arc::new(Tick::new(db.clone(), executor, owner));
     // wakeup::run_forever takes &str (Task 16); tokio::spawn needs a 'static future, so the URL

@@ -52,6 +52,35 @@ pub async fn claim_one_ready(
     row.map(|r| r.try_get("", "id")).transpose()
 }
 
+/// Makes every execution left `running` by a previous engine process claimable again, returning
+/// how many were freed. Call once at startup, before the tick loop starts.
+///
+/// `claim_one_ready` already reclaims an abandoned lease — but only once it expires, and
+/// `LEASE_DURATION` is 5 minutes (it has to cover a worst-case tick, nothing renews it mid-tick).
+/// A container replaced mid-tick therefore leaves its execution frozen for those 5 minutes, and
+/// anything serialized behind it (Chat's topic, `Interrupt`, `Resume`) blocks with "is mid-tick,
+/// retry shortly" the whole time. Expiring the lease at startup hands the row straight back to
+/// the ordinary claim path, which resumes it from its last checkpoint — no execution is failed
+/// for having been interrupted, because nothing about it was lost.
+///
+/// This assumes the process that just started owns no running execution and no *other* engine
+/// process is mid-tick: true for this stack, which runs a single engine replica (`compose.yaml`).
+/// Were a second replica added, this would need to skip leases still held by a live peer — a
+/// worker registry or a heartbeat-renewed short lease, neither of which exists yet.
+pub async fn expire_abandoned_leases(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
+    let result = db
+        .execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            r"
+            UPDATE engine.executions
+            SET lease_until = now()
+            WHERE status = 'running' AND lease_until > now()
+            ",
+        ))
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Takes `&impl ConnectionTrait`, not `&DatabaseConnection` specifically — Task 15's tick commit
 /// calls this with a `&DatabaseTransaction` (also `ConnectionTrait`) so the status/wait_kind/
 /// current_nodes update lands in the same transaction as that tick's checkpoint and events; this
@@ -165,6 +194,55 @@ mod tests {
             reclaimed, id,
             "worker-1's lease expired, worker-2 picks it up"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_recovery_frees_an_execution_a_replaced_engine_left_running() {
+        let test = crate::test_db::start().await;
+        let id = seed_ready_execution(&test.db).await;
+        // A previous process claimed it with a long lease and then died mid-tick.
+        claim_one_ready(
+            &test.db,
+            "engine-before-the-restart",
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert_eq!(
+            claim_one_ready(
+                &test.db,
+                "engine-after-the-restart",
+                Duration::from_secs(300)
+            )
+            .await
+            .expect("claim attempt"),
+            None,
+            "without recovery the fresh process waits out the whole 5-minute lease"
+        );
+
+        let freed = expire_abandoned_leases(&test.db).await.expect("recover");
+
+        assert_eq!(freed, 1);
+        let reclaimed = claim_one_ready(
+            &test.db,
+            "engine-after-the-restart",
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("reclaim")
+        .expect("the orphaned execution is claimable again");
+        assert_eq!(reclaimed, id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_recovery_leaves_executions_that_are_not_running_alone() {
+        let test = crate::test_db::start().await;
+        seed_ready_execution(&test.db).await;
+
+        let freed = expire_abandoned_leases(&test.db).await.expect("recover");
+
+        assert_eq!(freed, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
