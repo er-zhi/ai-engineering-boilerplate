@@ -43,6 +43,11 @@ configs:
       CREATE SCHEMA tool AUTHORIZATION tool_user;
       ALTER ROLE tool_user SET search_path TO tool, public;
 
+      \getenv chat_password CHAT_DB_PASSWORD
+      CREATE ROLE chat_user LOGIN PASSWORD :'chat_password';
+      CREATE SCHEMA chat AUTHORIZATION chat_user;
+      ALTER ROLE chat_user SET search_path TO chat, public;
+
 services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -58,6 +63,7 @@ services:
       KNOWLEDGE_BASE_DB_PASSWORD: ${KNOWLEDGE_BASE_DB_PASSWORD:?set it in .env, see .env.example}
       ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:?set it in .env, see .env.example}
       TOOL_DB_PASSWORD: ${TOOL_DB_PASSWORD:?set it in .env, see .env.example}
+      CHAT_DB_PASSWORD: ${CHAT_DB_PASSWORD:?set it in .env, see .env.example}
     configs:
       - source: postgres-bootstrap
         target: /docker-entrypoint-initdb.d/init.sql
@@ -187,6 +193,24 @@ services:
       llm-router:
         condition: service_healthy
       knowledge-base:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  chat:
+    build:
+      dockerfile: services/chat/Dockerfile
+    develop: *rebuild-on-save
+    environment:
+      ENGINE_URL: http://engine:8085
+      DATABASE_URL: postgres://chat_user:${CHAT_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      engine:
         condition: service_healthy
     init: true
     restart: unless-stopped
