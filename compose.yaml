@@ -38,6 +38,11 @@ configs:
       CREATE SCHEMA engine AUTHORIZATION engine_user;
       ALTER ROLE engine_user SET search_path TO engine, public;
 
+      \getenv tool_password TOOL_DB_PASSWORD
+      CREATE ROLE tool_user LOGIN PASSWORD :'tool_password';
+      CREATE SCHEMA tool AUTHORIZATION tool_user;
+      ALTER ROLE tool_user SET search_path TO tool, public;
+
 services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -52,6 +57,7 @@ services:
       LLM_ROUTER_DB_PASSWORD: ${LLM_ROUTER_DB_PASSWORD:?set it in .env, see .env.example}
       KNOWLEDGE_BASE_DB_PASSWORD: ${KNOWLEDGE_BASE_DB_PASSWORD:?set it in .env, see .env.example}
       ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:?set it in .env, see .env.example}
+      TOOL_DB_PASSWORD: ${TOOL_DB_PASSWORD:?set it in .env, see .env.example}
     configs:
       - source: postgres-bootstrap
         target: /docker-entrypoint-initdb.d/init.sql
@@ -156,6 +162,28 @@ services:
       postgres:
         condition: service_healthy
       llm-router:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  tool:
+    build:
+      dockerfile: services/tool/Dockerfile
+    develop: *rebuild-on-save
+    environment:
+      LLM_ROUTER_URL: http://llm-router:8083
+      KNOWLEDGE_BASE_URL: http://knowledge-base:8084
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      DATABASE_URL: postgres://tool_user:${TOOL_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      llm-router:
+        condition: service_healthy
+      knowledge-base:
         condition: service_healthy
     init: true
     restart: unless-stopped
