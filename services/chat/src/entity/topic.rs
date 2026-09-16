@@ -37,7 +37,12 @@ pub struct Model {
     /// The caller's `CreateTopicRequest.input_json`, kept verbatim so a topic that starts out
     /// `Queued` can be started with its original intent by `promote_next_queued` once a slot
     /// frees — rather than the empty state an Engine execution would otherwise get.
-    #[sea_orm(column_type = "Text", default_value = "")]
+    /// Defaults to `{}`, never `""`: the default is what any row predating this column gets on
+    /// schema sync, and `promote_next_queued` hands this value straight to Engine, which rejects
+    /// anything that isn't a JSON object. A `Queued` row carrying `""` would fail to start on
+    /// every promotion attempt, and since it stays the oldest queued row, it would wedge the
+    /// session's queue permanently — `finish_topic`'s error is only logged, never surfaced.
+    #[sea_orm(column_type = "Text", default_value = "{}")]
     pub input_json: String,
     pub result_summary: Option<String>,
     #[sea_orm(column_type = "JsonBinary")]

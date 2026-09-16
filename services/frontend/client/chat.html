@@ -2,32 +2,40 @@
 <meta charset="utf-8">
 <title>Chat</title>
 <style>
-  body { font: 14px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; display: flex; gap: 1.5rem; }
-  .logout { position: absolute; top: 2rem; right: 1rem; }
+  /* The whole page is exactly one viewport tall and never scrolls as a document: each pane
+     (transcript, topic list, debug log) owns its own scrollbar instead, so the layout stays put
+     however many topics the session accumulates. Every ancestor of a scrolling pane needs
+     `min-height: 0` — a flex item's default `min-height: auto` refuses to shrink below its
+     content, which is what would otherwise push the page past 100vh. */
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 60rem; height: 100vh; box-sizing: border-box; margin: 0 auto; padding: 1.5rem 1rem; overflow: hidden; display: flex; gap: 1.5rem; }
+  .logout { position: absolute; top: 1.5rem; right: 1rem; }
   .logout button { background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
-  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
-  main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-  aside { width: 16rem; flex-shrink: 0; }
-  aside h2 { font-size: 0.9rem; color: #666; margin: 0 0 .5rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; flex-shrink: 0; }
+  main { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+  aside { width: 16rem; flex-shrink: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+  #topics { flex: 1; min-height: 0; overflow-y: auto; }
+  aside h2 { font-size: 0.9rem; color: #666; margin: 0 0 .5rem; flex-shrink: 0; }
   .topic-row { padding: .5rem; border-radius: 4px; cursor: pointer; margin-bottom: .25rem; }
   .topic-row:hover { background: #f4f4f4; }
   .topic-row.focus { background: #eef; font-weight: 600; }
   .topic-row .status { color: #666; font-size: .8em; }
-  #newTopic { width: 100%; margin-top: .5rem; padding: .5rem; cursor: pointer; }
-  #transcript { flex: 1; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; padding: .75rem; margin-bottom: .75rem; min-height: 20rem; }
+  /* Stays pinned below the scrolling topic list rather than scrolling away with it. */
+  #newTopic { width: 100%; margin-top: .5rem; padding: .5rem; cursor: pointer; flex-shrink: 0; }
+  #transcript { flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; padding: .75rem; margin-bottom: .75rem; }
   .msg { padding: .4rem 0; border-bottom: 1px solid #f4f4f4; }
   .msg.notification { color: #444; font-style: italic; }
   .msg .kind { color: #999; font-size: .75em; }
-  form#sendForm { display: flex; gap: .5rem; }
+  form#sendForm { display: flex; gap: .5rem; flex-shrink: 0; }
   #content { flex: 1; padding: .5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }
   button { padding: .5rem 1.2rem; font: inherit; cursor: pointer; }
   .error { color: #b00; }
-  #debugToggle { position: absolute; top: 2rem; right: 6rem; background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
+  #debugToggle { position: absolute; top: 1.5rem; right: 6rem; background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
   aside.debug { width: 22rem; display: flex; flex-direction: column; }
   aside.debug[hidden] { display: none; }
   aside.debug h2 { display: flex; justify-content: space-between; align-items: center; }
   aside.debug h2 button { font-size: .75em; padding: .15rem .5rem; }
-  #debugLog { flex: 1; overflow-y: auto; background: #1e1e1e; color: #ddd; font: 11px/1.5 ui-monospace, monospace; border-radius: 4px; padding: .5rem; min-height: 20rem; max-height: 80vh; }
+  aside.debug h2 { flex-shrink: 0; }
+  #debugLog { flex: 1; min-height: 0; overflow-y: auto; background: #1e1e1e; color: #ddd; font: 11px/1.5 ui-monospace, monospace; border-radius: 4px; padding: .5rem; }
   .debug-entry { padding: .2rem 0; border-bottom: 1px solid #333; white-space: pre-wrap; word-break: break-all; }
   .debug-entry .ts { color: #888; }
   .debug-entry .kind { color: #7fc; }
@@ -69,6 +77,9 @@
   const DEBUG_MAX_ENTRIES = 500;
   let debugOn = false;
   let focusTopicId = null;
+  // What the server last told us its focus is — `focusTopicId` is what we're *showing*, and the
+  // two diverge whenever a topic completes (the server moves focus on, or clears it).
+  let serverFocusTopicId = null;
   let topics = [];
 
   function element(tag, className, text) {
@@ -174,19 +185,84 @@
     return kind;
   }
 
-  function renderEvent(event) {
-    debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
-    if (event.topicId !== focusTopicId) return;
-    const div = element("div", `msg ${event.kind === "notification" ? "notification" : ""}`);
-    div.appendChild(element("span", "kind", `${event.kind} `));
-    const text = event.kind === "notification"
-      ? (JSON.parse(event.payloadJson || "{}").text || "")
-      : event.kind === "topic_progress"
-      ? progressText(event.payloadJson)
-      : event.kind;
+  function appendMessage(who, text, className) {
+    const div = element("div", `msg ${className || ""}`);
+    div.appendChild(element("span", "kind", `${who} `));
     div.appendChild(document.createTextNode(text));
     transcript.appendChild(div);
     transcript.scrollTop = transcript.scrollHeight;
+    return div;
+  }
+
+  // The focused topic plus every ancestor, oldest first: a continuation is a child topic, so the
+  // thread the user thinks of as "this chat" is the parent_id chain up to the root.
+  function threadOf(topicId) {
+    const byId = new Map(topics.map((t) => [t.id, t]));
+    const chain = [];
+    for (let node = byId.get(topicId); node; node = node.parentId ? byId.get(node.parentId) : null) {
+      chain.unshift(node);
+      if (chain.length > 100) break; // defensive: never loop on a malformed chain
+    }
+    return chain;
+  }
+
+  // Re-renders the whole conversation for the focused topic from GetSession's snapshot: each
+  // topic in the thread contributes the question that started it and the answer it produced.
+  //
+  // Known gap: a turn delivered into a *running* topic (the `interrupt` path) is stored only in
+  // chat.messages, which GetSession does not expose — so it shows optimistically when sent but
+  // cannot be reproduced here on a reload or a topic switch. Closing it means returning message
+  // rows from GetSession; the continuation path this page is built around does not need it,
+  // because each follow-up becomes a topic whose `title` is the question.
+  function renderTranscript() {
+    transcript.textContent = "";
+    if (!focusTopicId) return;
+    // `title` is the question as the user put it: CreateTopic's title for a root topic, the
+    // follow-up text verbatim for a continuation. The `question` in `input_json` would repeat
+    // the parent's answer that is already on screen above, so GetSession needs no new field.
+    threadOf(focusTopicId).forEach((topic) => {
+      if (topic.title) appendMessage("you", topic.title);
+      if (topic.resultSummary) {
+        appendMessage("assistant", topic.resultSummary, topic.status === "failed" ? "error" : "");
+      } else if (topic.status === "running" || topic.status === "queued") {
+        appendMessage("assistant", `(${topic.status}…)`, "notification");
+      }
+    });
+  }
+
+  function renderEvent(event) {
+    debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
+    // Chat's EventBus is one process-wide broadcast channel and StreamEvents does not filter it
+    // per session, so this stream also carries other users' topics. Render only what GetSession
+    // says belongs to this session — otherwise a background-topic notification below would show
+    // a stranger's answer text in this transcript.
+    if (!topics.some((t) => t.id === event.topicId)) return;
+    let payload = {};
+    try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
+    const inThread = threadOf(focusTopicId).some((t) => t.id === event.topicId);
+
+    // `notification` and `topic_completed` carry the same summary. For a topic in this thread the
+    // summary *is* the assistant's reply, so it renders once as the reply and the notification is
+    // dropped; for a background topic it's the other way round — the spec's «когда фоновая тема
+    // завершается, в чат приходит уведомление с её результатом».
+    if (event.kind === "notification") {
+      if (!inThread) {
+        appendMessage("·", `Topic ${event.topicId}: ${payload.text || payload.kind || ""}`, "notification");
+      }
+      return;
+    }
+    if (!inThread) return;
+    if (event.kind === "topic_completed" || event.kind === "topic_failed") {
+      // finish_topic publishes `{"summary": ...}` — the answer itself, which is the whole point
+      // of the exchange and used to be rendered as the bare word "topic_completed".
+      if (payload.summary) {
+        appendMessage("assistant", payload.summary, event.kind === "topic_failed" ? "error" : "");
+      }
+      return;
+    }
+    if (event.kind === "topic_progress") {
+      appendMessage("·", progressText(event.payloadJson), "notification");
+    }
   }
 
   function renderTopics() {
@@ -204,15 +280,25 @@
     if (topicId === focusTopicId) return;
     await callRpc("SetFocus", { topicId });
     focusTopicId = topicId;
-    transcript.textContent = "";
+    serverFocusTopicId = topicId;
     renderTopics();
+    renderTranscript();
   }
 
-  async function loadSession() {
+  // `keepTranscript` is for the refreshes that happen *while* the user is reading a live
+  // conversation (stream events, a continuation being created): the topic list and focus are
+  // re-read, but the transcript keeps the messages already on screen instead of being rebuilt
+  // from the snapshot, which would duplicate or drop what the event stream just rendered.
+  async function loadSession(keepTranscript) {
     const session = await callRpc("GetSession", {});
     topics = session.topics || [];
-    focusTopicId = session.focusTopicId || (topics[0] && topics[0].id) || null;
+    serverFocusTopicId = session.focusTopicId || null;
+    // When the last unfinished topic completes the server clears focus, so fall back to the
+    // newest topic — that is the conversation the user was just reading, and `sendTurn` below
+    // re-asserts it server-side before sending.
+    focusTopicId = serverFocusTopicId || (topics.length && topics[topics.length - 1].id) || null;
     renderTopics();
+    if (!keepTranscript) renderTranscript();
   }
 
   document.getElementById("sendForm").onsubmit = async (event) => {
@@ -221,10 +307,25 @@
     const content = input.value.trim();
     if (!content || !focusTopicId) return;
     input.value = "";
+    appendMessage("you", content);
     try {
-      await callRpc("SendTurn", { turnId: crypto.randomUUID(), content });
+      // SendTurn routes to whatever the *server* calls focus. If we're showing a topic it has
+      // moved (or cleared) focus off, say so first, or the turn lands on the wrong topic — or
+      // on none at all.
+      if (focusTopicId !== serverFocusTopicId) {
+        await callRpc("SetFocus", { topicId: focusTopicId });
+        serverFocusTopicId = focusTopicId;
+      }
+      const sent = await callRpc("SendTurn", { turnId: crypto.randomUUID(), content });
+      // A turn on a completed topic comes back as a *new* (child) topic. Follow the focus onto
+      // it without clearing the transcript: to the user this is one continuous conversation.
+      if (sent.topicId && sent.topicId !== focusTopicId) {
+        focusTopicId = sent.topicId;
+        serverFocusTopicId = sent.topicId;
+      }
+      await loadSession(true);
     } catch (err) {
-      transcript.appendChild(element("div", "msg error", err.message));
+      appendMessage("!", err.message, "error");
     }
   };
 
@@ -239,7 +340,7 @@
       await loadSession();
       await setFocus(created.topicId);
     } catch (err) {
-      transcript.appendChild(element("div", "msg error", err.message));
+      appendMessage("!", err.message, "error");
     }
   };
 
@@ -250,14 +351,14 @@
       try {
         for await (const event of streamChatEvents()) {
           if (event.kind === "topic_completed" || event.kind === "topic_failed" || event.kind === "topic_started" || event.kind === "topic_queued") {
-            await loadSession();
+            await loadSession(true);
           }
           renderEvent(event);
         }
         debugLine("meta", "stream", "ended cleanly");
       } catch (err) {
         debugLine("err", "stream", `${err.message} — retrying in 2s`);
-        transcript.appendChild(element("div", "msg error", `Stream error: ${err.message} — retrying…`));
+        appendMessage("!", `Stream error: ${err.message} — retrying…`, "error");
       }
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }

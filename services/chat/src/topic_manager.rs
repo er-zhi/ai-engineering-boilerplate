@@ -177,36 +177,57 @@ impl TopicManager {
     }
 
     pub async fn send_turn(
-        &self,
+        self: &std::sync::Arc<Self>,
         user_id: Uuid,
         turn_id: Uuid,
         content: String,
     ) -> Result<i64, ChatError> {
-        let (focus_topic_id, _topics) = self.session.get_session_view(user_id).await?;
+        let (focus_topic_id, topics) = self.session.get_session_view(user_id).await?;
+
+        // The dedup check stays up front, so a retry *after* a successful delivery short-circuits
+        // without interrupting the execution a second time.
+        //
+        // It is keyed on the turn across the *whole session*, never on `(focus topic, turn_id)`:
+        // focus is not stable between a delivery and the client's retry. A continuation writes
+        // its marker on the newly created child, and by the time a retry arrives focus may have
+        // moved on again (the child completed, so `move_focus_off_completed` advanced it) or
+        // never moved at all (the `set_focus` below failed after the child was created). Keyed on
+        // the focus topic, those retries miss the marker and re-deliver: a second child topic and
+        // a second Engine execution for one user message, or — worse — the follow-up
+        // `interrupt`ed into whatever unrelated topic happens to hold focus now. Keyed on the
+        // session, the turn is found wherever it landed, and the topic that actually received it
+        // is returned, which is exactly what `SendTurnResponse.topic_id` promises.
+        use crate::entity::message;
+        let session_topic_ids: Vec<i64> = topics.iter().map(|t| t.id).collect();
+        if let Some(delivered) = message::Entity::find()
+            .filter(message::Column::TurnId.eq(turn_id))
+            .filter(message::Column::TopicId.is_in(session_topic_ids))
+            .one(&self.session.db)
+            .await?
+        {
+            return Ok(delivered.topic_id); // already applied — idempotent no-op
+        }
+
         let topic_id = focus_topic_id.ok_or(ChatError::NoFocus)?;
         let topic = topic::Entity::find_by_id(topic_id)
             .one(&self.session.db)
             .await?
             .ok_or(ChatError::TopicNotFound(topic_id))?;
 
-        // The dedup check stays up front, so a retry *after* a successful delivery short-circuits
-        // without interrupting the execution a second time.
-        use crate::entity::message;
-        if message::Entity::find()
-            .filter(message::Column::TopicId.eq(topic_id))
-            .filter(message::Column::TurnId.eq(turn_id))
-            .one(&self.session.db)
-            .await?
-            .is_some()
-        {
-            return Ok(topic_id); // already applied — idempotent no-op
+        // Spec, «Ошибки»: «Реплика в тему со статусом `Completed`: создаётся дочерняя тема от
+        // неё с этой репликой как входом — прошлое не переписывается». A completed topic's
+        // execution is gone, so the turn continues the conversation in a child topic instead.
+        if topic.status == Status::Completed {
+            return self
+                .continue_in_child(user_id, &topic, turn_id, content)
+                .await;
         }
 
         // `execution_id` stays set forever once a topic reaches a terminal status, so its
         // presence says nothing about whether the execution is still there to interrupt. Only a
-        // Running topic can receive a turn; anything else is rejected outright rather than
-        // routed into a doomed Interrupt. (Auto-creating a child topic for a finished one is
-        // the spec's eventual answer and is deliberately out of scope here.)
+        // Running topic can receive a turn; Failed and Cancelled are rejected outright rather
+        // than routed into a doomed Interrupt — the spec gives a continuation rule for
+        // `Completed` only, and a failed topic has no answer to continue from.
         if topic.status != Status::Running {
             return Err(ChatError::TopicNotRunning(topic_id));
         }
@@ -232,6 +253,65 @@ impl TopicManager {
         .insert(&self.session.db)
         .await?;
         Ok(topic_id)
+    }
+
+    /// A turn aimed at a `Completed` topic: spawn a child topic carrying the reply forward, per
+    /// the spec's «создаётся дочерняя тема от неё с этой репликой как входом».
+    ///
+    /// It goes through `create_topic`, not a hand-rolled insert, so a continuation is subject to
+    /// exactly the same rules as any other topic: the per-session concurrency cap, `Queued`
+    /// admission when the cap is full, the session row lock, and the `topic_started`/
+    /// `topic_queued` events the client already knows how to render.
+    ///
+    /// The conversation lives in the child's `question`, because that is the only state key the
+    /// agent graph's prompt actually reads (`engine-core`'s `build_prompt` takes
+    /// `state.question`, and the tool executor's fixed-slug path searches the same key) — a
+    /// separate `context` key would be silently ignored.
+    async fn continue_in_child(
+        self: &std::sync::Arc<Self>,
+        user_id: Uuid,
+        parent: &topic::Model,
+        turn_id: Uuid,
+        content: String,
+    ) -> Result<i64, ChatError> {
+        let question = match parent.result_summary.as_deref() {
+            Some(summary) => format!("Earlier answer:\n{summary}\n\nFollow-up: {content}"),
+            None => {
+                // A completed topic whose final state had no `/llm/reply` — the continuation is
+                // still the right thing to do, but it starts cold, so say so rather than letting
+                // the thread silently lose its context.
+                tracing::warn!(
+                    parent_id = parent.id,
+                    "completed parent topic has no result_summary; \
+                     the continuation starts without the earlier answer"
+                );
+                content.clone()
+            }
+        };
+        let title: String = content.chars().take(60).collect();
+        let input_json = serde_json::json!({ "question": question }).to_string();
+        let (child_id, _status) = self
+            .create_topic(user_id, Some(parent.id), title, input_json)
+            .await?;
+
+        // Same ordering rationale as the Interrupt path above: the dedup marker is written only
+        // after the turn is really delivered (here, after the child topic exists), so a failed
+        // attempt can be retried with the same turn_id instead of reporting a silent no-op.
+        use crate::entity::message;
+        message::ActiveModel {
+            topic_id: Set(child_id),
+            turn_id: Set(turn_id),
+            content: Set(content),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&self.session.db)
+        .await?;
+
+        // The user is talking to the continuation now — `create_topic` only claims focus for the
+        // very first topic in a session, so move it explicitly.
+        self.set_focus(user_id, child_id).await?;
+        Ok(child_id)
     }
 
     /// Consumes one topic's Engine event stream to completion, updating `chat.topics` and
@@ -942,15 +1022,18 @@ mod tests {
     /// set forever after a topic finishes — so a turn aimed at a dead focus topic was routed
     /// into an `Interrupt` on an execution that had already ended. It must be refused instead,
     /// and refused before any Engine call is made.
+    ///
+    /// `Failed` (not `Completed`) is the case that stays refused: the spec's continuation rule
+    /// covers `Completed` only, and a failed topic has no answer to continue from.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_turn_for_a_finished_focus_topic_is_refused_rather_than_interrupted() {
+    async fn a_turn_for_a_failed_focus_topic_is_refused_rather_than_interrupted() {
         let (_test, manager, fake) = manager_with().await;
         let user_id = Uuid::new_v4();
         let (topic_id, _) = manager
             .create_topic(user_id, None, "First".into(), "{}".into())
             .await
             .expect("create");
-        set_status(&manager, topic_id, Status::Completed).await;
+        set_status(&manager, topic_id, Status::Failed).await;
 
         let error = manager
             .send_turn(user_id, Uuid::new_v4(), "hello".into())
@@ -964,6 +1047,190 @@ mod tests {
         );
         let error: connectrpc::ConnectError = error.into();
         assert_eq!(error.code, connectrpc::ErrorCode::FailedPrecondition);
+    }
+
+    const PARENT_ANSWER: &str = "It is a coding agent.";
+    const FOLLOW_UP: &str = "Which IDEs does it integrate with?";
+
+    /// Leaves the session with one `Completed` topic that answered `PARENT_ANSWER`, focused —
+    /// the exact state the user is in when they type a follow-up. Returns
+    /// `(user_id, parent_id, start_execution calls so far)`.
+    async fn session_with_a_completed_focus_topic(
+        manager: &Arc<TopicManager>,
+        fake: &FakeEngine,
+    ) -> (Uuid, i64, usize) {
+        let user_id = Uuid::new_v4();
+        let (parent_id, _) = manager
+            .create_topic(user_id, None, "What is Claude Code?".into(), "{}".into())
+            .await
+            .expect("create");
+        let execution_id = arm_terminal_event(
+            manager,
+            fake,
+            parent_id,
+            "ExecutionCompleted",
+            &format!(
+                r#"{{"ExecutionCompleted":{{"final_state":{{"llm":{{"reply":"{PARENT_ANSWER}"}}}}}}}}"#
+            ),
+        )
+        .await;
+        manager.watch_topic(parent_id, execution_id).await;
+        // The parent completed with nothing else unfinished, so focus was cleared; put the user
+        // back on the topic they were reading, which is where a follow-up is actually typed.
+        manager
+            .set_focus(user_id, parent_id)
+            .await
+            .expect("set_focus");
+        let starts = fake.start_executions.lock().expect("lock").len();
+        (user_id, parent_id, starts)
+    }
+
+    /// The user's report: «чаты при создании топика сразу закрываются» — a topic finishes in
+    /// seconds and every further message was refused, so the chat looked dead on arrival. Spec,
+    /// «Ошибки»: a reply to a `Completed` topic creates a child topic from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_for_a_completed_focus_topic_starts_a_child_that_carries_the_answer_forward() {
+        let (_test, manager, fake) = manager_with().await;
+        let (user_id, parent_id, starts_before) =
+            session_with_a_completed_focus_topic(&manager, &fake).await;
+
+        let turn_id = Uuid::new_v4();
+        let child_id = manager
+            .send_turn(user_id, turn_id, FOLLOW_UP.into())
+            .await
+            .expect("a completed topic must accept a follow-up");
+
+        assert_ne!(child_id, parent_id, "the follow-up gets its own topic");
+        let child = topic::Entity::find_by_id(child_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("child topic");
+        assert_eq!(child.parent_id, Some(parent_id));
+        assert_eq!(child.status, Status::Running);
+        assert_eq!(child.title, FOLLOW_UP);
+        assert_eq!(
+            focus_of(&manager, user_id).await,
+            Some(child_id),
+            "the user is talking to the continuation now"
+        );
+
+        let starts = fake.start_executions.lock().expect("lock");
+        assert_eq!(
+            starts.len(),
+            starts_before + 1,
+            "exactly one new Engine execution for the child topic"
+        );
+        let input = &starts.last().expect("child start").input_json;
+        let state: serde_json::Value = serde_json::from_str(input).expect("input is json");
+        // It has to land under `question`: that is the only state key the agent graph's prompt
+        // reads, so a follow-up parked anywhere else would be silently ignored.
+        let question = state
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .expect("the child's input carries a `question`");
+        assert!(
+            question.contains(PARENT_ANSWER),
+            "the child's question must carry the parent's answer: {question}"
+        );
+        assert!(
+            question.contains(FOLLOW_UP),
+            "the child's question must carry the new turn: {question}"
+        );
+    }
+
+    /// The review finding: the dedup lookup was keyed on `(focus topic, turn_id)`, but a
+    /// continuation writes its marker on the *child*. Focus does not stand still between a
+    /// delivery and the client's retry — here the child completes first, so focus moves on to a
+    /// Running sibling. Keyed on the focus topic, the retry missed the marker and `interrupt`ed
+    /// the follow-up into that unrelated topic; keyed on the session, it is recognised as already
+    /// delivered and still reports the child that received it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_is_still_a_no_op_after_focus_has_moved_off_the_child() {
+        let (_test, manager, fake) = manager_with().await;
+        let (user_id, _parent_id, _starts) =
+            session_with_a_completed_focus_topic(&manager, &fake).await;
+        // A background topic that stays Running — focus lands here when the child completes.
+        let (sibling_id, status) = manager
+            .create_topic(user_id, None, "Background".into(), "{}".into())
+            .await
+            .expect("create sibling");
+        assert_eq!(status, Status::Running);
+
+        let turn_id = Uuid::new_v4();
+        let child_id = manager
+            .send_turn(user_id, turn_id, FOLLOW_UP.into())
+            .await
+            .expect("send_turn");
+        let starts_after_child = fake.start_executions.lock().expect("lock").len();
+
+        // The child completes, so focus advances to the still-Running sibling.
+        let execution_id = arm_terminal_event(
+            &manager,
+            &fake,
+            child_id,
+            "ExecutionCompleted",
+            r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"VS Code and JetBrains."}}}}"#,
+        )
+        .await;
+        manager.watch_topic(child_id, execution_id).await;
+        assert_eq!(
+            focus_of(&manager, user_id).await,
+            Some(sibling_id),
+            "focus must have moved off the completed child for this test to mean anything"
+        );
+
+        let repeated = manager
+            .send_turn(user_id, turn_id, FOLLOW_UP.into())
+            .await
+            .expect("the retry must be recognised as already delivered");
+
+        assert_eq!(
+            repeated, child_id,
+            "the retry must report the topic that actually received the turn, not the new focus"
+        );
+        assert!(
+            fake.interrupts.lock().expect("lock").is_empty(),
+            "the follow-up must not be interrupted into the unrelated background topic"
+        );
+        assert_eq!(
+            fake.start_executions.lock().expect("lock").len(),
+            starts_after_child,
+            "and no second continuation may be started"
+        );
+    }
+
+    /// The turn_id contract holds across the continuation path too: a client retry must not
+    /// spawn a second child topic (and a second Engine execution) for one user message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_turn_id_does_not_spawn_a_second_continuation() {
+        let (_test, manager, fake) = manager_with().await;
+        let (user_id, _parent_id, starts_before) =
+            session_with_a_completed_focus_topic(&manager, &fake).await;
+        let turn_id = Uuid::new_v4();
+        let child_id = manager
+            .send_turn(user_id, turn_id, FOLLOW_UP.into())
+            .await
+            .expect("send_turn");
+
+        let repeated = manager
+            .send_turn(user_id, turn_id, FOLLOW_UP.into())
+            .await
+            .expect("the repeat must succeed as a no-op");
+        assert_eq!(repeated, child_id);
+        assert_eq!(
+            fake.start_executions.lock().expect("lock").len(),
+            starts_before + 1,
+            "a repeated turn_id must not spawn a second continuation"
+        );
+        use crate::entity::message;
+        let stored = message::Entity::find()
+            .filter(message::Column::TopicId.eq(child_id))
+            .filter(message::Column::TurnId.eq(turn_id))
+            .all(&manager.session.db)
+            .await
+            .expect("query messages");
+        assert_eq!(stored.len(), 1, "one message row on the child, not two");
     }
 
     /// The finding: the dedup row was written before `interrupt` was called, so a transient

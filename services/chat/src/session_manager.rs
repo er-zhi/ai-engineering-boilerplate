@@ -4,6 +4,7 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder,
 };
 use uuid::Uuid;
 
@@ -45,8 +46,14 @@ impl SessionManager {
         user_id: Uuid,
     ) -> Result<(Option<i64>, Vec<topic::Model>), ChatError> {
         let session = self.get_or_create_session(user_id).await?;
+        // Oldest first, explicitly. Without an ORDER BY this is heap order, which Postgres
+        // reshuffles as rows are UPDATEd — and topic rows are updated on every status change. The
+        // client relies on this order both to draw the topic panel and to pick the newest topic
+        // when the server has cleared focus, so an arbitrary order there attaches a follow-up to
+        // whichever conversation happened to sort last.
         let topics = topic::Entity::find()
             .filter(topic::Column::SessionId.eq(session.id))
+            .order_by_asc(topic::Column::CreatedAt)
             .all(&self.db)
             .await?;
         Ok((session.focus_topic_id, topics))
