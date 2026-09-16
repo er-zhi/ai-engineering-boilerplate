@@ -4,6 +4,11 @@ x-rebuild-on-save: &rebuild-on-save
     - action: rebuild
       path: .
 
+# Cargo profile every Rust image is built with. `dev` keeps local rebuilds fast; set
+# BUILD_PROFILE=release in .env (or the environment) for anything shipped.
+x-build-args: &build-args
+  BUILD_PROFILE: ${BUILD_PROFILE:-dev}
+
 configs:
   postgres-bootstrap:
     content: |
@@ -81,6 +86,7 @@ services:
   crawler:
     build:
       dockerfile: services/crawler/Dockerfile
+      args: *build-args
     develop: *rebuild-on-save
     environment:
       CRAWL_MAX_PAGES:
@@ -101,6 +107,7 @@ services:
   knowledge-base:
     build:
       dockerfile: services/knowledge-base/Dockerfile
+      args: *build-args
     develop: *rebuild-on-save
     environment:
       LLM_ROUTER_URL: http://llm-router:8083
@@ -134,6 +141,7 @@ services:
   llm-router:
     build:
       dockerfile: services/llm-router/Dockerfile
+      args: *build-args
     develop: *rebuild-on-save
     environment:
       # The only service given the provider key.
@@ -158,6 +166,7 @@ services:
   engine:
     build:
       dockerfile: services/engine/Dockerfile
+      args: *build-args
     develop: *rebuild-on-save
     environment:
       LLM_ROUTER_URL: http://llm-router:8083
@@ -181,6 +190,7 @@ services:
   tool:
     build:
       dockerfile: services/tool/Dockerfile
+      args: *build-args
     develop: *rebuild-on-save
     environment:
       LLM_ROUTER_URL: http://llm-router:8083
@@ -204,6 +214,7 @@ services:
   chat:
     build:
       dockerfile: services/chat/Dockerfile
+      args: *build-args
     develop: *rebuild-on-save
     environment:
       ENGINE_URL: http://engine:8085
@@ -225,6 +236,7 @@ services:
   gateway:
     build:
       dockerfile: services/gateway/Dockerfile
+      args: *build-args
     develop: *rebuild-on-save
     ports:
       - "8080:8080"
