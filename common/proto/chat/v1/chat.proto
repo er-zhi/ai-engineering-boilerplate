@@ -31,7 +31,8 @@ message SendTurnRequest {
   string content = 2;   // routed to the session's current focus topic
 }
 message SendTurnResponse {
-  string topic_id = 1;  // the topic that actually received it (the focus at send time)
+  string topic_id = 1;           // the first topic that received it — kept for older clients
+  repeated string topic_ids = 2; // every topic the classifier routed this turn to
 }
 
 message GetSessionRequest {}
@@ -46,6 +47,15 @@ message Topic {
   string status = 4;              // "queued"|"running"|"completed"|"failed"|"cancelled"
   optional string execution_id = 5;
   optional string result_summary = 6;
+  string question = 7;            // the self-contained question the topic was started with
+  string created_at = 8;          // RFC 3339
+  string updated_at = 9;          // RFC 3339
+  repeated Message messages = 10; // the user turns delivered to this topic, oldest first
+}
+message Message {
+  string id = 1;
+  string content = 2;
+  string created_at = 3;          // RFC 3339
 }
 
 message ResetSessionRequest {}
@@ -59,4 +69,5 @@ message ChatEvent {
   string kind = 2;
   string payload_json = 3;
   string occurred_at = 4;         // RFC 3339
+  string session_id = 5;          // the session this event belongs to
 }

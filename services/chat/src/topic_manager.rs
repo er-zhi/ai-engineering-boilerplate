@@ -10,10 +10,12 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
+use crate::classifier::{Action, TopicClassifier, TopicSummary};
 use crate::engine_client::EngineClient;
 use crate::entity::session;
 use crate::entity::topic::{self, Status};
 use crate::error::ChatError;
+use crate::event_log::event;
 use crate::events::EventBus;
 use crate::session_manager::SessionManager;
 
@@ -40,15 +42,82 @@ pub struct TopicManager {
     pub session: SessionManager,
     pub(crate) engine: EngineClient,
     pub events: EventBus,
+    pub(crate) classifier: TopicClassifier,
 }
 
 impl TopicManager {
-    pub fn new(db: DatabaseConnection, engine_url: &str) -> Result<Self, String> {
+    pub fn new(
+        db: DatabaseConnection,
+        engine_url: &str,
+        llm_router_url: &str,
+    ) -> Result<Self, String> {
         Ok(Self {
             session: SessionManager::new(db),
             engine: EngineClient::new(engine_url)?,
             events: EventBus::default(),
+            classifier: TopicClassifier::new(llm_router_url)?,
         })
+    }
+
+    /// Every lifecycle event goes through here: appended to `chat.events` **and** broadcast to
+    /// whatever `StreamEvents` calls are attached right now. The stored row is what a client that
+    /// reloads replays; the broadcast is what an already-connected client sees live.
+    ///
+    /// A failed insert is logged, never propagated: losing the durable copy of a `topic_started`
+    /// must not fail the topic that just started. The live event still goes out.
+    async fn publish(&self, session_id: Uuid, event: ChatEvent) {
+        let payload_json: serde_json::Value = serde_json::from_str(&event.payload_json)
+            .unwrap_or_else(|_| serde_json::json!({"text": event.payload_json}));
+        let occurred_at = chrono::DateTime::parse_from_rfc3339(&event.occurred_at)
+            .map(|at| at.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let stored = event::ActiveModel {
+            session_id: Set(session_id),
+            topic_id: Set(event.topic_id.parse::<i64>().ok()),
+            kind: Set(event.kind.clone()),
+            payload_json: Set(payload_json),
+            occurred_at: Set(occurred_at),
+            ..Default::default()
+        }
+        .insert(&self.session.db)
+        .await;
+        if let Err(error) = stored {
+            tracing::error!(%error, kind = %event.kind, "failed to persist a chat event");
+        }
+        self.events.publish(ChatEvent {
+            session_id: session_id.to_string(),
+            ..event
+        });
+    }
+
+    /// Every stored event for a session, oldest first — `StreamEvents`' replay.
+    pub async fn stored_events(&self, session_id: Uuid) -> Result<Vec<ChatEvent>, ChatError> {
+        let rows = event::Entity::find()
+            .filter(event::Column::SessionId.eq(session_id))
+            .order_by_asc(event::Column::Id)
+            .all(&self.session.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChatEvent {
+                topic_id: row.topic_id.map(|id| id.to_string()).unwrap_or_default(),
+                kind: row.kind,
+                payload_json: row.payload_json.to_string(),
+                occurred_at: row.occurred_at.to_rfc3339(),
+                session_id: session_id.to_string(),
+                ..Default::default()
+            })
+            .collect())
+    }
+
+    /// `session_id` is immutable once a topic is created, so this is a plain unlocked read —
+    /// it only answers "which session does this event belong to".
+    async fn session_of_topic(&self, topic_id: i64) -> Result<Uuid, ChatError> {
+        Ok(topic::Entity::find_by_id(topic_id)
+            .one(&self.session.db)
+            .await?
+            .ok_or(ChatError::TopicNotFound(topic_id))?
+            .session_id)
     }
 
     pub async fn create_topic(
@@ -63,17 +132,39 @@ impl TopicManager {
             .insert_topic(session.id, parent_id, title, &input_json)
             .await?;
 
-        self.events.publish(ChatEvent {
-            topic_id: row.id.to_string(),
-            kind: if row.status == Status::Running {
-                "topic_started"
-            } else {
-                "topic_queued"
-            }
-            .to_owned(),
-            occurred_at: row.created_at.to_rfc3339(),
-            ..Default::default()
-        });
+        // `topic_created` first, then how it was admitted: the replay is the only thing a
+        // reloading client has, so the event that says a topic exists (and what it is about) has
+        // to be in it, not just the status transition.
+        self.publish(
+            session.id,
+            ChatEvent {
+                topic_id: row.id.to_string(),
+                kind: "topic_created".to_owned(),
+                payload_json: serde_json::json!({
+                    "title": row.title,
+                    "parent_id": parent_id,
+                })
+                .to_string(),
+                occurred_at: row.created_at.to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .await;
+        self.publish(
+            session.id,
+            ChatEvent {
+                topic_id: row.id.to_string(),
+                kind: if row.status == Status::Running {
+                    "topic_started"
+                } else {
+                    "topic_queued"
+                }
+                .to_owned(),
+                occurred_at: row.created_at.to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .await;
 
         if let (Status::Running, Some(execution_id)) = (row.status, row.execution_id) {
             self.spawn_watch(row.id, execution_id);
@@ -166,22 +257,34 @@ impl TopicManager {
         active.focus_topic_id = Set(Some(topic_id));
         active.update(&self.session.db).await?;
 
-        self.events.publish(ChatEvent {
-            topic_id: topic.id.to_string(),
-            kind: "focus_changed".to_owned(),
-            payload_json: serde_json::json!({"from": previous, "reason": "user"}).to_string(),
-            occurred_at: Utc::now().to_rfc3339(),
-            ..Default::default()
-        });
+        self.publish(
+            session.id,
+            ChatEvent {
+                topic_id: topic.id.to_string(),
+                kind: "focus_changed".to_owned(),
+                payload_json:
+                    serde_json::json!({"from": previous, "to": topic_id, "reason": "user"})
+                        .to_string(),
+                occurred_at: Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .await;
         Ok(())
     }
 
+    /// A user turn, routed by the LLM classifier rather than by a hand-made topic choice.
+    ///
+    /// Returns every topic the turn was delivered to, first one first — `SendTurnResponse`'s
+    /// `topic_id` is that first entry and `topic_ids` the whole list. A first message naming two
+    /// themes opens two topics here; a mid-conversation aside opens one more beside the running
+    /// one; anything else continues an existing topic, which is still the common case.
     pub async fn send_turn(
         self: &std::sync::Arc<Self>,
         user_id: Uuid,
         turn_id: Uuid,
         content: String,
-    ) -> Result<i64, ChatError> {
+    ) -> Result<Vec<i64>, ChatError> {
         let (focus_topic_id, topics) = self.session.get_session_view(user_id).await?;
 
         // The dedup check stays up front, so a retry *after* a successful delivery short-circuits
@@ -197,62 +300,148 @@ impl TopicManager {
         // `interrupt`ed into whatever unrelated topic happens to hold focus now. Keyed on the
         // session, the turn is found wherever it landed, and the topic that actually received it
         // is returned, which is exactly what `SendTurnResponse.topic_id` promises.
-        use crate::entity::message;
-        let session_topic_ids: Vec<i64> = topics.iter().map(|t| t.id).collect();
-        if let Some(delivered) = message::Entity::find()
-            .filter(message::Column::TurnId.eq(turn_id))
-            .filter(message::Column::TopicId.is_in(session_topic_ids))
-            .one(&self.session.db)
-            .await?
-        {
-            return Ok(delivered.topic_id); // already applied — idempotent no-op
+        if let Some(delivered) = self.already_delivered(turn_id, &topics).await? {
+            return Ok(delivered); // already applied — idempotent no-op
         }
 
-        let topic_id = focus_topic_id.ok_or(ChatError::NoFocus)?;
-        let topic = topic::Entity::find_by_id(topic_id)
-            .one(&self.session.db)
-            .await?
-            .ok_or(ChatError::TopicNotFound(topic_id))?;
+        let summaries: Vec<TopicSummary> = topics
+            .iter()
+            .map(|topic| TopicSummary {
+                id: topic.id,
+                title: topic.title.clone(),
+                status: crate::status_to_str(topic.status),
+                result_summary: topic.result_summary.clone(),
+            })
+            .collect();
+        let actions = self
+            .classifier
+            .classify(&summaries, focus_topic_id, &content)
+            .await;
 
-        // Spec, «Ошибки»: «Реплика в тему со статусом `Completed`: создаётся дочерняя тема от
-        // неё с этой репликой как входом — прошлое не переписывается». A completed topic's
-        // execution is gone, so the turn continues the conversation in a child topic instead.
-        if topic.status == Status::Completed {
-            return self
-                .continue_in_child(user_id, &topic, turn_id, content)
-                .await;
-        }
-
-        // `execution_id` stays set forever once a topic reaches a terminal status, so its
-        // presence says nothing about whether the execution is still there to interrupt. Only a
-        // Running topic can receive a turn; Failed and Cancelled are rejected outright rather
-        // than routed into a doomed Interrupt — the spec gives a continuation rule for
-        // `Completed` only, and a failed topic has no answer to continue from.
-        if topic.status != Status::Running {
-            return Err(ChatError::TopicNotRunning(topic_id));
-        }
-        let execution_id = topic.execution_id.ok_or(ChatError::InvalidRequest(format!(
-            "topic {topic_id} has no running execution to interrupt"
-        )))?;
-        let input_json = serde_json::json!({"question": content}).to_string();
-        self.engine
-            .interrupt(execution_id, &input_json)
-            .await
-            .map_err(ChatError::Engine)?;
-
+        let (received, new_focus) = self
+            .apply_actions(user_id, &topics, &content, actions)
+            .await?;
         // Only now is the turn actually delivered, so only now is the dedup marker written. The
         // other order loses the turn for good on a transient Interrupt failure: the client's
         // documented same-turn_id retry would find the row and report success as a no-op.
-        message::ActiveModel {
-            topic_id: Set(topic_id),
-            turn_id: Set(turn_id),
-            content: Set(content),
-            created_at: Set(Utc::now()),
-            ..Default::default()
+        use crate::entity::message;
+        let now = Utc::now();
+        for topic_id in &received {
+            message::ActiveModel {
+                topic_id: Set(*topic_id),
+                turn_id: Set(turn_id),
+                content: Set(content.clone()),
+                created_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&self.session.db)
+            .await?;
         }
-        .insert(&self.session.db)
-        .await?;
-        Ok(topic_id)
+
+        if let Some(topic_id) = new_focus {
+            self.set_focus(user_id, topic_id).await?;
+        }
+        Ok(received)
+    }
+
+    /// The dedup check that keeps `send_turn` idempotent, keyed on the turn across the *whole
+    /// session* and never on `(focus topic, turn_id)`: focus is not stable between a delivery and
+    /// the client's retry. A continuation writes its marker on the newly created child, and by the
+    /// time a retry arrives focus may have moved on again (the child completed, so
+    /// `move_focus_off_completed` advanced it) or never moved at all. Keyed on the focus topic,
+    /// those retries miss the marker and re-deliver: a second child topic and a second Engine
+    /// execution for one user message, or — worse — the follow-up `interrupt`ed into whatever
+    /// unrelated topic happens to hold focus now. Keyed on the session, the turn is found wherever
+    /// it landed, and every topic that received it is reported, which is exactly what
+    /// `SendTurnResponse` promises.
+    async fn already_delivered(
+        &self,
+        turn_id: Uuid,
+        topics: &[topic::Model],
+    ) -> Result<Option<Vec<i64>>, ChatError> {
+        use crate::entity::message;
+        let delivered: Vec<i64> = message::Entity::find()
+            .filter(message::Column::TurnId.eq(turn_id))
+            .filter(message::Column::TopicId.is_in(topics.iter().map(|t| t.id).collect::<Vec<_>>()))
+            .order_by_asc(message::Column::Id)
+            .all(&self.session.db)
+            .await?
+            .into_iter()
+            .map(|row| row.topic_id)
+            .collect();
+        Ok((!delivered.is_empty()).then_some(delivered))
+    }
+
+    /// Applies one classification: returns `(every topic the turn reached, the topic focus should
+    /// move to)`. Focus moves only to a topic this turn *created* — a new theme, or the
+    /// continuation of a completed one; a turn that merely continues running topics leaves the
+    /// pointer where the user put it.
+    async fn apply_actions(
+        self: &std::sync::Arc<Self>,
+        user_id: Uuid,
+        topics: &[topic::Model],
+        content: &str,
+        actions: Vec<Action>,
+    ) -> Result<(Vec<i64>, Option<i64>), ChatError> {
+        let mut received: Vec<i64> = Vec::new();
+        let mut new_focus: Option<i64> = None;
+        // Why a classification can end up delivering nothing: it continued a Failed or Cancelled
+        // topic, which has no execution to interrupt and no answer to continue from. Held rather
+        // than returned on the spot, so a second action that *does* deliver still wins.
+        let mut refusal: Option<ChatError> = None;
+
+        for action in actions {
+            match action {
+                Action::New { title, question } => {
+                    let input_json = serde_json::json!({ "question": question }).to_string();
+                    let (topic_id, _status) =
+                        self.create_topic(user_id, None, title, input_json).await?;
+                    received.push(topic_id);
+                    new_focus.get_or_insert(topic_id);
+                }
+                Action::Continue { topic_id } => {
+                    let Some(topic) = topics.iter().find(|t| t.id == topic_id) else {
+                        continue; // the session changed under us; the other actions still stand
+                    };
+                    match topic.status {
+                        // Spec, «Ошибки»: «Реплика в тему со статусом `Completed`: создаётся
+                        // дочерняя тема от неё с этой репликой как входом — прошлое не
+                        // переписывается». A completed topic's execution is gone.
+                        Status::Completed => {
+                            let child_id = self.continue_in_child(user_id, topic, content).await?;
+                            received.push(child_id);
+                            new_focus.get_or_insert(child_id);
+                        }
+                        Status::Running => {
+                            // `execution_id` stays set forever once a topic reaches a terminal
+                            // status, so its presence says nothing about whether the execution is
+                            // still there — only the status does, and it says Running here.
+                            let execution_id =
+                                topic.execution_id.ok_or(ChatError::InvalidRequest(format!(
+                                    "topic {topic_id} has no running execution to interrupt"
+                                )))?;
+                            let input_json = serde_json::json!({"question": content}).to_string();
+                            self.engine
+                                .interrupt(execution_id, &input_json)
+                                .await
+                                .map_err(ChatError::Engine)?;
+                            received.push(topic_id);
+                        }
+                        // A queued topic has no execution yet: the message is recorded against it
+                        // and `promote_next_queued` will start it from its original input.
+                        Status::Queued => received.push(topic_id),
+                        Status::Failed | Status::Cancelled => {
+                            refusal.get_or_insert(ChatError::TopicNotRunning(topic_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        if received.is_empty() {
+            return Err(refusal.unwrap_or(ChatError::NoFocus));
+        }
+        Ok((received, new_focus))
     }
 
     /// A turn aimed at a `Completed` topic: spawn a child topic carrying the reply forward, per
@@ -271,8 +460,7 @@ impl TopicManager {
         self: &std::sync::Arc<Self>,
         user_id: Uuid,
         parent: &topic::Model,
-        turn_id: Uuid,
-        content: String,
+        content: &str,
     ) -> Result<i64, ChatError> {
         let question = match parent.result_summary.as_deref() {
             Some(summary) => format!("Earlier answer:\n{summary}\n\nFollow-up: {content}"),
@@ -285,7 +473,7 @@ impl TopicManager {
                     "completed parent topic has no result_summary; \
                      the continuation starts without the earlier answer"
                 );
-                content.clone()
+                content.to_owned()
             }
         };
         let title: String = content.chars().take(60).collect();
@@ -293,24 +481,7 @@ impl TopicManager {
         let (child_id, _status) = self
             .create_topic(user_id, Some(parent.id), title, input_json)
             .await?;
-
-        // Same ordering rationale as the Interrupt path above: the dedup marker is written only
-        // after the turn is really delivered (here, after the child topic exists), so a failed
-        // attempt can be retried with the same turn_id instead of reporting a silent no-op.
-        use crate::entity::message;
-        message::ActiveModel {
-            topic_id: Set(child_id),
-            turn_id: Set(turn_id),
-            content: Set(content),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        }
-        .insert(&self.session.db)
-        .await?;
-
-        // The user is talking to the continuation now — `create_topic` only claims focus for the
-        // very first topic in a session, so move it explicitly.
-        self.set_focus(user_id, child_id).await?;
+        // `send_turn` writes the dedup marker and moves focus once every action has been applied.
         Ok(child_id)
     }
 
@@ -354,13 +525,18 @@ impl TopicManager {
             "ExecutionCompleted" => self.finish_topic(topic_id, Status::Completed, event).await,
             "ExecutionFailed" => self.finish_topic(topic_id, Status::Failed, event).await,
             _ => {
-                self.events.publish(ChatEvent {
-                    topic_id: topic_id.to_string(),
-                    kind: "topic_progress".to_owned(),
-                    payload_json: event.payload_json.clone(),
-                    occurred_at: event.occurred_at.clone(),
-                    ..Default::default()
-                });
+                let session_id = self.session_of_topic(topic_id).await?;
+                self.publish(
+                    session_id,
+                    ChatEvent {
+                        topic_id: topic_id.to_string(),
+                        kind: "topic_progress".to_owned(),
+                        payload_json: event.payload_json.clone(),
+                        occurred_at: event.occurred_at.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
                 Ok(())
             }
         }
@@ -394,46 +570,76 @@ impl TopicManager {
             .update_topic_status_and_move_focus(topic_id, status, summary.clone())
             .await?;
 
-        let kind = if status == Status::Completed {
-            "topic_completed"
-        } else {
-            "topic_failed"
-        };
-        self.events.publish(ChatEvent {
-            topic_id: topic_id.to_string(),
-            kind: kind.to_owned(),
-            payload_json: serde_json::json!({"summary": summary}).to_string(),
-            occurred_at: row.updated_at.to_rfc3339(),
-            ..Default::default()
-        });
-        self.events.publish(ChatEvent {
-            topic_id: topic_id.to_string(),
-            kind: "notification".to_owned(),
-            payload_json: serde_json::json!({
-                "kind": if status == Status::Completed { "completed" } else { "failed" },
-                "text": summary,
-            })
-            .to_string(),
-            occurred_at: row.updated_at.to_rfc3339(),
-            ..Default::default()
-        });
-
-        if let Some((next, from)) = focus_change {
-            self.events.publish(ChatEvent {
-                topic_id: next.map(|id| id.to_string()).unwrap_or_default(),
-                kind: "focus_changed".to_owned(),
-                payload_json: serde_json::json!({
-                    "from": from,
-                    "to": next,
-                    "reason": "completion",
-                })
-                .to_string(),
-                occurred_at: Utc::now().to_rfc3339(),
-                ..Default::default()
-            });
-        }
+        self.publish_terminal_events(&row, status, summary.as_deref(), focus_change)
+            .await;
 
         self.promote_next_queued(row.session_id).await
+    }
+
+    /// The three events a terminal topic produces, in the order a client has to see them: the
+    /// lifecycle event, the notification carrying the answer («уведомление — это событие, которое
+    /// клиент отображает в чате»), and — only when the finished topic held focus — where focus
+    /// went.
+    async fn publish_terminal_events(
+        &self,
+        row: &topic::Model,
+        status: Status,
+        summary: Option<&str>,
+        focus_change: Option<(Option<i64>, i64)>,
+    ) {
+        let completed = status == Status::Completed;
+        let session_id = row.session_id;
+        let occurred_at = row.updated_at.to_rfc3339();
+        self.publish(
+            session_id,
+            ChatEvent {
+                topic_id: row.id.to_string(),
+                kind: if completed {
+                    "topic_completed"
+                } else {
+                    "topic_failed"
+                }
+                .to_owned(),
+                payload_json: serde_json::json!({"summary": summary}).to_string(),
+                occurred_at: occurred_at.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        self.publish(
+            session_id,
+            ChatEvent {
+                topic_id: row.id.to_string(),
+                kind: "notification".to_owned(),
+                payload_json: serde_json::json!({
+                    "kind": if completed { "completed" } else { "failed" },
+                    "text": summary,
+                })
+                .to_string(),
+                occurred_at,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        if let Some((next, from)) = focus_change {
+            self.publish(
+                session_id,
+                ChatEvent {
+                    topic_id: next.map(|id| id.to_string()).unwrap_or_default(),
+                    kind: "focus_changed".to_owned(),
+                    payload_json: serde_json::json!({
+                        "from": from,
+                        "to": next,
+                        "reason": "completion",
+                    })
+                    .to_string(),
+                    occurred_at: Utc::now().to_rfc3339(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
     }
 
     /// `finish_topic`'s one atomic decision: mark the topic terminal and, when it was the
@@ -564,12 +770,16 @@ impl TopicManager {
         active.update(&txn).await?;
         txn.commit().await?;
 
-        self.events.publish(ChatEvent {
-            topic_id: next.id.to_string(),
-            kind: "topic_started".to_owned(),
-            occurred_at: Utc::now().to_rfc3339(),
-            ..Default::default()
-        });
+        self.publish(
+            session_id,
+            ChatEvent {
+                topic_id: next.id.to_string(),
+                kind: "topic_started".to_owned(),
+                occurred_at: Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .await;
         self.spawn_watch(next.id, execution_id);
         Ok(())
     }
@@ -615,13 +825,24 @@ impl TopicManager {
                 .exec(&txn)
                 .await?;
         }
+        // The session's event log goes with it: a reset means "none of this happened", and the
+        // replay a reconnecting client gets must not resurrect topics that no longer exist. This
+        // is a per-session domain delete over one user's rows, not the log's retention path
+        // (which is DROP PARTITION — see `event_log`).
+        event::Entity::delete_many()
+            .filter(event::Column::SessionId.eq(locked.id))
+            .exec(&txn)
+            .await?;
         session::Entity::delete_by_id(locked.id).exec(&txn).await?;
         txn.commit().await?;
 
+        // Published, deliberately not persisted: the row would land in the log of a session that
+        // was just deleted, and the next `get_or_create_session` mints a new session id anyway.
         self.events.publish(ChatEvent {
             topic_id: String::new(),
             kind: "session_reset".to_owned(),
             occurred_at: Utc::now().to_rfc3339(),
+            session_id: session.id.to_string(),
             ..Default::default()
         });
         Ok(())
@@ -663,6 +884,10 @@ mod tests {
         InterruptResponse, ListSchedulesRequest, ListSchedulesResponse, RegisterGraphRequest,
         RegisterGraphResponse, ResumeRequest, ResumeResponse, StartExecutionRequest,
         StartExecutionResponse, StreamEventsRequest as EngineStreamEventsRequest,
+    };
+    use common::proto::llm_router::v1::{
+        CompleteRequest, CompleteResponse, DescribeTiersRequest, DescribeTiersResponse,
+        LlmRouterService,
     };
     use connectrpc::{
         RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
@@ -781,8 +1006,51 @@ mod tests {
         }
     }
 
-    async fn serve_engine(fake: Arc<FakeEngine>) -> String {
-        let connect = ConnectRouter::new().add_service(fake);
+    /// The llm-router stand-in for the topic classifier: hands back whatever JSON a test armed
+    /// it with (or fails, when the test is about the fallback path). Same shape as `FakeEngine`.
+    #[derive(Default)]
+    struct FakeLlmRouter {
+        /// The `content` of the next `Complete` response. `None` = answer with an error, which
+        /// is what drives `TopicClassifier`'s fallback.
+        answer: Mutex<Option<String>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl FakeLlmRouter {
+        fn answer_with(&self, content: &str) {
+            *self.answer.lock().expect("lock") = Some(content.to_owned());
+        }
+    }
+
+    #[allow(refining_impl_trait)]
+    impl LlmRouterService for FakeLlmRouter {
+        async fn complete(
+            &self,
+            _ctx: RequestContext,
+            request: ServiceRequest<'_, CompleteRequest>,
+        ) -> ServiceResult<CompleteResponse> {
+            let owned = request.to_owned_message();
+            self.prompts.lock().expect("lock").push(owned.user_prompt);
+            match self.answer.lock().expect("lock").clone() {
+                Some(content) => Response::ok(CompleteResponse {
+                    content,
+                    ..Default::default()
+                }),
+                None => Err(connectrpc::ConnectError::unavailable(
+                    "configured fake llm-router failure",
+                )),
+            }
+        }
+        async fn describe_tiers(
+            &self,
+            _ctx: RequestContext,
+            _request: ServiceRequest<'_, DescribeTiersRequest>,
+        ) -> ServiceResult<DescribeTiersResponse> {
+            Response::ok(DescribeTiersResponse::default())
+        }
+    }
+
+    async fn serve(connect: ConnectRouter) -> String {
         let app = axum::Router::new().fallback_service(connect.into_axum_service());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -793,11 +1061,25 @@ mod tests {
     }
 
     async fn manager_with() -> (crate::test_db::TestDb, Arc<TopicManager>, Arc<FakeEngine>) {
+        let (test, manager, engine, _router) = manager_with_router().await;
+        (test, manager, engine)
+    }
+
+    async fn manager_with_router() -> (
+        crate::test_db::TestDb,
+        Arc<TopicManager>,
+        Arc<FakeEngine>,
+        Arc<FakeLlmRouter>,
+    ) {
         let test = crate::test_db::start().await;
         let fake = Arc::new(FakeEngine::default());
-        let engine_url = serve_engine(Arc::clone(&fake)).await;
-        let manager = Arc::new(TopicManager::new(test.db.clone(), &engine_url).expect("manager"));
-        (test, manager, fake)
+        let router = Arc::new(FakeLlmRouter::default());
+        let engine_url = serve(ConnectRouter::new().add_service(Arc::clone(&fake))).await;
+        let router_url = serve(ConnectRouter::new().add_service(Arc::clone(&router))).await;
+        let manager = Arc::new(
+            TopicManager::new(test.db.clone(), &engine_url, &router_url).expect("manager"),
+        );
+        (test, manager, fake, router)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -928,7 +1210,7 @@ mod tests {
             .send_turn(user_id, turn_id, "hello".into())
             .await
             .expect("send_turn");
-        assert_eq!(routed, topic_id);
+        assert_eq!(routed, vec![topic_id]);
 
         {
             let interrupts = fake.interrupts.lock().expect("lock");
@@ -1051,6 +1333,13 @@ mod tests {
         execution_id
     }
 
+    /// `send_turn` returns every topic a turn reached; most tests route to exactly one and want
+    /// that id, with the count itself asserted.
+    fn one_topic(topic_ids: Vec<i64>) -> i64 {
+        assert_eq!(topic_ids.len(), 1, "expected one topic: {topic_ids:?}");
+        topic_ids[0]
+    }
+
     async fn focus_of(manager: &Arc<TopicManager>, user_id: Uuid) -> Option<i64> {
         manager
             .session
@@ -1148,10 +1437,12 @@ mod tests {
             session_with_a_completed_focus_topic(&manager, &fake).await;
 
         let turn_id = Uuid::new_v4();
-        let child_id = manager
-            .send_turn(user_id, turn_id, FOLLOW_UP.into())
-            .await
-            .expect("a completed topic must accept a follow-up");
+        let child_id = one_topic(
+            manager
+                .send_turn(user_id, turn_id, FOLLOW_UP.into())
+                .await
+                .expect("a completed topic must accept a follow-up"),
+        );
 
         assert_ne!(child_id, parent_id, "the follow-up gets its own topic");
         let child = topic::Entity::find_by_id(child_id)
@@ -1211,10 +1502,12 @@ mod tests {
         assert_eq!(status, Status::Running);
 
         let turn_id = Uuid::new_v4();
-        let child_id = manager
-            .send_turn(user_id, turn_id, FOLLOW_UP.into())
-            .await
-            .expect("send_turn");
+        let child_id = one_topic(
+            manager
+                .send_turn(user_id, turn_id, FOLLOW_UP.into())
+                .await
+                .expect("send_turn"),
+        );
         let starts_after_child = fake.start_executions.lock().expect("lock").len();
 
         // The child completes, so focus advances to the still-Running sibling.
@@ -1233,10 +1526,12 @@ mod tests {
             "focus must have moved off the completed child for this test to mean anything"
         );
 
-        let repeated = manager
-            .send_turn(user_id, turn_id, FOLLOW_UP.into())
-            .await
-            .expect("the retry must be recognised as already delivered");
+        let repeated = one_topic(
+            manager
+                .send_turn(user_id, turn_id, FOLLOW_UP.into())
+                .await
+                .expect("the retry must be recognised as already delivered"),
+        );
 
         assert_eq!(
             repeated, child_id,
@@ -1261,15 +1556,19 @@ mod tests {
         let (user_id, _parent_id, starts_before) =
             session_with_a_completed_focus_topic(&manager, &fake).await;
         let turn_id = Uuid::new_v4();
-        let child_id = manager
-            .send_turn(user_id, turn_id, FOLLOW_UP.into())
-            .await
-            .expect("send_turn");
+        let child_id = one_topic(
+            manager
+                .send_turn(user_id, turn_id, FOLLOW_UP.into())
+                .await
+                .expect("send_turn"),
+        );
 
-        let repeated = manager
-            .send_turn(user_id, turn_id, FOLLOW_UP.into())
-            .await
-            .expect("the repeat must succeed as a no-op");
+        let repeated = one_topic(
+            manager
+                .send_turn(user_id, turn_id, FOLLOW_UP.into())
+                .await
+                .expect("the repeat must succeed as a no-op"),
+        );
         assert_eq!(repeated, child_id);
         assert_eq!(
             fake.start_executions.lock().expect("lock").len(),
@@ -1324,7 +1623,7 @@ mod tests {
             .await
             .expect("the retry with the same turn_id must actually deliver");
 
-        assert_eq!(routed, topic_id);
+        assert_eq!(routed, vec![topic_id]);
         assert_eq!(
             fake.interrupts.lock().expect("lock").len(),
             2,
@@ -1631,6 +1930,243 @@ mod tests {
             focus,
             Some(fresh_id),
             "the first topic of the new session becomes focus again"
+        );
+    }
+
+    /// The product decision this change implements: the user never creates a topic by hand, so
+    /// the very first message of a session has to become one — title, question and a started
+    /// Engine execution — with no `CreateTopic` call anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_message_in_an_empty_session_becomes_a_started_topic() {
+        let (_test, manager, fake, router) = manager_with_router().await;
+        let user_id = Uuid::new_v4();
+        router.answer_with(
+            r#"{"actions":[{"kind":"new","title":"Claude Code","question":"What is Claude Code?"}]}"#,
+        );
+
+        let topic_id = one_topic(
+            manager
+                .send_turn(user_id, Uuid::new_v4(), "What is Claude Code?".into())
+                .await
+                .expect("send_turn"),
+        );
+
+        let topic = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic");
+        assert_eq!(topic.title, "Claude Code");
+        assert_eq!(topic.status, Status::Running);
+        assert_eq!(focus_of(&manager, user_id).await, Some(topic_id));
+        let starts = fake.start_executions.lock().expect("lock");
+        assert_eq!(starts.len(), 1, "the message started exactly one execution");
+        let state: serde_json::Value =
+            serde_json::from_str(&starts[0].input_json).expect("input is json");
+        assert_eq!(
+            state.get("question").and_then(serde_json::Value::as_str),
+            Some("What is Claude Code?"),
+            "the classifier's self-contained question is what the worker is given"
+        );
+    }
+
+    /// «Первое сообщение содержит несколько тем → несколько корневых тем, одна в фокусе,
+    /// остальные выполняются параллельно» — and `SendTurnResponse` has to name both, which is
+    /// why `topic_ids` exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_naming_two_themes_opens_two_topics_and_focuses_the_first() {
+        let (_test, manager, fake, router) = manager_with_router().await;
+        let user_id = Uuid::new_v4();
+        router.answer_with(
+            r#"{"actions":[
+                {"kind":"new","title":"Claude Code","question":"What is Claude Code?"},
+                {"kind":"new","title":"Academy courses","question":"Which Claude Academy courses exist?"}
+            ]}"#,
+        );
+
+        let topic_ids = manager
+            .send_turn(
+                user_id,
+                Uuid::new_v4(),
+                "What is Claude Code? And which Academy courses exist?".into(),
+            )
+            .await
+            .expect("send_turn");
+
+        assert_eq!(topic_ids.len(), 2, "one topic per theme: {topic_ids:?}");
+        assert_eq!(
+            focus_of(&manager, user_id).await,
+            Some(topic_ids[0]),
+            "focus goes to the first new topic"
+        );
+        assert_eq!(
+            fake.start_executions.lock().expect("lock").len(),
+            2,
+            "both topics run in parallel"
+        );
+        // The turn is recorded against every topic that received it.
+        use crate::entity::message;
+        for topic_id in &topic_ids {
+            let stored = message::Entity::find()
+                .filter(message::Column::TopicId.eq(*topic_id))
+                .all(&manager.session.db)
+                .await
+                .expect("query");
+            assert_eq!(stored.len(), 1, "topic {topic_id} holds the user's message");
+        }
+    }
+
+    /// The common case, and the one that must not regress into topic sprawl: a follow-up the
+    /// classifier calls a continuation of the running focus is `interrupt`ed into it, with no new
+    /// topic and no new execution.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_continue_on_the_running_focus_interrupts_it_and_creates_no_topic() {
+        let (_test, manager, fake, router) = manager_with_router().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, _) = manager
+            .create_topic(user_id, None, "Claude Code".into(), "{}".into())
+            .await
+            .expect("create");
+        let starts_before = fake.start_executions.lock().expect("lock").len();
+        router.answer_with(&format!(
+            r#"{{"actions":[{{"kind":"continue","topic_id":{topic_id}}}]}}"#
+        ));
+
+        let routed = manager
+            .send_turn(user_id, Uuid::new_v4(), "and which IDEs?".into())
+            .await
+            .expect("send_turn");
+
+        assert_eq!(routed, vec![topic_id]);
+        assert_eq!(fake.interrupts.lock().expect("lock").len(), 1);
+        assert_eq!(
+            fake.start_executions.lock().expect("lock").len(),
+            starts_before,
+            "a continuation must not start a second execution"
+        );
+    }
+
+    /// Classification is advisory: an llm-router that is down (or answers nonsense) must never
+    /// cost the user their turn. The fallback continues the focused topic, which is what the
+    /// service did before the classifier existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_classifier_failure_falls_back_to_continuing_the_focused_topic() {
+        let (_test, manager, fake, router) = manager_with_router().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, _) = manager
+            .create_topic(user_id, None, "Claude Code".into(), "{}".into())
+            .await
+            .expect("create");
+        // `answer` left unset — every Complete call fails.
+        assert!(router.answer.lock().expect("lock").is_none());
+
+        let routed = manager
+            .send_turn(user_id, Uuid::new_v4(), "and which IDEs?".into())
+            .await
+            .expect("a classifier outage must not fail the turn");
+
+        assert_eq!(routed, vec![topic_id]);
+        assert_eq!(fake.interrupts.lock().expect("lock").len(), 1);
+    }
+
+    /// One session-wide transcript needs the user's own turns back from the server, not just
+    /// topic titles — `GetSession` renders from these rows after a reload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_session_view_returns_each_topic_s_messages_in_order() {
+        let (_test, manager, _fake, router) = manager_with_router().await;
+        let user_id = Uuid::new_v4();
+        router.answer_with(
+            r#"{"actions":[{"kind":"new","title":"Claude Code","question":"What is Claude Code?"}]}"#,
+        );
+        let topic_id = one_topic(
+            manager
+                .send_turn(user_id, Uuid::new_v4(), "What is Claude Code?".into())
+                .await
+                .expect("send_turn"),
+        );
+        router.answer_with(&format!(
+            r#"{{"actions":[{{"kind":"continue","topic_id":{topic_id}}}]}}"#
+        ));
+        manager
+            .send_turn(user_id, Uuid::new_v4(), "and which IDEs?".into())
+            .await
+            .expect("send_turn");
+
+        let (_focus, topics) = manager
+            .session
+            .get_session_view(user_id)
+            .await
+            .expect("view");
+        let messages = manager
+            .session
+            .messages_by_topic(&topics.iter().map(|t| t.id).collect::<Vec<_>>())
+            .await
+            .expect("messages");
+
+        let contents: Vec<&str> = messages[&topic_id]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, vec!["What is Claude Code?", "and which IDEs?"]);
+    }
+
+    /// The debug panel is session-wide *and* survives a reload, which it can only do if every
+    /// published event is also a row — and if the replay comes back in the order it happened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_are_persisted_and_replayed_in_order_then_cleared_by_a_reset() {
+        let (_test, manager, _fake, _router) = manager_with_router().await;
+        let user_id = Uuid::new_v4();
+        let (first_id, _) = manager
+            .create_topic(user_id, None, "First".into(), "{}".into())
+            .await
+            .expect("create");
+        let (second_id, _) = manager
+            .create_topic(user_id, None, "Second".into(), "{}".into())
+            .await
+            .expect("create");
+        manager
+            .set_focus(user_id, second_id)
+            .await
+            .expect("set_focus");
+        let session_id = manager
+            .session
+            .get_or_create_session(user_id)
+            .await
+            .expect("session")
+            .id;
+
+        let replay = manager.stored_events(session_id).await.expect("replay");
+
+        let kinds: Vec<&str> = replay.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "topic_created",
+                "topic_started",
+                "topic_created",
+                "topic_started",
+                "focus_changed",
+            ],
+            "the replay is the session's history in the order it happened"
+        );
+        assert_eq!(replay[0].topic_id, first_id.to_string());
+        assert_eq!(replay[4].topic_id, second_id.to_string());
+        assert!(
+            replay
+                .iter()
+                .all(|e| e.session_id == session_id.to_string()),
+            "every replayed event names its session, which is what the live tail filters on"
+        );
+
+        manager.reset_session(user_id).await.expect("reset");
+
+        assert!(
+            manager
+                .stored_events(session_id)
+                .await
+                .expect("replay")
+                .is_empty(),
+            "a reset must leave no events behind to resurrect deleted topics"
         );
     }
 

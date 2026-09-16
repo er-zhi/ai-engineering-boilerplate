@@ -21,7 +21,10 @@
   .topic-row.focus { background: #eef; font-weight: 600; }
   .topic-row .status { color: #666; font-size: .8em; }
   /* Stays pinned below the scrolling topic list rather than scrolling away with it. */
-  #newTopic { width: 100%; margin-top: .5rem; padding: .5rem; cursor: pointer; flex-shrink: 0; }
+  #newSession { width: 100%; margin-top: .5rem; padding: .5rem; cursor: pointer; flex-shrink: 0; }
+  /* Which topic a line belongs to. One transcript carries every topic's turns, so without this
+     label an answer from a background topic reads as a reply to the last thing typed. */
+  .msg .topic { color: #66a; font-size: .75em; margin-right: .35em; }
   #transcript { flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; padding: .75rem; margin-bottom: .75rem; }
   .msg { padding: .4rem 0; border-bottom: 1px solid #f4f4f4; }
   .msg.notification { color: #444; font-style: italic; }
@@ -63,7 +66,6 @@
   <aside>
     <h2>Topics</h2>
     <div id="topics"></div>
-    <button id="newTopic" type="button">New topic</button>
     <button id="newSession" type="button">New session</button>
   </aside>
 </div>
@@ -254,8 +256,12 @@
     return htmlParts.join("");
   }
 
-  function appendMessage(who, text, className) {
+  // One transcript for the whole session: every topic's turns and answers interleaved in time,
+  // each tagged with the topic it belongs to — the Claude Code model, where background work
+  // reports back into the one conversation rather than into a pane of its own.
+  function appendMessage(who, text, className, topicTitle) {
     const div = element("div", `msg ${className || ""}`);
+    if (topicTitle) div.appendChild(element("span", "topic", `[${topicTitle}]`));
     div.appendChild(element("span", "kind", `${who} `));
     if (who === "assistant") {
       const body = element("span");
@@ -269,74 +275,83 @@
     return div;
   }
 
-  // The focused topic plus every ancestor, oldest first: a continuation is a child topic, so the
-  // thread the user thinks of as "this chat" is the parent_id chain up to the root.
-  function threadOf(topicId) {
-    const byId = new Map(topics.map((t) => [t.id, t]));
-    const chain = [];
-    for (let node = byId.get(topicId); node; node = node.parentId ? byId.get(node.parentId) : null) {
-      chain.unshift(node);
-      if (chain.length > 100) break; // defensive: never loop on a malformed chain
-    }
-    return chain;
+  function titleOf(topicId) {
+    const topic = topics.find((t) => t.id === topicId);
+    return topic ? topic.title : topicId;
   }
 
-  // Re-renders the whole conversation for the focused topic from GetSession's snapshot: each
-  // topic in the thread contributes the question that started it and the answer it produced.
+  // Rebuilt from GetSession alone, so it is idempotent: a reload, a topic switch and a lifecycle
+  // event all produce the same transcript for the same server state.
   //
-  // Known gap: a turn delivered into a *running* topic (the `interrupt` path) is stored only in
-  // chat.messages, which GetSession does not expose — so it shows optimistically when sent but
-  // cannot be reproduced here on a reload or a topic switch. Closing it means returning message
-  // rows from GetSession; the continuation path this page is built around does not need it,
-  // because each follow-up becomes a topic whose `title` is the question.
+  // Per topic it contributes the question that started it (skipped when the first stored message
+  // already says the same thing — a topic the classifier opened from a message carries both), the
+  // user turns delivered to it, and its answer. Everything is then sorted by timestamp, which is
+  // what interleaves parallel topics into one readable thread.
+  function transcriptEntries() {
+    const entries = [];
+    topics.forEach((topic) => {
+      const messages = topic.messages || [];
+      const question = topic.question || topic.title;
+      if (question && !(messages.length && messages[0].content === question)) {
+        entries.push({ at: topic.createdAt, who: "you", text: question, topic: topic.title });
+      }
+      messages.forEach((message) => {
+        entries.push({ at: message.createdAt, who: "you", text: message.content, topic: topic.title });
+      });
+      if (topic.resultSummary && (topic.status === "completed" || topic.status === "failed")) {
+        entries.push({
+          at: topic.updatedAt,
+          who: "assistant",
+          text: topic.resultSummary,
+          className: topic.status === "failed" ? "error" : "",
+          topic: topic.title,
+        });
+      } else if (topic.status === "running" || topic.status === "queued") {
+        entries.push({
+          at: topic.updatedAt,
+          who: "assistant",
+          text: `(${topic.status}…)`,
+          className: "notification",
+          topic: topic.title,
+        });
+      }
+    });
+    return entries.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  }
+
   function renderTranscript() {
     transcript.textContent = "";
-    if (!focusTopicId) return;
-    // `title` is the question as the user put it: CreateTopic's title for a root topic, the
-    // follow-up text verbatim for a continuation. The `question` in `input_json` would repeat
-    // the parent's answer that is already on screen above, so GetSession needs no new field.
-    threadOf(focusTopicId).forEach((topic) => {
-      if (topic.title) appendMessage("you", topic.title);
-      if (topic.resultSummary) {
-        appendMessage("assistant", topic.resultSummary, topic.status === "failed" ? "error" : "");
-      } else if (topic.status === "running" || topic.status === "queued") {
-        appendMessage("assistant", `(${topic.status}…)`, "notification");
-      }
+    transcriptEntries().forEach((entry) => {
+      appendMessage(entry.who, entry.text, entry.className, entry.topic);
     });
   }
 
-  function renderEvent(event) {
-    debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
-    // Chat's EventBus is one process-wide broadcast channel and StreamEvents does not filter it
-    // per session, so this stream also carries other users' topics. Render only what GetSession
-    // says belongs to this session — otherwise a background-topic notification below would show
-    // a stranger's answer text in this transcript.
-    if (!topics.some((t) => t.id === event.topicId)) return;
-    let payload = {};
-    try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
-    const inThread = threadOf(focusTopicId).some((t) => t.id === event.topicId);
+  // Lifecycle events change what GetSession would say, so they are rendered by reloading and
+  // re-rendering (idempotent, see renderTranscript). Everything else — progress, notifications —
+  // is appended in place, because it is never part of the snapshot.
+  const LIFECYCLE = new Set([
+    "topic_created", "topic_started", "topic_queued", "topic_completed", "topic_failed",
+    "topic_cancelled", "focus_changed",
+  ]);
 
-    // `notification` and `topic_completed` carry the same summary. For a topic in this thread the
-    // summary *is* the assistant's reply, so it renders once as the reply and the notification is
-    // dropped; for a background topic it's the other way round — the spec's «когда фоновая тема
-    // завершается, в чат приходит уведомление с её результатом».
-    if (event.kind === "notification") {
-      if (!inThread) {
-        appendMessage("·", `Topic ${event.topicId}: ${payload.text || payload.kind || ""}`, "notification");
-      }
+  async function renderEvent(event) {
+    debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
+    if (event.kind === "session_reset") {
+      await startOver();
       return;
     }
-    if (!inThread) return;
-    if (event.kind === "topic_completed" || event.kind === "topic_failed") {
-      // finish_topic publishes `{"summary": ...}` — the answer itself, which is the whole point
-      // of the exchange and used to be rendered as the bare word "topic_completed".
-      if (payload.summary) {
-        appendMessage("assistant", payload.summary, event.kind === "topic_failed" ? "error" : "");
-      }
+    if (LIFECYCLE.has(event.kind)) {
+      scheduleReload();
+      return;
+    }
+    let payload = {};
+    try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
+    if (event.kind === "notification") {
+      appendMessage("·", payload.text || payload.kind || "", "notification", titleOf(event.topicId));
       return;
     }
     if (event.kind === "topic_progress") {
-      appendMessage("·", progressText(event.payloadJson), "notification");
+      appendMessage("·", progressText(event.payloadJson), "notification", titleOf(event.topicId));
     }
   }
 
@@ -351,54 +366,60 @@
     });
   }
 
+  // The topic list is navigation and status only: clicking a row moves the server's focus and
+  // highlights it. The transcript is session-wide, so it does not change.
   async function setFocus(topicId) {
     if (topicId === focusTopicId) return;
     await callRpc("SetFocus", { topicId });
     focusTopicId = topicId;
     serverFocusTopicId = topicId;
     renderTopics();
-    renderTranscript();
   }
 
-  // `keepTranscript` is for the refreshes that happen *while* the user is reading a live
-  // conversation (stream events, a continuation being created): the topic list and focus are
-  // re-read, but the transcript keeps the messages already on screen instead of being rebuilt
-  // from the snapshot, which would duplicate or drop what the event stream just rendered.
-  async function loadSession(keepTranscript) {
+  // A reconnect replays the session's whole stored history, which is dozens of lifecycle events
+  // in a burst — one GetSession each would be a storm of identical calls. They all want the same
+  // thing (the current snapshot), so they collapse into one trailing reload.
+  let reloadTimer = null;
+  function scheduleReload() {
+    if (reloadTimer) return;
+    reloadTimer = setTimeout(() => {
+      reloadTimer = null;
+      loadSession().catch((err) => debugLine("err", "GetSession", err.message));
+    }, 50);
+  }
+
+  async function loadSession() {
     const session = await callRpc("GetSession", {});
     topics = session.topics || [];
     serverFocusTopicId = session.focusTopicId || null;
     // When the last unfinished topic completes the server clears focus, so fall back to the
-    // newest topic — that is the conversation the user was just reading, and `sendTurn` below
-    // re-asserts it server-side before sending.
+    // newest topic — that is the conversation the user was just reading. It only decides which
+    // row is highlighted; the classifier, not this pointer, decides where a turn lands.
     focusTopicId = serverFocusTopicId || (topics.length && topics[topics.length - 1].id) || null;
     renderTopics();
-    if (!keepTranscript) renderTranscript();
+    renderTranscript();
   }
 
   document.getElementById("sendForm").onsubmit = async (event) => {
     event.preventDefault();
     const input = document.getElementById("content");
     const content = input.value.trim();
-    if (!content || !focusTopicId) return;
+    // Always sendable: an empty session is how a first topic gets created now, so there is
+    // nothing to be focused on first.
+    if (!content) return;
     input.value = "";
     appendMessage("you", content);
     try {
-      // SendTurn routes to whatever the *server* calls focus. If we're showing a topic it has
-      // moved (or cleared) focus off, say so first, or the turn lands on the wrong topic — or
-      // on none at all.
-      if (focusTopicId !== serverFocusTopicId) {
-        await callRpc("SetFocus", { topicId: focusTopicId });
-        serverFocusTopicId = focusTopicId;
-      }
+      // The server classifies the message against the whole session — it may continue a topic,
+      // or open one, or open several — so the client asserts no focus beforehand and simply
+      // follows whatever comes back.
       const sent = await callRpc("SendTurn", { turnId: crypto.randomUUID(), content });
-      // A turn on a completed topic comes back as a *new* (child) topic. Follow the focus onto
-      // it without clearing the transcript: to the user this is one continuous conversation.
-      if (sent.topicId && sent.topicId !== focusTopicId) {
-        focusTopicId = sent.topicId;
-        serverFocusTopicId = sent.topicId;
+      const routed = (sent.topicIds && sent.topicIds[0]) || sent.topicId || null;
+      if (routed) {
+        focusTopicId = routed;
+        serverFocusTopicId = routed;
       }
-      await loadSession(true);
+      await loadSession();
     } catch (err) {
       appendMessage("!", err.message, "error");
     }
@@ -425,35 +446,13 @@
     }
   };
 
-  document.getElementById("newTopic").onclick = async () => {
-    const title = prompt("What's this topic about?");
-    if (!title) return;
-    try {
-      const created = await callRpc("CreateTopic", {
-        title,
-        inputJson: JSON.stringify({ question: title }),
-      });
-      await loadSession();
-      await setFocus(created.topicId);
-    } catch (err) {
-      appendMessage("!", err.message, "error");
-    }
-  };
-
   (async () => {
     await loadSession();
     for (;;) {
       debugLine("meta", "stream", "connecting…");
       try {
         for await (const event of streamChatEvents()) {
-          if (event.kind === "session_reset") {
-            await startOver();
-            continue;
-          }
-          if (event.kind === "topic_completed" || event.kind === "topic_failed" || event.kind === "topic_started" || event.kind === "topic_queued") {
-            await loadSession(true);
-          }
-          renderEvent(event);
+          await renderEvent(event);
         }
         debugLine("meta", "stream", "ended cleanly");
       } catch (err) {

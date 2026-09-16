@@ -1,7 +1,8 @@
 // Test-only Postgres for chat: the shared container bootstrapped with this service's own role
 // and schema. Same shape as tool's, knowledge-base's, and llm-router's. Chat has no manual-index
-// escape hatch (unlike Tool Service's COALESCE-based unique index), so no post-sync index
-// statements are needed here.
+// escape hatch (unlike Tool Service's COALESCE-based unique index), but it does own one
+// partitioned table schema-sync cannot express — `chat.events` — so `start` runs the same
+// `event_log::setup` the service runs at startup.
 
 #![cfg(feature = "test-support")]
 
@@ -16,5 +17,9 @@ const CHAT: ServiceSchema = ServiceSchema {
 };
 
 pub async fn start() -> TestDb {
-    common::test_db::start(CHAT).await
+    let test = common::test_db::start(CHAT).await;
+    crate::event_log::setup(&test.db)
+        .await
+        .expect("create chat.events and its partitions");
+    test
 }
