@@ -39,7 +39,8 @@
   aside.debug h2 button { font-size: .75em; padding: .15rem .5rem; }
   aside.debug h2 { flex-shrink: 0; }
   #debugLog { flex: 1; min-height: 0; overflow-y: auto; background: #1e1e1e; color: #ddd; font: 11px/1.5 ui-monospace, monospace; border-radius: 4px; padding: .5rem; }
-  .debug-entry { padding: .2rem 0; border-bottom: 1px solid #333; white-space: pre-wrap; word-break: break-all; }
+  .debug-entry { padding: .2rem 0; border-bottom: 1px solid #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+  .debug-entry.open { white-space: pre-wrap; word-break: break-all; }
   .debug-entry .ts { color: #888; }
   .debug-entry .kind { color: #7fc; }
   .debug-entry .topic { color: #fc7; }
@@ -98,6 +99,7 @@
     entry.appendChild(element("span", "ts", `${new Date().toLocaleTimeString()} `));
     if (kindText) entry.appendChild(element("span", "kind", `${kindText} `));
     entry.appendChild(document.createTextNode(detail));
+    entry.onclick = () => entry.classList.toggle("open");
     debugLog.appendChild(entry);
     while (debugLog.children.length > DEBUG_MAX_ENTRIES) debugLog.removeChild(debugLog.firstChild);
     debugLog.scrollTop = debugLog.scrollHeight;
