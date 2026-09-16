@@ -20,3 +20,6 @@ native/tts-ane/*.wav
 
 .temp
 .lycheecache
+
+# Local git worktrees for isolated feature work (superpowers using-git-worktrees)
+.worktrees/

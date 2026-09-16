@@ -23,6 +23,7 @@ Entities are the source of truth: schema sync builds the tables from them on sta
 | Timestamps | `timestamptz` | `timestamp` |
 | Money, exact decimals | `numeric(p,s)` | `float`, `double` |
 | Queryable fields | typed columns | one `jsonb` blob |
+| Opaque/semi-structured payload (state, checkpoints, event payloads, metadata) | `jsonb` (SeaORM `column_type = "JsonBinary"`) | plain `json` (SeaORM `"Json"`) — text storage with no indexing, no operators, and no reason to prefer it over binary once the field is a blob at all |
 
 `text` and `varchar` store identically in Postgres; `varchar(n)` makes the length a schema guarantee. The code enforces the same limit where the value enters ([gate-code-quality](../gate-code-quality/SKILL.md#boundaries-and-limits)), so the database never has to reject it. `NOT NULL` unless the field is genuinely optional. Index only what you actually query; every index costs writes and disk.
 

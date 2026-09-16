@@ -35,7 +35,7 @@ pub struct Model {
     pub relation_type: RelationType,
     #[sea_orm(column_type = "String(StringLen::N(crate::links::MAX_ANCHOR_TEXT_CHARS as u32))")]
     pub anchor_text: String,
-    #[sea_orm(column_type = "Json", nullable)]
+    #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<Json>,
     pub discovered_at: DateTimeUtc,
 }
