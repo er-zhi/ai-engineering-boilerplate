@@ -30,7 +30,9 @@ pub(crate) const CRAWLER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CRAWLER_CALL_ATTEMPTS: usize = 3;
 const CRAWLER_RETRY_DELAY: Duration = Duration::from_millis(100);
 pub(crate) const KNOWLEDGE_BASE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const CHAT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+// SendTurn runs an LLM classification (up to 30s) before returning, so the unary bound must
+// outlast it.
+pub(crate) const CHAT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// `StreamEvents` is a long-lived stream, and a client timeout is a *whole-call* deadline that
 /// connectrpc re-checks on every frame — the 10s unary bound would cut the browser's event feed
 /// after ten seconds, every time. Long and finite: `CallOptions` cannot express "no deadline".
