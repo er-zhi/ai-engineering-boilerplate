@@ -22,9 +22,22 @@
   #content { flex: 1; padding: .5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }
   button { padding: .5rem 1.2rem; font: inherit; cursor: pointer; }
   .error { color: #b00; }
+  #debugToggle { position: absolute; top: 2rem; right: 6rem; background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
+  aside.debug { width: 22rem; display: flex; flex-direction: column; }
+  aside.debug[hidden] { display: none; }
+  aside.debug h2 { display: flex; justify-content: space-between; align-items: center; }
+  aside.debug h2 button { font-size: .75em; padding: .15rem .5rem; }
+  #debugLog { flex: 1; overflow-y: auto; background: #1e1e1e; color: #ddd; font: 11px/1.5 ui-monospace, monospace; border-radius: 4px; padding: .5rem; min-height: 20rem; max-height: 80vh; }
+  .debug-entry { padding: .2rem 0; border-bottom: 1px solid #333; white-space: pre-wrap; word-break: break-all; }
+  .debug-entry .ts { color: #888; }
+  .debug-entry .kind { color: #7fc; }
+  .debug-entry .topic { color: #fc7; }
+  .debug-entry.meta { color: #999; font-style: italic; }
+  .debug-entry.err { color: #f77; }
 </style>
 
 <form class="logout" method="post" action="/logout"><button type="submit">Log out</button></form>
+<button id="debugToggle" type="button">Debug: off</button>
 
 <main>
   <h1>Chat</h1>
@@ -41,10 +54,20 @@
   <button id="newTopic" type="button">New topic</button>
 </aside>
 
+<aside class="debug" id="debugPanel" hidden>
+  <h2>Session debug <button id="debugClear" type="button">clear</button></h2>
+  <div id="debugLog"></div>
+</aside>
+
 <script>
   const SERVICE = "/chat.v1.ChatService";
   const transcript = document.getElementById("transcript");
   const topicsEl = document.getElementById("topics");
+  const debugPanel = document.getElementById("debugPanel");
+  const debugLog = document.getElementById("debugLog");
+  const debugToggle = document.getElementById("debugToggle");
+  const DEBUG_MAX_ENTRIES = 500;
+  let debugOn = false;
   let focusTopicId = null;
   let topics = [];
 
@@ -55,14 +78,46 @@
     return node;
   }
 
+  // Everything observable about this session: every RPC call/response, every stream event (not
+  // just the focused topic's), connection lifecycle, and errors — a running log of what the
+  // client sees, independent of what the transcript chooses to render.
+  function debugLine(className, kindText, detail) {
+    const entry = element("div", `debug-entry ${className}`);
+    entry.appendChild(element("span", "ts", `${new Date().toLocaleTimeString()} `));
+    if (kindText) entry.appendChild(element("span", "kind", `${kindText} `));
+    entry.appendChild(document.createTextNode(detail));
+    debugLog.appendChild(entry);
+    while (debugLog.children.length > DEBUG_MAX_ENTRIES) debugLog.removeChild(debugLog.firstChild);
+    if (debugOn) debugLog.scrollTop = debugLog.scrollHeight;
+  }
+
+  debugToggle.onclick = () => {
+    debugOn = !debugOn;
+    debugPanel.hidden = !debugOn;
+    debugToggle.textContent = `Debug: ${debugOn ? "on" : "off"}`;
+    if (debugOn) debugLog.scrollTop = debugLog.scrollHeight;
+  };
+  document.getElementById("debugClear").onclick = () => { debugLog.textContent = ""; };
+
   async function callRpc(method, message) {
-    const res = await fetch(`${SERVICE}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "connect-protocol-version": "1" },
-      body: JSON.stringify(message),
-    });
+    debugLine("meta", `→ ${method}`, JSON.stringify(message));
+    let res;
+    try {
+      res = await fetch(`${SERVICE}/${method}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "connect-protocol-version": "1" },
+        body: JSON.stringify(message),
+      });
+    } catch (err) {
+      debugLine("err", `✗ ${method}`, err.message);
+      throw err;
+    }
     const body = await res.json();
-    if (!res.ok) throw new Error(body.message || `${method} failed with ${res.status}`);
+    if (!res.ok) {
+      debugLine("err", `✗ ${method} (${res.status})`, JSON.stringify(body));
+      throw new Error(body.message || `${method} failed with ${res.status}`);
+    }
+    debugLine("meta", `← ${method}`, JSON.stringify(body));
     return body;
   }
 
@@ -120,6 +175,7 @@
   }
 
   function renderEvent(event) {
+    debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
     if (event.topicId !== focusTopicId) return;
     const div = element("div", `msg ${event.kind === "notification" ? "notification" : ""}`);
     div.appendChild(element("span", "kind", `${event.kind} `));
@@ -190,6 +246,7 @@
   (async () => {
     await loadSession();
     for (;;) {
+      debugLine("meta", "stream", "connecting…");
       try {
         for await (const event of streamChatEvents()) {
           if (event.kind === "topic_completed" || event.kind === "topic_failed" || event.kind === "topic_started" || event.kind === "topic_queued") {
@@ -197,7 +254,9 @@
           }
           renderEvent(event);
         }
+        debugLine("meta", "stream", "ended cleanly");
       } catch (err) {
+        debugLine("err", "stream", `${err.message} — retrying in 2s`);
         transcript.appendChild(element("div", "msg error", `Stream error: ${err.message} — retrying…`));
       }
       await new Promise((resolve) => setTimeout(resolve, 2000));
