@@ -36,14 +36,16 @@ fn routes(config: &GatewayConfig, db: DatabaseConnection) -> axum::Router {
     let gateway = Arc::new(Gateway::new(
         config.crawler_url().clone(),
         config.knowledge_base_url().clone(),
+        config.chat_url().clone(),
     ));
     let connect = ConnectRouter::new()
         .add_service::<_, common::proto::crawler::v1::CrawlerServiceRegisterMarker>(Arc::clone(
             &gateway,
         ))
         .add_service::<_, common::proto::knowledge_base::v1::KnowledgeBaseServiceRegisterMarker>(
-            gateway,
-        );
+            Arc::clone(&gateway),
+        )
+        .add_service::<_, common::proto::chat::v1::ChatServiceRegisterMarker>(gateway);
 
     let protected = axum::Router::new()
         .route_service(

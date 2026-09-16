@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use common::proto::chat::v1::ChatServiceClient;
 use common::proto::knowledge_base::v1::{
     DocumentRef, IngestRequest, IngestResponse, KnowledgeBaseService, KnowledgeBaseServiceClient,
     ReadDocumentRequest, ReadDocumentResponse, SearchRequest, SearchResponse, SearchResult,
@@ -11,7 +12,7 @@ use connectrpc::{
 };
 
 use super::start_gateway;
-use crate::proxy::{Gateway, KNOWLEDGE_BASE_CALL_TIMEOUT};
+use crate::proxy::{CHAT_CALL_TIMEOUT, Gateway, KNOWLEDGE_BASE_CALL_TIMEOUT};
 
 struct FakeKnowledgeBase {
     ingested: std::sync::Mutex<Vec<IngestRequest>>,
@@ -126,6 +127,16 @@ fn knowledge_base_client_to(url: &str) -> KnowledgeBaseServiceClient<HttpClient>
     )
 }
 
+fn unreachable_chat_client() -> ChatServiceClient<HttpClient> {
+    ChatServiceClient::new(
+        HttpClient::plaintext_http2_only(),
+        ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
+            .with_protocol(Protocol::Grpc)
+            .with_default_timeout(CHAT_CALL_TIMEOUT)
+            .proto(),
+    )
+}
+
 #[tokio::test]
 async fn search_forwards_the_complete_request_and_response_through_gateway() {
     let fake = fake_knowledge_base(None);
@@ -133,6 +144,7 @@ async fn search_forwards_the_complete_request_and_response_through_gateway() {
     let gateway = Gateway::new(
         "http://127.0.0.1:1".parse().unwrap(),
         knowledge_base_url.parse().unwrap(),
+        "http://127.0.0.1:1".parse().unwrap(),
     );
     let gateway_url = start_gateway(gateway).await;
     let client = knowledge_base_client_to(&gateway_url);
@@ -156,6 +168,7 @@ async fn search_upstream_error_propagates_through_gateway() {
     let gateway = Gateway {
         crawler: crawler_client_to("http://127.0.0.1:1"),
         knowledge_base: knowledge_base_client_to(&knowledge_base_url),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client = knowledge_base_client_to(&gateway_url);
@@ -170,6 +183,7 @@ async fn ingest_is_never_forwarded_to_knowledge_base() {
     let gateway = Gateway {
         crawler: crawler_client_to("http://127.0.0.1:1"),
         knowledge_base: knowledge_base_client_to(&knowledge_base_url),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client = knowledge_base_client_to(&gateway_url);
@@ -185,6 +199,7 @@ async fn read_document_forwards_the_reference_and_page_options() {
     let gateway = Gateway {
         crawler: crawler_client_to("http://127.0.0.1:1"),
         knowledge_base: knowledge_base_client_to(&knowledge_base_url),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client = knowledge_base_client_to(&gateway_url);

@@ -4,6 +4,11 @@ use std::future::Future;
 use std::time::Duration;
 
 use axum::http::Uri;
+use common::proto::chat::v1::{
+    ChatEvent, ChatService, ChatServiceClient, CreateTopicRequest, CreateTopicResponse,
+    GetSessionRequest, GetSessionResponse, SendTurnRequest, SendTurnResponse, SetFocusRequest,
+    SetFocusResponse, StreamEventsRequest,
+};
 use common::proto::crawler::v1::{
     CrawlerService, CrawlerServiceClient, GetCrawlJobRequest, GetCrawlJobResponse,
     GetPageNeighborsRequest, GetPageNeighborsResponse, StartCrawlRequest, StartCrawlResponse,
@@ -15,20 +20,23 @@ use common::proto::knowledge_base::v1::{
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{
     ConnectError, ErrorCode, Protocol, RequestContext, Response, ServiceRequest, ServiceResult,
+    ServiceStream,
 };
 
 pub(crate) const CRAWLER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CRAWLER_CALL_ATTEMPTS: usize = 3;
 const CRAWLER_RETRY_DELAY: Duration = Duration::from_millis(100);
 pub(crate) const KNOWLEDGE_BASE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CHAT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Gateway {
     pub(crate) crawler: CrawlerServiceClient<HttpClient>,
     pub(crate) knowledge_base: KnowledgeBaseServiceClient<HttpClient>,
+    pub(crate) chat: ChatServiceClient<HttpClient>,
 }
 
 impl Gateway {
-    pub fn new(crawler_url: Uri, knowledge_base_url: Uri) -> Self {
+    pub fn new(crawler_url: Uri, knowledge_base_url: Uri, chat_url: Uri) -> Self {
         Self {
             crawler: CrawlerServiceClient::new(
                 HttpClient::plaintext_http2_only(),
@@ -42,6 +50,13 @@ impl Gateway {
                 ClientConfig::new(knowledge_base_url)
                     .with_protocol(Protocol::Grpc)
                     .with_default_timeout(KNOWLEDGE_BASE_CALL_TIMEOUT)
+                    .proto(),
+            ),
+            chat: ChatServiceClient::new(
+                HttpClient::plaintext_http2_only(),
+                ClientConfig::new(chat_url)
+                    .with_protocol(Protocol::Grpc)
+                    .with_default_timeout(CHAT_CALL_TIMEOUT)
                     .proto(),
             ),
         }
@@ -148,5 +163,88 @@ impl KnowledgeBaseService for Gateway {
             .await?
             .into_owned();
         Response::ok(upstream)
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl ChatService for Gateway {
+    async fn create_topic(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, CreateTopicRequest>,
+    ) -> ServiceResult<CreateTopicResponse> {
+        let upstream = self
+            .chat
+            .create_topic(request.to_owned_message())
+            .await?
+            .into_owned();
+        Response::ok(upstream)
+    }
+
+    async fn set_focus(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, SetFocusRequest>,
+    ) -> ServiceResult<SetFocusResponse> {
+        let upstream = self
+            .chat
+            .set_focus(request.to_owned_message())
+            .await?
+            .into_owned();
+        Response::ok(upstream)
+    }
+
+    async fn send_turn(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, SendTurnRequest>,
+    ) -> ServiceResult<SendTurnResponse> {
+        let upstream = self
+            .chat
+            .send_turn(request.to_owned_message())
+            .await?
+            .into_owned();
+        Response::ok(upstream)
+    }
+
+    async fn get_session(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, GetSessionRequest>,
+    ) -> ServiceResult<GetSessionResponse> {
+        let upstream = self
+            .chat
+            .get_session(request.to_owned_message())
+            .await?
+            .into_owned();
+        Response::ok(upstream)
+    }
+
+    async fn stream_events(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, StreamEventsRequest>,
+    ) -> ServiceResult<ServiceStream<ChatEvent>> {
+        let mut stream = self.chat.stream_events(request.to_owned_message()).await?;
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                match stream.message::<ChatEvent>().await {
+                    Ok(Some(item)) => {
+                        if sender.send(Ok(item.to_owned_message())).is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    Ok(None) => break, // clean end of stream
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        Response::stream_ok(tokio_stream::wrappers::UnboundedReceiverStream::new(
+            receiver,
+        ))
     }
 }

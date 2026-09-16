@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use buffa::EnumValue;
+use common::proto::chat::v1::ChatServiceClient;
 use common::proto::crawler::v1::{
     CrawlerService, CrawlerServiceClient, GetCrawlJobRequest, GetCrawlJobResponse,
     GetPageNeighborsRequest, GetPageNeighborsResponse, PageNeighbor, PageRelation,
@@ -14,7 +15,7 @@ use connectrpc::{
     ServiceRequest, ServiceResult,
 };
 
-use crate::proxy::{CRAWLER_CALL_TIMEOUT, KNOWLEDGE_BASE_CALL_TIMEOUT};
+use crate::proxy::{CHAT_CALL_TIMEOUT, CRAWLER_CALL_TIMEOUT, KNOWLEDGE_BASE_CALL_TIMEOUT};
 
 pub(super) struct FakeCrawler {
     pub(super) received: std::sync::Mutex<Option<GetPageNeighborsRequest>>,
@@ -116,6 +117,16 @@ pub(super) fn unreachable_knowledge_base_client() -> KnowledgeBaseServiceClient<
         ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
             .with_protocol(Protocol::Grpc)
             .with_default_timeout(KNOWLEDGE_BASE_CALL_TIMEOUT)
+            .proto(),
+    )
+}
+
+pub(super) fn unreachable_chat_client() -> ChatServiceClient<HttpClient> {
+    ChatServiceClient::new(
+        HttpClient::plaintext_http2_only(),
+        ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
+            .with_protocol(Protocol::Grpc)
+            .with_default_timeout(CHAT_CALL_TIMEOUT)
             .proto(),
     )
 }

@@ -229,6 +229,7 @@ services:
     environment:
       CRAWLER_URL: http://crawler:8081
       KNOWLEDGE_BASE_URL: http://knowledge-base:8084
+      CHAT_URL: http://chat:8088
       GATEWAY_AUTH_PASSWORD: ${GATEWAY_AUTH_PASSWORD:?set it in .env, see .env.example}
       GATEWAY_SESSION_TTL_HOURS:
       DATABASE_URL: postgres://gateway_user:${GATEWAY_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
@@ -240,6 +241,8 @@ services:
       frontend:
         condition: service_completed_successfully
       knowledge-base:
+        condition: service_healthy
+      chat:
         condition: service_healthy
     init: true
     restart: unless-stopped

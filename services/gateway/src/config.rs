@@ -7,6 +7,7 @@ use axum::http::Uri;
 
 const DEFAULT_CRAWLER_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_KNOWLEDGE_BASE_URL: &str = "http://127.0.0.1:8084";
+const DEFAULT_CHAT_URL: &str = "http://127.0.0.1:8088";
 const DEFAULT_FRONTEND_DIR: &str = "/frontend";
 const DEFAULT_SESSION_TTL_HOURS: u64 = 24;
 const MAX_SESSION_TTL_HOURS: u64 = 24 * 365;
@@ -18,6 +19,7 @@ const MAX_AUTH_PASSWORD_CHARS: usize = 1_024;
 pub struct GatewayConfig {
     crawler_url: Uri,
     knowledge_base_url: Uri,
+    chat_url: Uri,
     frontend_dir: PathBuf,
     database_url: String,
     password: String,
@@ -31,6 +33,10 @@ impl GatewayConfig {
 
     pub fn knowledge_base_url(&self) -> &Uri {
         &self.knowledge_base_url
+    }
+
+    pub fn chat_url(&self) -> &Uri {
+        &self.chat_url
     }
 
     pub fn frontend_dir(&self) -> &PathBuf {
@@ -54,6 +60,7 @@ impl GatewayConfig {
         Self {
             crawler_url: Uri::from_static(DEFAULT_CRAWLER_URL),
             knowledge_base_url: Uri::from_static(DEFAULT_KNOWLEDGE_BASE_URL),
+            chat_url: Uri::from_static(DEFAULT_CHAT_URL),
             frontend_dir,
             database_url: "unused in route tests".to_owned(),
             password: "correct horse battery staple".to_owned(),
@@ -71,6 +78,7 @@ pub fn gateway_config() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
         "KNOWLEDGE_BASE_URL",
         read_or_default("KNOWLEDGE_BASE_URL", DEFAULT_KNOWLEDGE_BASE_URL)?,
     )?;
+    let chat_url = endpoint("CHAT_URL", read_or_default("CHAT_URL", DEFAULT_CHAT_URL)?)?;
     let frontend_dir = bounded(
         "FRONTEND_DIST_DIR",
         read_or_default("FRONTEND_DIST_DIR", DEFAULT_FRONTEND_DIR)?,
@@ -92,6 +100,7 @@ pub fn gateway_config() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
     Ok(GatewayConfig {
         crawler_url,
         knowledge_base_url,
+        chat_url,
         frontend_dir: PathBuf::from(frontend_dir),
         database_url,
         password,

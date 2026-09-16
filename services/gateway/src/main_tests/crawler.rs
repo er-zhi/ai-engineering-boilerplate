@@ -22,6 +22,7 @@ async fn get_page_neighbors_forwards_the_complete_request_and_response() {
     let gateway = Gateway {
         crawler: client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client = client_to(&gateway_url);
@@ -56,6 +57,7 @@ async fn get_crawl_job_is_forwarded_through_gateway() {
     let gateway = Gateway {
         crawler: client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client = client_to(&gateway_url);
@@ -74,6 +76,7 @@ async fn get_page_neighbors_retries_transient_failures_until_success() {
     let gateway = Gateway {
         crawler: client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client = client_to(&gateway_url);
@@ -93,6 +96,7 @@ async fn get_page_neighbors_does_not_retry_permanent_failures() {
     let gateway = Gateway {
         crawler: client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client = client_to(&gateway_url);
@@ -118,6 +122,7 @@ async fn start_crawl_is_never_retried_even_on_a_transient_failure() {
     let gateway = Gateway {
         crawler: client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
+        chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
     let client: CrawlerServiceClient<_> = client_to(&gateway_url);

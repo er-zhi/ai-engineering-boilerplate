@@ -65,6 +65,7 @@
         let config = GatewayConfig {
             crawler_url: "http://crawler:8081".parse().unwrap(),
             knowledge_base_url: "http://knowledge-base:8084".parse().unwrap(),
+            chat_url: "http://chat:8088".parse().unwrap(),
             frontend_dir: PathBuf::from("/frontend"),
             database_url: "postgres://gateway@postgres/gateway".to_owned(),
             password: "secret".to_owned(),
