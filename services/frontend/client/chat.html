@@ -64,6 +64,7 @@
     <h2>Topics</h2>
     <div id="topics"></div>
     <button id="newTopic" type="button">New topic</button>
+    <button id="newSession" type="button">New session</button>
   </aside>
 </div>
 
@@ -403,6 +404,27 @@
     }
   };
 
+  // Wipes the whole session (every topic, every message) and starts fresh. Also reachable from
+  // another tab's own click via the `session_reset` stream event below, so both tabs land in the
+  // same empty state instead of one of them still showing topics that no longer exist server-side.
+  async function startOver() {
+    transcript.textContent = "";
+    topics = [];
+    focusTopicId = null;
+    serverFocusTopicId = null;
+    await loadSession();
+  }
+
+  document.getElementById("newSession").onclick = async () => {
+    if (!confirm("Start over? This deletes all topics.")) return;
+    try {
+      await callRpc("ResetSession", {});
+      await startOver();
+    } catch (err) {
+      appendMessage("!", err.message, "error");
+    }
+  };
+
   document.getElementById("newTopic").onclick = async () => {
     const title = prompt("What's this topic about?");
     if (!title) return;
@@ -424,6 +446,10 @@
       debugLine("meta", "stream", "connecting…");
       try {
         for await (const event of streamChatEvents()) {
+          if (event.kind === "session_reset") {
+            await startOver();
+            continue;
+          }
           if (event.kind === "topic_completed" || event.kind === "topic_failed" || event.kind === "topic_started" || event.kind === "topic_queued") {
             await loadSession(true);
           }

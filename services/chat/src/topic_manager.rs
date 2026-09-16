@@ -574,6 +574,59 @@ impl TopicManager {
         Ok(())
     }
 
+    /// "Start over": wipes the user's session — every message, every topic, and the session row
+    /// itself — under the same session row lock every other focus/status-changing path uses, so
+    /// this can't race a concurrent `create_topic`/`finish_topic`/`promote_next_queued` for the
+    /// same session.
+    ///
+    /// Still-`Running` topics get a best-effort `Interrupt` first so their Engine executions stop
+    /// making progress; the interrupt result is ignored (the topic row is about to be deleted
+    /// either way) and any in-flight `watch_topic` task hits `TopicNotFound` on its next event —
+    /// `handle_engine_event_logged` only logs that, never panics. `get_or_create_session` builds
+    /// a brand-new session row on the next call, exactly as if this were a first-time user.
+    pub async fn reset_session(&self, user_id: Uuid) -> Result<(), ChatError> {
+        let session = self.session.get_or_create_session(user_id).await?;
+
+        let txn = self.session.db.begin().await?;
+        let locked = lock_session(&txn, session.id).await?;
+
+        let topics = topic::Entity::find()
+            .filter(topic::Column::SessionId.eq(locked.id))
+            .all(&txn)
+            .await?;
+
+        for topic in &topics {
+            if topic.status == Status::Running
+                && let Some(execution_id) = topic.execution_id
+            {
+                let _ = self.engine.interrupt(execution_id, "{}").await;
+            }
+        }
+
+        let topic_ids: Vec<i64> = topics.iter().map(|t| t.id).collect();
+        if !topic_ids.is_empty() {
+            use crate::entity::message;
+            message::Entity::delete_many()
+                .filter(message::Column::TopicId.is_in(topic_ids.clone()))
+                .exec(&txn)
+                .await?;
+            topic::Entity::delete_many()
+                .filter(topic::Column::Id.is_in(topic_ids))
+                .exec(&txn)
+                .await?;
+        }
+        session::Entity::delete_by_id(locked.id).exec(&txn).await?;
+        txn.commit().await?;
+
+        self.events.publish(ChatEvent {
+            topic_id: String::new(),
+            kind: "session_reset".to_owned(),
+            occurred_at: Utc::now().to_rfc3339(),
+            ..Default::default()
+        });
+        Ok(())
+    }
+
     /// Called once at startup (Task 9's `main.rs`) — re-attaches a live `watch_topic` consumer
     /// to every topic this process left `Running` before a restart. Recovery correctness relies
     /// on Engine's `StreamEvents(execution_id)` replaying full history from version 1 (not just
@@ -1535,6 +1588,50 @@ mod tests {
                  not be lost to the create_topic race"
             );
         }
+    }
+
+    /// "Start over": two topics, then `ResetSession` — the session view must come back empty
+    /// with no focus, and a `CreateTopic` afterwards must become focus again exactly like a
+    /// brand-new user's first topic (see
+    /// `the_first_topic_in_a_session_starts_running_and_becomes_focus`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_session_clears_everything_and_a_fresh_topic_becomes_focus_again() {
+        let (_test, manager, _fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        manager
+            .create_topic(user_id, None, "First".into(), "{}".into())
+            .await
+            .expect("create");
+        manager
+            .create_topic(user_id, None, "Second".into(), "{}".into())
+            .await
+            .expect("create");
+
+        manager.reset_session(user_id).await.expect("reset");
+
+        let (focus, topics) = manager
+            .session
+            .get_session_view(user_id)
+            .await
+            .expect("view");
+        assert_eq!(focus, None, "reset must clear focus");
+        assert!(topics.is_empty(), "reset must clear every topic");
+
+        let (fresh_id, status) = manager
+            .create_topic(user_id, None, "Fresh".into(), "{}".into())
+            .await
+            .expect("create after reset");
+        assert_eq!(status, Status::Running);
+        let (focus, _) = manager
+            .session
+            .get_session_view(user_id)
+            .await
+            .expect("view");
+        assert_eq!(
+            focus,
+            Some(fresh_id),
+            "the first topic of the new session becomes focus again"
+        );
     }
 
     /// Guards the envelope contract on the failure path: Engine sends

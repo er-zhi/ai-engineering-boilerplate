@@ -8,8 +8,8 @@ use chat::entity::topic::Status;
 use chat::topic_manager::TopicManager;
 use common::proto::chat::v1::{
     ChatEvent, ChatService, CreateTopicRequest, CreateTopicResponse, GetSessionRequest,
-    GetSessionResponse, SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse,
-    StreamEventsRequest, Topic as TopicProto,
+    GetSessionResponse, ResetSessionRequest, ResetSessionResponse, SendTurnRequest,
+    SendTurnResponse, SetFocusRequest, SetFocusResponse, StreamEventsRequest, Topic as TopicProto,
 };
 use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
@@ -124,6 +124,16 @@ impl ChatService for ChatServiceImpl {
                 .collect(),
             ..Default::default()
         })
+    }
+
+    async fn reset_session(
+        &self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ResetSessionRequest>,
+    ) -> ServiceResult<ResetSessionResponse> {
+        let user_id = require_principal(&ctx)?;
+        self.topics.reset_session(user_id).await?;
+        Response::ok(ResetSessionResponse::default())
     }
 
     async fn stream_events(

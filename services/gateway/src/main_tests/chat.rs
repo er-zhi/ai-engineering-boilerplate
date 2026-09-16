@@ -6,8 +6,8 @@ use std::time::Duration;
 use common::principal::Principal;
 use common::proto::chat::v1::{
     ChatEvent, ChatService, ChatServiceClient, CreateTopicRequest, CreateTopicResponse,
-    GetSessionRequest, GetSessionResponse, SendTurnRequest, SendTurnResponse, SetFocusRequest,
-    SetFocusResponse, StreamEventsRequest,
+    GetSessionRequest, GetSessionResponse, ResetSessionRequest, ResetSessionResponse,
+    SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse, StreamEventsRequest,
 };
 use common::proto::crawler::v1::CrawlerServiceClient;
 use common::proto::knowledge_base::v1::KnowledgeBaseServiceClient;
@@ -96,6 +96,15 @@ impl ChatService for FakeChat {
         Response::ok(GetSessionResponse::default())
     }
 
+    async fn reset_session(
+        &self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ResetSessionRequest>,
+    ) -> ServiceResult<ResetSessionResponse> {
+        self.principal(&ctx)?;
+        Response::ok(ResetSessionResponse::default())
+    }
+
     async fn stream_events(
         &self,
         ctx: RequestContext,
@@ -179,6 +188,10 @@ async fn every_chat_rpc_reaches_chat_with_a_principal_built_from_the_session_coo
         .get_session_with_options(GetSessionRequest::default(), with_session_cookie(token))
         .await
         .expect("GetSession");
+    client
+        .reset_session_with_options(ResetSessionRequest::default(), with_session_cookie(token))
+        .await
+        .expect("ResetSession");
     let mut stream = client
         .stream_events_with_options(StreamEventsRequest::default(), with_session_cookie(token))
         .await
@@ -189,7 +202,7 @@ async fn every_chat_rpc_reaches_chat_with_a_principal_built_from_the_session_coo
         .expect("the stream must open, which means the Principal was accepted");
 
     let seen = fake.seen.lock().unwrap();
-    assert_eq!(seen.len(), 5, "all five RPCs must carry a Principal");
+    assert_eq!(seen.len(), 6, "all six RPCs must carry a Principal");
     for principal in seen.iter() {
         assert_eq!(
             principal.user_id.to_string(),

@@ -8,6 +8,7 @@ service ChatService {
   rpc SendTurn(SendTurnRequest) returns (SendTurnResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc StreamEvents(StreamEventsRequest) returns (stream ChatEvent);
+  rpc ResetSession(ResetSessionRequest) returns (ResetSessionResponse);
 }
 
 message CreateTopicRequest {
@@ -46,6 +47,9 @@ message Topic {
   optional string execution_id = 5;
   optional string result_summary = 6;
 }
+
+message ResetSessionRequest {}
+message ResetSessionResponse {}
 
 message StreamEventsRequest {}
 message ChatEvent {

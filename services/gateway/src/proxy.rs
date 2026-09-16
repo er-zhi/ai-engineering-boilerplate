@@ -7,8 +7,8 @@ use axum::http::{Uri, header};
 use common::principal::{SESSION_ID_HEADER, USER_ID_HEADER};
 use common::proto::chat::v1::{
     ChatEvent, ChatService, ChatServiceClient, CreateTopicRequest, CreateTopicResponse,
-    GetSessionRequest, GetSessionResponse, SendTurnRequest, SendTurnResponse, SetFocusRequest,
-    SetFocusResponse, StreamEventsRequest,
+    GetSessionRequest, GetSessionResponse, ResetSessionRequest, ResetSessionResponse,
+    SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse, StreamEventsRequest,
 };
 use common::proto::crawler::v1::{
     CrawlerService, CrawlerServiceClient, GetCrawlJobRequest, GetCrawlJobResponse,
@@ -246,6 +246,19 @@ impl ChatService for Gateway {
         let upstream = self
             .chat
             .get_session_with_options(request.to_owned_message(), chat_call_options(&ctx)?)
+            .await?
+            .into_owned();
+        Response::ok(upstream)
+    }
+
+    async fn reset_session(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ResetSessionRequest>,
+    ) -> ServiceResult<ResetSessionResponse> {
+        let upstream = self
+            .chat
+            .reset_session_with_options(request.to_owned_message(), chat_call_options(&ctx)?)
             .await?
             .into_owned();
         Response::ok(upstream)
