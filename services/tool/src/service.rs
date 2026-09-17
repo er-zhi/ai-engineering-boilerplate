@@ -20,7 +20,10 @@ use crate::entity::tool::{ActiveModel, Entity, Risk, Status};
 use crate::error::ToolError;
 use crate::providers::AnySearchProvider;
 use crate::providers::brave::SearchProvider;
+use crate::tools::fx::FxTool;
 use crate::tools::kb_client::KnowledgeBaseClient;
+use crate::tools::stocks::StockTool;
+use crate::tools::weather::WeatherTool;
 
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
 const VALIDATE_SYSTEM_PROMPT: &str = r#"You validate a tool definition against 2026 API design standards. You will be given a tool's name, description, JSON Schema input_schema, JSON Schema output_schema, risk level, and timeout_seconds. Respond with exactly this JSON and nothing else: {"approved": true or false, "feedback": "one or two sentences"}. Approve only if input_schema and output_schema are each a plausible JSON Schema object, description clearly states what the tool does (and, for risk "write" or "destructive", what it changes), and timeout_seconds is between 1 and 300."#;
@@ -31,6 +34,9 @@ pub struct Service {
     search: AnySearchProvider,
     http: reqwest::Client,
     kb: KnowledgeBaseClient,
+    weather: WeatherTool,
+    fx: FxTool,
+    stocks: StockTool,
 }
 
 impl Service {
@@ -56,6 +62,9 @@ impl Service {
             search: AnySearchProvider::from_env(you_api_key, brave_api_key),
             http: reqwest::Client::new(),
             kb: KnowledgeBaseClient::new(knowledge_base_url)?,
+            weather: WeatherTool::default(),
+            fx: FxTool::default(),
+            stocks: StockTool::default(),
         })
     }
 
@@ -279,10 +288,57 @@ impl Service {
             crate::slugs::WEB_FETCH => self.run_web_fetch(input).await,
             crate::slugs::KB_SEARCH => self.run_kb_search(input).await,
             crate::slugs::KB_READ_DOCUMENT => self.run_kb_read_document(input).await,
+            crate::slugs::WEATHER => self.run_weather(input).await,
+            crate::slugs::FX_RATE => self.run_fx_rate(input).await,
+            crate::slugs::STOCK_QUOTE => self.run_stock_quote(input).await,
             other => Ok(ExecuteOutcome::NotExecutable(format!(
                 "tool {other:?} has no runnable implementation yet — user-created tools need Integrations Service"
             ))),
         }
+    }
+
+    async fn run_weather(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
+        let location = input
+            .get("location")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(match self.weather.current(location).await {
+            Ok(weather) => ExecuteOutcome::Ok(serde_json::to_value(weather)?),
+            Err(error) => ExecuteOutcome::Error(error),
+        })
+    }
+
+    async fn run_fx_rate(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
+        let base = input
+            .get("base")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let quote = input
+            .get("quote")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // The model may pass the amount as a JSON number or, in practice, as a string — accept
+        // both rather than silently dropping the conversion.
+        let amount = input.get("amount").and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        });
+        Ok(match self.fx.rate(base, quote, amount).await {
+            Ok(rate) => ExecuteOutcome::Ok(serde_json::to_value(rate)?),
+            Err(error) => ExecuteOutcome::Error(error),
+        })
+    }
+
+    async fn run_stock_quote(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
+        let symbol = input
+            .get("symbol")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(match self.stocks.quote(symbol).await {
+            Ok(quote) => ExecuteOutcome::Ok(serde_json::to_value(quote)?),
+            Err(error) => ExecuteOutcome::Error(error),
+        })
     }
 
     async fn run_web_search(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {

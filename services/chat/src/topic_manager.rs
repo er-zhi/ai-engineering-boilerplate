@@ -2494,8 +2494,7 @@ mod tests {
     /// event id instead, so a terminal event at the same `version` as an earlier progress event
     /// still gets processed and `finish_topic` runs on the very first pass — no reconnect.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_terminal_event_sharing_its_version_with_an_earlier_event_still_finishes_the_topic()
-     {
+    async fn a_terminal_event_sharing_its_version_with_an_earlier_event_still_finishes_the_topic() {
         let (_test, manager, fake) = manager_with().await;
         let user_id = Uuid::new_v4();
         let (topic_id, execution_id) = insert_running_topic(&manager, user_id).await;
@@ -2518,8 +2517,9 @@ mod tests {
                     execution_id: execution_id.to_string(),
                     version: 1,
                     payload_kind: "ExecutionCompleted".to_owned(),
-                    payload_json: r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#
-                        .to_owned(),
+                    payload_json:
+                        r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#
+                            .to_owned(),
                     ..Default::default()
                 },
             ]],

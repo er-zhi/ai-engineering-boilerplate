@@ -203,37 +203,176 @@ impl ToolService for ToolServiceImpl {
     }
 }
 
-async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) {
-    let system_tools = [
-        (
-            slugs::WEB_SEARCH,
-            "Web search",
-            "Searches the web via Brave Search and returns matching pages.",
-            Risk::ReadOnly,
-        ),
-        (
-            slugs::WEB_FETCH,
-            "Fetch a web page",
-            "Fetches a URL and returns its readable title and text.",
-            Risk::ReadOnly,
-        ),
-        (
-            slugs::KB_SEARCH,
-            "Knowledge base search",
-            "Searches this project's knowledge base.",
-            Risk::ReadOnly,
-        ),
-        (
-            slugs::KB_READ_DOCUMENT,
-            "Read a knowledge base document",
-            "Reads the full text of one knowledge base document.",
-            Risk::ReadOnly,
-        ),
+/// One seedable system tool. The schemas matter: `list_tools` hands `input_schema` straight to
+/// the agent's prompt, so this is the only place that tells the model what arguments
+/// `weather`/`fx_rate`/`stock_quote` take.
+struct SystemTool {
+    slug: &'static str,
+    name: &'static str,
+    description: &'static str,
+    risk: Risk,
+    timeout_seconds: i32,
+    input_schema: serde_json::Value,
+    output_schema: serde_json::Value,
+}
+
+fn system_tools() -> Vec<SystemTool> {
+    let object = || serde_json::json!({"type": "object"});
+    let mut tools = vec![
+        SystemTool {
+            slug: slugs::WEB_SEARCH,
+            name: "Web search",
+            description: "Searches the web via Brave Search and returns matching pages.",
+            risk: Risk::ReadOnly,
+            timeout_seconds: 30,
+            input_schema: object(),
+            output_schema: object(),
+        },
+        SystemTool {
+            slug: slugs::WEB_FETCH,
+            name: "Fetch a web page",
+            description: "Fetches a URL and returns its readable title and text.",
+            risk: Risk::ReadOnly,
+            timeout_seconds: 30,
+            input_schema: object(),
+            output_schema: object(),
+        },
+        SystemTool {
+            slug: slugs::KB_SEARCH,
+            name: "Knowledge base search",
+            description: "Searches this project's knowledge base.",
+            risk: Risk::ReadOnly,
+            timeout_seconds: 30,
+            input_schema: object(),
+            output_schema: object(),
+        },
+        SystemTool {
+            slug: slugs::KB_READ_DOCUMENT,
+            name: "Read a knowledge base document",
+            description: "Reads the full text of one knowledge base document.",
+            risk: Risk::ReadOnly,
+            timeout_seconds: 30,
+            input_schema: object(),
+            output_schema: object(),
+        },
     ];
-    for (slug, name, description, risk) in system_tools {
+    tools.extend(structured_data_tools());
+    tools
+}
+
+/// The three structured-data tools (Task: live weather/FX/market data). Each races several open,
+/// keyless APIs internally, so from the agent's side they are a single fast call that either
+/// returns the real numbers or an error — which is why the prompt prefers them over web_search.
+fn structured_data_tools() -> Vec<SystemTool> {
+    vec![
+        weather_system_tool(),
+        fx_system_tool(),
+        stock_quote_system_tool(),
+    ]
+}
+
+fn weather_system_tool() -> SystemTool {
+    SystemTool {
+        slug: slugs::WEATHER,
+        name: "Current weather",
+        description: "Current weather for a place, from live weather APIs. Use this for any weather question instead of searching the web. Input: {\"location\": \"San Francisco\"} (a city, \"city, country\", or postcode).",
+        risk: Risk::ReadOnly,
+        timeout_seconds: 15,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "City, \"city, country\", or postcode, e.g. \"San Francisco\" or \"Berlin, DE\"."
+                }
+            },
+            "required": ["location"],
+        }),
+        output_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "temp_c": {"type": "number"},
+                "temp_f": {"type": "number"},
+                "conditions": {"type": "string"},
+                "humidity": {"type": ["number", "null"]},
+                "wind_kmh": {"type": ["number", "null"]},
+                "source": {"type": "string"},
+                "observed_at": {"type": "string"},
+            },
+        }),
+    }
+}
+
+fn fx_system_tool() -> SystemTool {
+    SystemTool {
+        slug: slugs::FX_RATE,
+        name: "Currency exchange rate",
+        description: "Current exchange rate between two currencies, from live FX APIs. Use this for any currency or conversion question instead of searching the web. Input: {\"base\": \"USD\", \"quote\": \"EUR\", \"amount\": 100} — amount is optional and returns the converted value.",
+        risk: Risk::ReadOnly,
+        timeout_seconds: 15,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "base": {"type": "string", "description": "ISO 4217 code to convert FROM, e.g. \"USD\"."},
+                "quote": {"type": "string", "description": "ISO 4217 code to convert TO, e.g. \"EUR\"."},
+                "amount": {"type": "number", "description": "Optional amount of the base currency to convert."},
+            },
+            "required": ["base", "quote"],
+        }),
+        output_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "base": {"type": "string"},
+                "quote": {"type": "string"},
+                "rate": {"type": "number"},
+                "amount": {"type": ["number", "null"]},
+                "converted": {"type": ["number", "null"]},
+                "date": {"type": "string"},
+                "source": {"type": "string"},
+            },
+        }),
+    }
+}
+
+fn stock_quote_system_tool() -> SystemTool {
+    SystemTool {
+        slug: slugs::STOCK_QUOTE,
+        name: "Stock or index quote",
+        description: "Latest price of a stock or market index, from live market-data APIs. Use this for any share price or index level question instead of searching the web. Input: {\"symbol\": \"AAPL\"}; indices use their Yahoo symbols: ^IXIC (Nasdaq Composite), ^GSPC (S&P 500), ^DJI (Dow Jones).",
+        risk: Risk::ReadOnly,
+        timeout_seconds: 15,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Ticker or index symbol, e.g. \"AAPL\", \"MSFT\", \"^IXIC\", \"^GSPC\", \"^DJI\"."
+                }
+            },
+            "required": ["symbol"],
+        }),
+        output_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "name": {"type": ["string", "null"]},
+                "price": {"type": "number"},
+                "previous_close": {"type": ["number", "null"]},
+                "change_pct": {"type": ["number", "null"]},
+                "currency": {"type": ["string", "null"]},
+                "as_of": {"type": "string"},
+                "source": {"type": "string"},
+            },
+        }),
+    }
+}
+
+async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) {
+    for tool in system_tools() {
         let existing = Entity::find()
             .filter(tool::entity::tool::Column::UserId.is_null())
-            .filter(tool::entity::tool::Column::Slug.eq(slug))
+            .filter(tool::entity::tool::Column::Slug.eq(tool.slug))
             .one(db)
             .await
             .unwrap_or(None);
@@ -247,50 +386,43 @@ async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) 
         {
             continue;
         }
-        seed_one_system_tool(service, db, slug, name, description, risk, existing).await;
+        seed_one_system_tool(service, db, &tool, existing).await;
     }
 }
 
 /// System tools are pre-vetted Rust implementations, not user-submitted schemas — they skip the
 /// Draft -> Validated LLM-review step and go straight to Active.
-#[allow(clippy::too_many_arguments)]
 async fn seed_one_system_tool(
     service: &Service,
     db: &sea_orm::DatabaseConnection,
-    slug: &str,
-    name: &str,
-    description: &str,
-    risk: Risk,
+    tool: &SystemTool,
     existing: Option<tool::entity::tool::Model>,
 ) {
     let result = match existing {
         Some(row) => activate_system_tool(db, row).await,
-        None => create_and_activate_system_tool(service, db, slug, name, description, risk).await,
+        None => create_and_activate_system_tool(service, db, tool).await,
     };
     match result {
-        Ok(()) => tracing::info!(slug, "seeded system tool"),
-        Err(error) => tracing::error!(slug, %error, "failed to seed system tool"),
+        Ok(()) => tracing::info!(slug = tool.slug, "seeded system tool"),
+        Err(error) => tracing::error!(slug = tool.slug, %error, "failed to seed system tool"),
     }
 }
 
 async fn create_and_activate_system_tool(
     service: &Service,
     db: &sea_orm::DatabaseConnection,
-    slug: &str,
-    name: &str,
-    description: &str,
-    risk: Risk,
+    tool: &SystemTool,
 ) -> Result<(), String> {
     let tool_id = service
         .create_tool(
             None,
-            slug.to_owned(),
-            name.to_owned(),
-            description.to_owned(),
-            serde_json::json!({"type": "object"}),
-            serde_json::json!({"type": "object"}),
-            risk,
-            30,
+            tool.slug.to_owned(),
+            tool.name.to_owned(),
+            tool.description.to_owned(),
+            tool.input_schema.clone(),
+            tool.output_schema.clone(),
+            tool.risk,
+            tool.timeout_seconds,
         )
         .await
         .map_err(|error| error.to_string())?;
