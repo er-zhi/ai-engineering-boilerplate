@@ -46,8 +46,8 @@ concrete answer, call web_fetch on the most relevant results — prefer plain, o
 pages over JavaScript-heavy ones, and when several results would each answer the question, pass
 them together so whichever responds first wins instead of spending a turn per failure.
 Then answer the question itself, with the real data in it — the numbers, dates and names you
-found — and cite the source URL. Never reply with a list of sites to check, a "you can find it
-at ..." pointer, or a "typically it is ..." guess when a tool can get the real value.
+found. Never reply with a list of sites to check, a "you can find it at ..." pointer, or a
+"typically it is ..." guess when a tool can get the real value.
 Your reply is either a tool_call or the finished answer — never a description of what you are
 about to do. Do not say "I will search", "I will fetch a better source" or "let me check": if
 that is your next step, make the tool_call for it in this very response instead.
@@ -65,16 +65,19 @@ another plan and do not decline again.
 /// of its answer rather than about calling tools. Replies here are read aloud, where a paragraph
 /// of process narration is unusable however accurate it is.
 const FINAL_ANSWER_STYLE: &str = r#"
-Final answer style, overriding any instinct to be thorough: your "reply" is read aloud, so it must
-be one or two short sentences, under 40 words.
-Never narrate your process — no "Based on the search results...", no "I searched...", no account
-of what worked or failed. No markdown, bullets, headers or bold. No list of sources; at most one
-short source mention in plain prose. State the answer itself — the number, the fact, the status —
-as if someone asked you out loud and you had one breath to reply.
-If you genuinely could not get the data, say that in one sentence and stop.
-Good: "Nasdaq Composite is at 26,108.46, up from 25,981.57 at the previous close."
-Bad: "Based on my search I attempted several sources; some returned errors or marketing text, but
-I eventually determined the value. Here are the details: ..."
+Final answer style, overriding any instinct to be thorough or helpful: your "reply" is read aloud.
+Answer only what was asked, in as few words as it takes — a fragment is better than a sentence,
+and one line is the maximum. Give the value, not a write-up of it.
+Never narrate your process, never list sources, never use markdown. Never add advice, suggestions,
+next steps, alternatives, caveats or offers of further help: the user asked a question, not for
+instructions.
+If you could not get the data, say only that, in a handful of words.
+Good: "Sunny, 69F."
+Good: "26,108.46."
+Good: "Couldn't get it."
+Bad: "Based on my search, the current weather in San Francisco is sunny with a temperature of
+about 69F. For the most accurate forecast you may want to check weather.gov or your local
+weather app."
 "#;
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RETRY_ATTEMPTS: u32 = 3;
@@ -375,8 +378,12 @@ mod tests {
         let (system, _) = build_prompt(&json!({"tool_calling": true}), &json!({}));
 
         assert!(system.contains("read aloud"), "{system}");
-        assert!(system.contains("one or two short sentences"), "{system}");
+        assert!(
+            system.contains("a fragment is better than a sentence"),
+            "{system}"
+        );
         assert!(system.contains("Never narrate your process"), "{system}");
+        assert!(system.contains("Never add advice"), "{system}");
         // The style rule is the last thing the model reads, after the tool policy.
         let policy_at = system.find("MUST use them").expect("policy rendered");
         let style_at = system.find("Final answer style").expect("style rendered");
@@ -398,7 +405,10 @@ mod tests {
             system.contains("pass\nthem together so whichever responds first wins"),
             "{system}"
         );
-        assert!(system.contains("cite the source URL"), "{system}");
+        assert!(
+            system.contains("with the real data in it — the numbers, dates and names"),
+            "{system}"
+        );
         assert!(
             system.contains("Never reply with a list of sites to check"),
             "{system}"
