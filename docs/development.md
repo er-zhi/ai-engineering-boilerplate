@@ -37,6 +37,25 @@ cargo machete
 
 Docker must be running for database tests. Nextest starts one disposable Postgres fixture for the suite, while every test gets its own database so the tests remain isolated and parallel; the fixture is removed when nextest exits. `cargo test --workspace` also works if `cargo-nextest` is unavailable and falls back to a testcontainer per database test.
 
+The whole suite runs in well under a minute. Two settings keep it there, and both fail silently when
+they drift:
+
+- A service whose tests take a database must appear in **both** the setup-script filter in
+  `.config/nextest.toml` and the `SCHEMAS` list in `.config/nextest-postgres.sh`. A service missing
+  from either falls back to starting its own Postgres container per test, which costs seconds per
+  test rather than milliseconds.
+- A service whose unit tests need `test_db` must depend on itself in its `[dev-dependencies]`
+  (`chat = { path = ".", features = ["test-support"] }`). Without that the tests are not compiled at
+  all by a plain `cargo nextest run --workspace` — they are skipped, not reported.
+
+## Image Build Speed
+
+`rust-toolchain.toml`'s channel and the `FROM rust:<version>-alpine` tag in every
+`services/*/Dockerfile` must name the **same exact patch version**. A floating tag such as
+`rust:1.98-alpine3.24` drifts to the newest patch release, and rustup then downloads the whole
+pinned toolchain inside every image build — about 48 seconds before cargo even starts. When the
+toolchain is bumped, bump both.
+
 Run the AI review workflow only after deterministic checks pass. Its entry point and required evidence format are in [the code-review skill](../.agents/skills/code-review/SKILL.md).
 
 ## Running Rust Services on the Host

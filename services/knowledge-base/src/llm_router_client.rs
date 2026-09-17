@@ -1,5 +1,6 @@
 // Talks to llm-router over gRPC for enrichment (Complete, low tier, JSON object); embeds via the native embedder — see embedder_client.rs.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use buffa::EnumValue;
@@ -19,10 +20,19 @@ const MAX_KEYWORDS: usize = 32;
 const MAX_KEYWORD_CHARS: usize = 64;
 const MAX_SUMMARY_CHARS: usize = 2_000;
 const MAX_ENRICHMENT_CONTENT_CHARS: usize = 20_000;
-const SYSTEM_PROMPT: &str = "Classify the page and reply with only a JSON object: \
-{\"page_type\": one of \"product\", \"knowledge\", \"instruction\", \"documentation\", \"blog\", \"other\", \
-\"keywords\": a short list of free-form terms, \"summary\": a one or two sentence summary}. \
-No other text.";
+static SYSTEM_PROMPT: LazyLock<String> = LazyLock::new(|| {
+    let choices: Vec<String> = search::classifiable_page_types()
+        .into_iter()
+        .map(|declared| format!("{:?}", search::page_type_word(declared)))
+        .collect();
+    format!(
+        "Classify the page and reply with only a JSON object: \
+{{\"page_type\": one of {}, \
+\"keywords\": a short list of free-form terms, \"summary\": a one or two sentence summary}}. \
+No other text.",
+        choices.join(", ")
+    )
+});
 
 pub struct LlmRouterClient {
     inner: LlmRouterServiceClient<HttpClient>,
@@ -60,7 +70,7 @@ impl LlmClient for LlmRouterClient {
             .inner
             .complete(CompleteRequest {
                 tier: EnumValue::Known(QualityTier::Low),
-                system_prompt: SYSTEM_PROMPT.to_owned(),
+                system_prompt: SYSTEM_PROMPT.clone(),
                 user_prompt: enrichment_content,
                 sampling: Sampling {
                     response_format: Some(EnumValue::Known(ResponseFormat::JsonObject)),
@@ -87,7 +97,8 @@ fn parse_enrichment(content: &str) -> Result<Enrichment, String> {
 
     let page_type = parsed["page_type"]
         .as_str()
-        .and_then(search::page_type_named)
+        .and_then(search::page_type_of_word)
+        .and_then(search::page_type_of)
         .unwrap_or(PageType::Other);
     let keywords = parsed["keywords"]
         .as_array()
@@ -195,7 +206,7 @@ mod tests {
         let received = fake.received.lock().unwrap();
         let request = &received[0];
         assert_eq!(request.tier, EnumValue::Known(QualityTier::Low));
-        assert_eq!(request.system_prompt, SYSTEM_PROMPT);
+        assert_eq!(request.system_prompt, *SYSTEM_PROMPT);
         assert_eq!(
             request.user_prompt.chars().count(),
             MAX_ENRICHMENT_CONTENT_CHARS

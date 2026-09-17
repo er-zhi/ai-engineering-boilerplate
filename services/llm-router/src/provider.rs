@@ -1,7 +1,6 @@
 // The contract every provider integration implements: one adapter per provider, speaking in prompts and completions rather than HTTP.
 
-use common::llm::Sampling;
-use common::proto::llm_router::v1::{FinishReason, QualityTier};
+use common::proto::llm_router::v1::{FinishReason, QualityTier, Sampling};
 use serde_json::Value;
 
 #[derive(Clone, Debug)]
@@ -21,10 +20,20 @@ pub struct Completion {
     pub reply: Value,
 }
 
+// Three ways a call ends badly: try the backup, the caller's own request was rejected, or this adapter's
+// contract was broken. Only Refused carries a fault the caller could fix, and only on a path the caller authors.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CallError {
     WorthRetrying(String),
+    Refused(String),
     Final(String),
+}
+
+impl CallError {
+    pub fn message(&self) -> &str {
+        let (Self::WorthRetrying(message) | Self::Refused(message) | Self::Final(message)) = self;
+        message
+    }
 }
 
 pub trait Provider: Send + Sync {

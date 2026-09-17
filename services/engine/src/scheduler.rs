@@ -1,12 +1,4 @@
-// The cron daemon: every poll interval, claim at most one due row of engine.schedules and start
-// a fresh execution of its graph. Deliberately much smaller than tick.rs's loop — a schedule
-// firing a few seconds late is invisible, so there is no LISTEN/NOTIFY here, just an interval.
-//
-// The claim and the advance of next_run_at happen in one transaction under FOR UPDATE SKIP
-// LOCKED, which gives cron's own at-most-once-per-due-tick semantics across any number of engine
-// instances: whoever wins the row also moves it forward, so nobody else sees it as due. A tick
-// missed while the service was down is not replayed — the next fire time is computed from now,
-// exactly like crond.
+// The cron daemon: claims one due schedule per poll and starts its execution.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +17,6 @@ use crate::cron_next::next_fire_after;
 use crate::entity::schedule;
 use crate::service::Service;
 
-/// One claimed schedule, carrying only what starting its execution needs.
 #[derive(Debug, Clone, PartialEq)]
 struct DueSchedule {
     id: i64,
@@ -43,9 +34,6 @@ pub async fn run_forever(db: DatabaseConnection, service: Arc<Service>, poll_int
     }
 }
 
-/// One scheduler pass: at most one schedule is claimed and fired, like `wakeup::try_spawn_one`'s
-/// one-per-wakeup discipline — the next tick picks up the next due row rather than draining a
-/// backlog synchronously. Returns the execution it started, for tests.
 async fn run_once(db: &DatabaseConnection, service: &Service) -> Option<Uuid> {
     let due = match claim_one_due(db).await {
         Ok(due) => due?,
@@ -57,13 +45,6 @@ async fn run_once(db: &DatabaseConnection, service: &Service) -> Option<Uuid> {
     fire(db, service, &due).await
 }
 
-/// Claims the earliest due schedule and advances its `next_run_at` in the same transaction, under
-/// `FOR UPDATE SKIP LOCKED` — a second instance polling at the same moment skips the locked row
-/// and, once this transaction commits, no longer sees it as due at all.
-///
-/// A row whose `cron_expr` no longer parses (hand-edited, or written before the validation in
-/// `Service::create_schedule`) is disabled instead of fired: leaving `next_run_at` in the past
-/// would make every poll re-claim the same unfireable row forever.
 async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, DbErr> {
     let txn = db.begin().await?;
     let Some(row) = schedule::Entity::find()
@@ -110,10 +91,6 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, D
     }))
 }
 
-/// Starts the claimed schedule's execution, after its claim transaction has already committed.
-/// Best effort by design: the schedule has been advanced either way, so a graph that no longer
-/// exists costs one skipped run and a log line, never the loop. Recording `last_execution_id` is
-/// cosmetic — a failure there is a warning, not a retry.
 async fn fire(db: &DatabaseConnection, service: &Service, due: &DueSchedule) -> Option<Uuid> {
     let execution_id = start(service, due).await?;
     record_last_execution(db, due.id, execution_id).await;
@@ -167,7 +144,7 @@ async fn record_last_execution(db: &DatabaseConnection, schedule_id: i64, execut
 mod tests {
     use super::*;
 
-    const HOURLY: &str = "0 0 * * * *"; // sec min hour dom month dow — see cron_next.rs
+    const HOURLY: &str = "0 0 * * * *";
 
     async fn seed_schedule(
         db: &DatabaseConnection,

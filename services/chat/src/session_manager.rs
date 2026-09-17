@@ -1,16 +1,36 @@
-// Session lookup/creation — the thin read side TopicManager (Task 5) builds on. One session
-// per user_id (see this plan's Task 3 design note): get_or_create_session is idempotent.
+// Session lookup and creation, and the session-scoped reads the topic RPCs are built on.
 
 use chrono::Utc;
+use common::principal::Principal;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::entity::{message, session, topic};
 use crate::error::ChatError;
+
+pub(crate) async fn lock_session<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    session_id: Uuid,
+) -> Result<session::Model, ChatError> {
+    session::Entity::find_by_id(session_id)
+        .lock_exclusive()
+        .one(db)
+        .await?
+        .ok_or_else(|| ChatError::InvalidRequest("session vanished".to_owned()))
+}
+
+#[must_use]
+pub fn principal_of(session: &session::Model) -> Principal {
+    Principal {
+        user_id: session.user_id,
+        session_id: session.id.to_string(),
+    }
+}
 
 pub struct SessionManager {
     pub(crate) db: DatabaseConnection,
@@ -30,13 +50,6 @@ impl SessionManager {
         {
             return Ok(existing);
         }
-        // Two callers can reach this point for the same user at once — the chat page opens
-        // `GetSession` and `StreamEvents` in parallel, and right after a `ResetSession` there is
-        // no row for either of them to find. A plain INSERT then makes the loser fail with
-        // «duplicate key value violates unique constraint "sessions_user_id_key"», which the
-        // user saw as a 500 on the page that had just been reset. `ON CONFLICT (user_id) DO
-        // NOTHING` turns the losing insert into a no-op, and the SELECT below picks up whichever
-        // row won — so both callers get the same session and neither errors.
         session::Entity::insert(session::ActiveModel {
             id: Set(Uuid::new_v4()),
             user_id: Set(user_id),
@@ -58,8 +71,28 @@ impl SessionManager {
             .ok_or_else(|| ChatError::InvalidRequest("session vanished".to_owned()))
     }
 
-    /// Every user turn stored for `topic_ids`, grouped by topic and oldest first — one query for
-    /// the whole session view rather than one per topic.
+    pub(crate) async fn session_by_id(
+        &self,
+        session_id: Uuid,
+    ) -> Result<session::Model, ChatError> {
+        session::Entity::find_by_id(session_id)
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| ChatError::InvalidRequest("session vanished".to_owned()))
+    }
+
+    pub(crate) async fn session_of_topic(
+        &self,
+        topic_id: i64,
+    ) -> Result<session::Model, ChatError> {
+        let session_id = topic::Entity::find_by_id(topic_id)
+            .one(&self.db)
+            .await?
+            .ok_or(ChatError::TopicNotFound(topic_id))?
+            .session_id;
+        self.session_by_id(session_id).await
+    }
+
     pub async fn messages_by_topic(
         &self,
         topic_ids: &[i64],
@@ -80,17 +113,11 @@ impl SessionManager {
         Ok(grouped)
     }
 
-    /// `(focus_topic_id, every topic in the session)` — backs the `GetSession` RPC.
     pub async fn get_session_view(
         &self,
         user_id: Uuid,
     ) -> Result<(Option<i64>, Vec<topic::Model>), ChatError> {
         let session = self.get_or_create_session(user_id).await?;
-        // Oldest first, explicitly. Without an ORDER BY this is heap order, which Postgres
-        // reshuffles as rows are UPDATEd — and topic rows are updated on every status change. The
-        // client relies on this order both to draw the topic panel and to pick the newest topic
-        // when the server has cleared focus, so an arbitrary order there attaches a follow-up to
-        // whichever conversation happened to sort last.
         let topics = topic::Entity::find()
             .filter(topic::Column::SessionId.eq(session.id))
             .order_by_asc(topic::Column::CreatedAt)
@@ -124,9 +151,6 @@ mod tests {
         assert_eq!(first.id, second.id);
     }
 
-    /// The bug the user hit live: after `ResetSession` the page reopens `GetSession` and
-    /// `StreamEvents` at the same time, both find no session row, and both INSERT — the loser
-    /// used to fail with a unique-constraint violation and the page showed a 500.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_get_or_create_session_calls_create_exactly_one_row() {
         let (test, _manager) = manager_with().await;

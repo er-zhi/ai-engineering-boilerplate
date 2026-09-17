@@ -1,36 +1,4 @@
-// engine.execution_events: the append-only log, and the one table in this service that grows with
-// time rather than with entities — so it is `PARTITION BY RANGE (occurred_at)`, monthly, from the
-// first version (gate-database → "Growth": retention here is DROP PARTITION, never DELETE, and
-// converting a full table to partitions later is a rewrite under lock). `partition.rs` creates and
-// drops the monthly children; this module owns the parent's definition.
-//
-// Row-count bound: none by row — a few events per super-step, unbounded over time, bounded only in
-// months by `ENGINE_EVENTS_RETENTION_MONTHS` (unset by default = kept forever; this is the durable
-// history `sweep.rs` deletes the hot tables against, so it is never trimmed by omission).
-// Hot-path queries: `stream.rs` alone, always `WHERE execution_id = $1 AND id > $2 ORDER BY id`
-// under `execution_events_execution_id_id_idx`. The tick path only appends here; no tick query
-// ever joins this table to `executions`.
-//
-// Why this entity deliberately does NOT live under `crate::entity::` — the module path that
-// `get_schema_registry("engine::entity::*")` globs (sea-orm 2.0.2 selects registry entries by
-// `module_path!()` prefix, see sea_orm::EntityRegistry::build_schema):
-//
-//   1. schema-sync cannot express a partitioned parent at all — it emits a plain CREATE TABLE.
-//   2. Worse, sync is not inert against one created by hand. Measured against sea-orm 2.0.2:
-//      with `#[sea_orm(unique_key = ...)]` on `event_id`, every sync fails outright with
-//      «unique constraint on partitioned table must include all partitioning columns»; without
-//      it, sync *silently drops* the table's own UNIQUE (occurred_at, event_id) — its last pass
-//      removes unique keys it finds in the database but not on the entity.
-//
-// So the table is created by the literal statements below, before any of this service's
-// partition management, and schema-sync never sees it. The four sync-managed entities stay under
-// `crate::entity::` and the glob keeps covering them automatically.
-//
-// The entity still declares `id` as its single primary key: that is the ORM's row identity (and
-// the `RETURNING id` an insert needs), not a claim about the database's constraint, which is
-// PRIMARY KEY (occurred_at, id) — Postgres requires the partition key in every unique constraint
-// on a partitioned table. Because `id` is one `bigserial` sequence shared by every partition it
-// is still globally monotonic in insertion order, which is exactly what StreamEvents orders by.
+// The engine.execution_events table: an append-only log bounded by the monthly partitions ENGINE_EVENTS_RETENTION_MONTHS drops; StreamEvents polls it by execution_id or by user_id.
 
 use sea_orm::entity::prelude::*;
 
@@ -52,8 +20,6 @@ pub struct Model {
 
 impl ActiveModelBehavior for ActiveModel {}
 
-/// The partitioned parent. Run before anything inserts an event; `IF NOT EXISTS` makes it a no-op
-/// on every start after the first.
 pub const TABLE_STATEMENTS: [&str; 1] = ["CREATE TABLE IF NOT EXISTS engine.execution_events ( \
      id bigserial NOT NULL, \
      event_id uuid NOT NULL, \
@@ -63,12 +29,12 @@ pub const TABLE_STATEMENTS: [&str; 1] = ["CREATE TABLE IF NOT EXISTS engine.exec
      causation_id uuid, \
      occurred_at timestamptz NOT NULL, \
      payload jsonb NOT NULL, \
-     PRIMARY KEY (occurred_at, id), \
-     UNIQUE (occurred_at, event_id) \
+     PRIMARY KEY (occurred_at, id) \
      ) PARTITION BY RANGE (occurred_at)"];
 
-/// `StreamEvents`' lookup index, created on the parent so every partition inherits it.
-pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 1] = [
+pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 2] = [
     "CREATE INDEX IF NOT EXISTS execution_events_execution_id_id_idx \
      ON engine.execution_events (execution_id, id)",
+    "CREATE INDEX IF NOT EXISTS execution_events_user_id_id_idx \
+     ON engine.execution_events (user_id, id)",
 ];

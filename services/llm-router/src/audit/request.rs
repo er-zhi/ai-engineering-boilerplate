@@ -1,5 +1,9 @@
 // One row per completion: the statistics worth keeping long after the payloads are gone.
 
+// One row per Complete call, so the table grows with traffic and is bounded only by its monthly partitions,
+// which are kept. Nothing reads it outside the tests today: it is queried by hand, by created_at, when
+// someone asks what the calls cost, which tier fell back, and how often a model refused.
+
 use common::proto::llm_router::v1::{FinishReason, QualityTier};
 use sea_orm::entity::prelude::*;
 
@@ -82,3 +86,20 @@ pub struct Model {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+// The database constraint is PRIMARY KEY (created_at, id), because Postgres wants the partition key in every
+// unique constraint on a partitioned table; the entity's single `id` is the ORM's row identity, not that
+// constraint. One bigserial sequence serves every partition, so ids stay monotonic in insertion order.
+pub const TABLE_STATEMENT: &str = "CREATE TABLE IF NOT EXISTS llm_router.requests ( \
+     id bigserial NOT NULL, \
+     tier varchar(32) NOT NULL, \
+     model_used varchar(128) NOT NULL, \
+     used_backup boolean NOT NULL, \
+     tokens_in integer NOT NULL, \
+     tokens_out integer NOT NULL, \
+     latency_ms integer NOT NULL, \
+     outcome varchar(16) NOT NULL, \
+     finish_reason varchar(32) NOT NULL, \
+     created_at timestamptz NOT NULL, \
+     PRIMARY KEY (created_at, id) \
+     ) PARTITION BY RANGE (created_at)";

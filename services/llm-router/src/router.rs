@@ -43,7 +43,7 @@ pub async fn complete(
             model_used: tier.primary.clone(),
             used_backup: false,
         }),
-        Err(rejected @ CallError::Final(_)) => Err(Failed {
+        Err(rejected @ (CallError::Refused(_) | CallError::Final(_))) => Err(Failed {
             error: rejected,
             model_used: tier.primary.clone(),
             used_backup: false,
@@ -70,8 +70,7 @@ pub async fn complete(
 mod tests {
     use std::sync::Mutex;
 
-    use common::llm::Sampling;
-    use common::proto::llm_router::v1::{FinishReason, QualityTier};
+    use common::proto::llm_router::v1::{FinishReason, QualityTier, Sampling};
 
     use super::*;
 
@@ -163,23 +162,28 @@ mod tests {
         );
     }
 
+    // A second vendor cannot fix a request the first one read and refused, so neither arm reaches the backup.
     #[tokio::test(start_paused = true)]
     async fn a_rejected_request_never_reaches_the_backup() {
-        let provider = Scripted::new(vec![Err(CallError::Final(
-            "the provider answered 400".to_owned(),
-        ))]);
+        for rejected in [
+            CallError::Final("the provider answered 400".to_owned()),
+            CallError::Refused("the provider answered 422".to_owned()),
+        ] {
+            let provider = Scripted::new(vec![Err(rejected)]);
 
-        let failed = complete(&provider, &tiers(), &prompt(QualityTier::Low))
-            .await
-            .unwrap_err();
+            let failed = complete(&provider, &tiers(), &prompt(QualityTier::Low))
+                .await
+                .unwrap_err();
 
-        assert_eq!(
-            failed.error,
-            CallError::Final("the provider answered 400".to_owned())
-        );
-        assert_eq!(failed.model_used, "deepseek/deepseek-v4-flash");
-        assert!(!failed.used_backup);
-        assert_eq!(provider.asked(), ["deepseek/deepseek-v4-flash"]);
+            assert!(
+                matches!(failed.error, CallError::Final(_) | CallError::Refused(_)),
+                "{:?} is reported as it arrived",
+                failed.error
+            );
+            assert_eq!(failed.model_used, "deepseek/deepseek-v4-flash");
+            assert!(!failed.used_backup);
+            assert_eq!(provider.asked(), ["deepseek/deepseek-v4-flash"]);
+        }
     }
 
     #[tokio::test(start_paused = true)]

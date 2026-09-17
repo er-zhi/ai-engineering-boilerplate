@@ -1,159 +1,206 @@
-// TaskExecutor for kind="llm": calls llm-router, mapping its plain-text CompleteResponse into
-// the {tool_call, reply} shape agent_graph's edges check (see the module doc above for why),
-// plus a {usage: {tokens_in, tokens_out}} block that step() charges the execution's Budget from.
+// Runs an llm node by calling llm-router and parsing its reply.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use buffa::EnumValue;
+use common::execution_input::ExecutionInput;
 use common::proto::llm_router::v1::{
     CompleteRequest, CompleteResponse, LlmRouterServiceClient, QualityTier, ResponseFormat,
     Sampling,
 };
-use connectrpc::Protocol;
-use connectrpc::client::{ClientConfig, HttpClient};
-use engine_core::{TaskError, TaskExecutor};
+use connectrpc::client::HttpClient;
+use engine_core::{
+    LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
+};
 use serde_json::{Value, json};
 
+use crate::dispatch::NodeKind;
+
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-const TOOL_CALLING_INSTRUCTIONS: &str = r#"
+const TOOL_SLUG_PLACEHOLDER: &str = "<tool slug>";
+const ARGUMENT_NAME_PLACEHOLDER: &str = "<argument name>";
+const ARGUMENT_VALUE_PLACEHOLDER: &str = "<argument value>";
+const ANSWER_PLACEHOLDER: &str = "<your answer>";
+static TOOL_CALLING_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"
 If you need a tool, respond with exactly this JSON and nothing else:
-{"tool_call": {"name": "<tool slug>", "args": {...}}}
+{}
 Otherwise, respond with exactly this JSON and nothing else:
-{"tool_call": null, "reply": "<your answer>"}
+{}
 A tool result shown as an ERROR means that call failed, not that the task is over: fix the
 arguments and call the tool again, call a different tool that can answer the question, or reply
 with the best answer you can give from what you already have. Do not repeat a call that has
 already failed the same way.
-"#;
-/// Appended after the `available_tools` list (so the model reads the rule with the catalog in
-/// front of it, not before it). Without this a model asked for today's weather happily replies
-/// "as an AI I don't have real-time data" and never calls a tool at all — the loop is wired, the
-/// catalog is injected, and the model still answers from training data.
+"#,
+        shape_of(LlmOutput {
+            tool_call: serde_json::to_value(ToolCall {
+                name: TOOL_SLUG_PLACEHOLDER.to_owned(),
+                args: json!({ARGUMENT_NAME_PLACEHOLDER: ARGUMENT_VALUE_PLACEHOLDER}),
+            })
+            .expect("a ToolCall always serializes"),
+            reply: Value::Null,
+        }),
+        shape_of(LlmOutput {
+            tool_call: Value::Null,
+            reply: Value::String(ANSWER_PLACEHOLDER.to_owned()),
+        }),
+    )
+});
+
 const TOOL_USE_POLICY: &str = r#"
-You have live access to these tools and MUST use them rather than answering from memory whenever
-the question is time-sensitive (today, current, latest, now, weather, news, prices, scores),
-concerns a specific real-world fact you are not certain of, or asks about this system's own
-knowledge base or documents. In those cases call web_search (for anything on the public web) or
-kb_search (for the knowledge base) FIRST and answer from the result.
-Never reply that you lack real-time data, cannot browse, or that your knowledge has a cutoff
-while a search tool is listed above — call it instead. Every tool listed above is connected and
-working: never decline because you are unsure a tool is available or operational, and never tell
-the user to go look somewhere else. Call it — if it fails you will be shown the error.
-Only answer directly when the question needs no outside information, or when the tools have
-already given you what you need.
-Keep going until you have the actual value. If the search snippets do not already contain the
-concrete answer, call web_fetch on the most relevant results — prefer plain, official, text-first
-pages over JavaScript-heavy ones, and when several results would each answer the question, pass
-them together so whichever responds first wins instead of spending a turn per failure.
-Then answer the question itself, with the real data in it — the numbers, dates and names you
-found. Never reply with a list of sites to check, a "you can find it at ..." pointer, or a
-"typically it is ..." guess when a tool can get the real value.
-Your reply is either a tool_call or the finished answer — never a description of what you are
-about to do. Do not say "I will search", "I will fetch a better source" or "let me check": if
-that is your next step, make the tool_call for it in this very response instead.
+The tools listed above are live and connected. Use one rather than answering from memory
+whenever you are not certain your answer is correct and current — anything that could have
+changed since you were trained, any specific fact you would be guessing at, and anything about
+this system's own data. Only answer directly when the question needs no outside information, or
+when the tools have already given you what you need.
+Never reply that you lack access, cannot browse, or that your knowledge has a cutoff while a
+tool that could answer is listed above — call it instead. Never decline because you are unsure a
+tool is available or working: call it, and if it fails you will be shown the error and can try
+another. Never tell the user to go look somewhere else.
+Keep going until you have the actual value. If one tool's result does not yet contain the
+concrete answer, use what it gave you to call another — and when several candidates would each
+answer the question, pass them together so whichever responds first wins, instead of spending a
+turn per failure.
+Your response is either a tool_call or the finished answer — never a description of what you are
+about to do. If your next step is a tool call, make that call in this very response.
+Every specific value you state — a number, a name, a date, a status — must appear in a tool result
+you were shown in this conversation. Never fill one in from memory, and never carry one over from
+what you knew before: a value you remember is out of date by definition, and a plausible wrong
+value is worse than none. If a tool result does not contain what was asked, call another tool; if
+nothing gives it to you, say you could not get it rather than supplying it yourself.
 "#;
-/// Appended to the system prompt for the one extra turn `execute` takes when the model described
-/// its next step, or declined, instead of calling a tool.
 const TOOL_NUDGE: &str = r#"
-Your previous response described what you were going to do, or declined for lack of access,
-instead of using a tool. Do it now: respond with the tool_call itself. Every tool listed above is
-connected and working — call it; if it fails you will be shown the error and can try another. If
-you truly cannot make that call, answer the question with what you already have — do not describe
-another plan and do not decline again.
+You answered without using any tool. If a tool above could confirm or supply what you just said,
+call it now: respond with the tool_call itself. Every tool listed is connected and working — if
+it fails you will be shown the error and can try another. If no tool applies, or you truly
+cannot make the call, answer the question with what you already have: do not describe a plan and
+do not decline.
 "#;
-/// Appended last, after the tool-use policy, so the final rule the model reads is about the shape
-/// of its answer rather than about calling tools. Replies here are read aloud, where a paragraph
-/// of process narration is unusable however accurate it is.
 const FINAL_ANSWER_STYLE: &str = r#"
 Final answer style, overriding any instinct to be thorough or helpful: your "reply" is read aloud.
+Your reply is either the value you were asked for, or an admission that you could not get it.
+There is no third option: naming a place the value could be found is not an answer, it is the
+admission with extra words. If you do not have the value, the whole reply is a handful of words
+saying so.
 Answer only what was asked, in as few words as it takes — a fragment is better than a sentence,
 and one line is the maximum. Give the value, not a write-up of it.
 Never narrate your process, never list sources, never use markdown. Never add advice, suggestions,
 next steps, alternatives, caveats or offers of further help: the user asked a question, not for
 instructions.
-If you could not get the data, say only that, in a handful of words.
-Good: "Sunny, 69F."
-Good: "26,108.46."
-Good: "Couldn't get it."
-Bad: "Based on my search, the current weather in San Francisco is sunny with a temperature of
-about 69F. For the most accurate forecast you may want to check weather.gov or your local
-weather app."
+A bare value, a fragment, or "Couldn't get it." are all complete answers. A sentence that opens
+with "Based on my search" or closes by suggesting where else to look is not.
 "#;
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const RENDERED_TOOL_RESULTS: usize = 4;
+const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+const TRUNCATION_MARK: &str = "… (truncated)";
 
-/// Builds `(system_prompt, user_prompt)` from a Task's `config` and the execution's current
-/// `state`. `config.system_prompt` overrides the default; `config.tool_calling: true` appends
-/// the JSON-contract instructions. `state.question` is the base question; any
-/// `state.tool_result` entries (an array — see Task 7's `agent_graph`) are rendered after it so
-/// a later loop iteration sees what earlier tool calls returned.
-#[must_use]
-pub fn build_prompt(config: &Value, state: &Value) -> (String, String) {
-    let mut system = config
-        .get("system_prompt")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_SYSTEM_PROMPT)
-        .to_owned();
-    if config.get("tool_calling").and_then(Value::as_bool) == Some(true) {
-        system.push_str(TOOL_CALLING_INSTRUCTIONS);
+fn shape_of(output: LlmOutput) -> String {
+    serde_json::to_string(&output).expect("an LlmOutput always serializes")
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct LlmNodeConfig {
+    pub system_prompt: Option<String>,
+    pub tool_calling: bool,
+    pub available_tools: Vec<CatalogEntry>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct CatalogEntry {
+    pub name: String,
+    pub description: String,
+}
+
+impl LlmNodeConfig {
+    pub fn parse(config: &Value) -> Result<Self, TaskError> {
+        serde_json::from_value(config.clone())
+            .map_err(|error| TaskError::Failed(format!("llm node config is not usable: {error}")))
     }
-    if let Some(tools) = config.get("available_tools").and_then(Value::as_array) {
+
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| {
+            debug_assert!(false, "an LlmNodeConfig always serializes");
+            Value::Object(serde_json::Map::new())
+        })
+    }
+}
+
+#[must_use]
+pub fn build_prompt(config: &LlmNodeConfig, state: &Value) -> (String, String) {
+    let mut system = config
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
+    if config.tool_calling {
+        system.push_str(&TOOL_CALLING_INSTRUCTIONS);
+    }
+    if !config.available_tools.is_empty() {
         system.push_str("\n\nAvailable tools:\n");
-        for tool in tools {
-            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
-            let description = tool
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            system.push_str(&format!("- {name}: {description}\n"));
+        for tool in &config.available_tools {
+            system.push_str(&format!("- {}: {}\n", tool.name, tool.description));
         }
     }
-    if config.get("tool_calling").and_then(Value::as_bool) == Some(true) {
+    if config.tool_calling {
         system.push_str(TOOL_USE_POLICY);
     }
     system.push_str(FINAL_ANSWER_STYLE);
 
-    let question = state
-        .get("question")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mut user = question.to_owned();
-    if let Some(results) = state.get("tool_result").and_then(Value::as_array) {
-        for (index, result) in results.iter().enumerate() {
-            // A {"error": msg} entry is ToolTaskExecutor's recoverable-error observation (see
-            // services/engine/src/executors/tool.rs). Label it so the model reads it as a failed
-            // call it may recover from, not as data the tool returned.
-            match result.get("error").and_then(Value::as_str) {
-                Some(error) => user.push_str(&format!("\n\nTool result {index} — ERROR: {error}")),
-                None => user.push_str(&format!("\n\nTool result {index}: {result}")),
-            }
-        }
+    let mut user = ExecutionInput::in_state(state).question;
+    for (index, result) in rendered_tool_results(state) {
+        user.push_str(&render_tool_result(index, result));
     }
     (system, user)
 }
 
-/// Parses a model's plain-text response into `{"tool_call": ..|null, "reply": ..|null}`. A
-/// response that isn't the requested JSON shape is treated as a plain final answer — a model
-/// that ignores the JSON-contract instructions should still produce a usable (if unstructured)
-/// result rather than fail the whole execution.
-#[must_use]
-pub fn parse_llm_output(content: &str) -> Value {
-    match serde_json::from_str::<Value>(content) {
-        Ok(parsed) if parsed.get("tool_call").is_some() || parsed.get("reply").is_some() => {
-            json!({
-                "tool_call": parsed.get("tool_call").cloned().unwrap_or(Value::Null),
-                "reply": parsed.get("reply").cloned().unwrap_or(Value::Null),
-            })
-        }
-        _ => json!({"tool_call": Value::Null, "reply": content}),
+fn rendered_tool_results(state: &Value) -> impl Iterator<Item = (usize, &Value)> {
+    let results = state
+        .get(TOOL_RESULT_STATE_KEY)
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let first_rendered = results.len().saturating_sub(RENDERED_TOOL_RESULTS);
+    results.iter().enumerate().skip(first_rendered)
+}
+
+fn render_tool_result(index: usize, result: &Value) -> String {
+    match result.get(TOOL_RESULT_ERROR_KEY).and_then(Value::as_str) {
+        Some(error) => format!("\n\nTool result {index} — ERROR: {}", truncated(error)),
+        None => format!(
+            "\n\nTool result {index}: {}",
+            truncated(&result.to_string())
+        ),
     }
 }
 
-/// One successful `CompleteResponse` as this executor's output value: `parse_llm_output`'s
-/// `{tool_call, reply}` shape plus a `usage` block. `step()` charges the execution's `Budget`
-/// from that block — without it a completed Task only ever costs its one tool call, so the token
-/// limit would never bind on the one node kind that actually spends tokens.
+fn truncated(text: &str) -> String {
+    if text.chars().count() <= MAX_TOOL_RESULT_CHARS {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+    format!("{kept}{TRUNCATION_MARK}")
+}
+
+#[must_use]
+pub fn parse_llm_output(content: &str) -> Value {
+    let parsed = serde_json::from_str::<LlmOutput>(content).unwrap_or_default();
+    let output = if parsed.is_blank() {
+        LlmOutput {
+            tool_call: Value::Null,
+            reply: Value::String(content.to_owned()),
+        }
+    } else {
+        parsed
+    };
+    serde_json::to_value(output).expect("an LlmOutput always serializes")
+}
+
 #[must_use]
 fn response_to_output(response: &CompleteResponse) -> Value {
     let mut output = parse_llm_output(&response.content);
@@ -172,17 +219,13 @@ pub struct LlmTaskExecutor {
 
 impl LlmTaskExecutor {
     pub fn new(llm_router_url: &str) -> Result<Self, String> {
-        let target = llm_router_url.parse().map_err(|error| {
-            format!("could not parse LLM_ROUTER_URL {llm_router_url:?}: {error}")
-        })?;
         Ok(Self {
-            client: LlmRouterServiceClient::new(
-                HttpClient::plaintext_http2_only(),
-                ClientConfig::new(target)
-                    .with_protocol(Protocol::Grpc)
-                    .with_default_timeout(CALL_TIMEOUT)
-                    .proto(),
-            ),
+            client: crate::executors::grpc_client(
+                "LLM_ROUTER_URL",
+                llm_router_url,
+                CALL_TIMEOUT,
+                LlmRouterServiceClient::new,
+            )?,
         })
     }
 }
@@ -195,20 +238,16 @@ impl TaskExecutor for LlmTaskExecutor {
         state: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TaskError> {
-        debug_assert_eq!(kind, "llm");
+        debug_assert_eq!(NodeKind::parse(kind), Ok(NodeKind::Llm));
         tracing::debug!(
             idempotency_key,
             "llm task executing (key logged, not enforced — no destructive side effect to dedupe, see the spec's Порты)"
         );
-        let (system_prompt, user_prompt) = build_prompt(config, state);
-        // When the graph asked for the JSON tool-call contract, also ask the provider for a JSON
-        // object response — every served tier supports it (common::llm::RESPONSE_FORMATS), and
-        // it makes parse_llm_output's happy path the common one instead of the fallback.
-        let response_format = if config.get("tool_calling").and_then(Value::as_bool) == Some(true) {
-            Some(EnumValue::Known(ResponseFormat::JsonObject))
-        } else {
-            None
-        };
+        let config = LlmNodeConfig::parse(config)?;
+        let (system_prompt, user_prompt) = build_prompt(&config, state);
+        let response_format = config
+            .tool_calling
+            .then_some(EnumValue::Known(ResponseFormat::JsonObject));
         let request = CompleteRequest {
             tier: EnumValue::Known(QualityTier::Medium),
             system_prompt,
@@ -223,15 +262,8 @@ impl TaskExecutor for LlmTaskExecutor {
 
         let output = self.complete_with_retries(&request).await?;
 
-        // The model answered with an intention ("I will search for a better source...") and no
-        // tool_call. The graph can only read that as a final answer — the llm → end edge fires on
-        // a null tool_call — so the execution completes with a narration instead of an answer.
-        // Nudge once, here, where it costs one call rather than a whole loop iteration.
-        if config.get("tool_calling").and_then(Value::as_bool) == Some(true)
-            && output["tool_call"].is_null()
-            && needs_tool_nudge(output["reply"].as_str().unwrap_or_default())
-        {
-            tracing::info!("llm answered without using a tool it should have used, nudging once");
+        if answered_before_consulting_any_tool(&config, state, &output) {
+            tracing::info!("llm answered before using any tool, nudging once");
             let mut nudged = request.clone();
             nudged.system_prompt.push_str(TOOL_NUDGE);
             let second = self.complete_with_retries(&nudged).await?;
@@ -258,8 +290,6 @@ impl LlmTaskExecutor {
     }
 }
 
-/// The nudged turn's output, carrying both turns' token usage — the discarded first call was
-/// really spent, and `step()` charges the budget from whatever this node returns.
 fn merge_usage(first: &Value, mut second: Value) -> Value {
     let field = |value: &Value, name: &str| value["usage"][name].as_u64().unwrap_or(0);
     let merged = json!({
@@ -272,55 +302,32 @@ fn merge_usage(first: &Value, mut second: Value) -> Value {
     second
 }
 
-/// Whether a tool-less reply is a non-answer that one nudge can turn into a real one. Two kinds
-/// have been seen live, both ending an execution with no answer in it:
-///   - a *narration*: the model describes the call it is about to make instead of making it
-///     ("I will search for a more reliable weather source");
-///   - a *refusal*: the model declines while the tools it needs are listed right there ("I do not
-///     have access to a search tool", "I cannot confirm its operational status").
-///
-/// Deliberately narrow, matching the way these replies talk about themselves — a real answer that
-/// merely mentions searching ("the search results say it is 62F") is untouched.
 #[must_use]
-pub fn needs_tool_nudge(reply: &str) -> bool {
-    const NARRATED_INTENTS: [&str; 10] = [
-        "i will search",
-        "i will fetch",
-        "i will look",
-        "i will check",
-        "i will try",
-        "i'll search",
-        "i'll fetch",
-        "i'll look",
-        "i'll check",
-        "let me search",
-    ];
-    const REFUSALS: [&str; 8] = [
-        "i do not have access",
-        "i don't have access",
-        "i cannot confirm",
-        "i can't confirm",
-        "i cannot reliably provide",
-        "i do not have real-time",
-        "i don't have real-time",
-        "i am unable to search",
-    ];
-    let lowered = reply.to_lowercase();
-    NARRATED_INTENTS
-        .iter()
-        .chain(REFUSALS.iter())
-        .any(|phrase| lowered.contains(phrase))
+pub fn answered_before_consulting_any_tool(
+    config: &LlmNodeConfig,
+    state: &Value,
+    output: &Value,
+) -> bool {
+    let written: LlmOutput = serde_json::from_value(output.clone()).unwrap_or_default();
+    config.tool_calling
+        && written.tool_call.is_null()
+        && state
+            .get(TOOL_RESULT_STATE_KEY)
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn config_of(value: Value) -> LlmNodeConfig {
+        LlmNodeConfig::parse(&value).expect("usable config")
+    }
+
     #[test]
     fn build_prompt_uses_the_default_system_prompt_when_config_has_none() {
-        let (system, _) = build_prompt(&json!({}), &json!({}));
-        // Tool instructions are opt-in; the answer-style rule is not — every reply is spoken,
-        // including a graph that never calls a tool.
+        let (system, _) = build_prompt(&config_of(json!({})), &json!({}));
         assert_eq!(
             system,
             format!("{DEFAULT_SYSTEM_PROMPT}{FINAL_ANSWER_STYLE}")
@@ -328,15 +335,31 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_ignores_the_graph_keys_that_are_not_this_executors() {
+        let config = config_of(json!({"state_key": "llm", "reducer": "Replace"}));
+        assert!(!config.tool_calling);
+        assert!(config.available_tools.is_empty());
+    }
+
+    #[test]
+    fn a_config_whose_tool_calling_is_not_a_bool_fails_the_node_at_the_entry() {
+        assert!(matches!(
+            LlmNodeConfig::parse(&json!({"tool_calling": "yes"})),
+            Err(TaskError::Failed(_))
+        ));
+    }
+
+    #[test]
     fn build_prompt_appends_tool_instructions_when_requested() {
-        let (system, _) = build_prompt(&json!({"tool_calling": true}), &json!({}));
+        let (system, _) = build_prompt(&config_of(json!({"tool_calling": true})), &json!({}));
         assert!(system.contains("tool_call"));
     }
 
     #[test]
     fn build_prompt_renders_available_tools_into_the_system_prompt() {
-        let config =
-            json!({"available_tools": [{"name": "web_search", "description": "search the web"}]});
+        let config = config_of(
+            json!({"available_tools": [{"name": "web_search", "description": "search the web"}]}),
+        );
         let (system, _) = build_prompt(&config, &json!({}));
         assert!(system.contains("web_search"));
         assert!(system.contains("search the web"));
@@ -344,73 +367,122 @@ mod tests {
 
     #[test]
     fn build_prompt_folds_prior_tool_results_into_the_user_prompt() {
-        let state = json!({"question": "weather in SF?", "tool_result": ["62F, fog"]});
-        let (_, user) = build_prompt(&json!({}), &state);
-        assert!(user.contains("weather in SF?"));
+        let state = json!({"question": "what is it?", "tool_result": ["62F, fog"]});
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+        assert!(user.contains("what is it?"));
         assert!(user.contains("62F, fog"));
     }
 
-    /// A tool-calling turn must tell the model it has live access and may not fall back on "I'm
-    /// an AI without real-time data" — the catalog alone did not get it to call web_search.
     #[test]
-    fn build_prompt_requires_a_search_before_answering_time_sensitive_questions() {
-        let config = json!({
+    fn build_prompt_renders_only_a_bounded_tail_of_the_tool_result_log() {
+        let results: Vec<Value> = (0..RENDERED_TOOL_RESULTS + 3)
+            .map(|index| json!(format!("result-{index}")))
+            .collect();
+        let last_index = results.len() - 1;
+        let state = json!({"question": "q", "tool_result": results});
+
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+
+        assert!(!user.contains("result-0"), "{user}");
+        assert!(user.contains(&format!("result-{last_index}")), "{user}");
+        assert_eq!(
+            user.matches("Tool result ").count(),
+            RENDERED_TOOL_RESULTS,
+            "{user}"
+        );
+        assert!(
+            user.contains(&format!("Tool result {last_index}")),
+            "an entry keeps its index in the full log: {user}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_truncates_one_oversized_tool_result() {
+        let state =
+            json!({"question": "q", "tool_result": ["x".repeat(MAX_TOOL_RESULT_CHARS * 2)]});
+
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+
+        assert!(user.contains(TRUNCATION_MARK), "{user}");
+        assert!(user.chars().count() < MAX_TOOL_RESULT_CHARS * 2, "{user}");
+    }
+
+    #[test]
+    fn the_tool_use_policy_names_no_subject_and_no_tool() {
+        let lowered = format!("{TOOL_USE_POLICY}{TOOL_NUDGE}{FINAL_ANSWER_STYLE}").to_lowercase();
+
+        for subject_or_tool in [
+            "weather",
+            "news",
+            "price",
+            "score",
+            "stock",
+            "forecast",
+            "web_search",
+            "kb_search",
+            "web_fetch",
+            "knowledge base",
+        ] {
+            assert!(!lowered.contains(subject_or_tool), "{subject_or_tool}");
+        }
+    }
+
+    #[test]
+    fn build_prompt_requires_a_tool_before_answering_what_the_model_is_unsure_of() {
+        let config = config_of(json!({
             "tool_calling": true,
             "available_tools": [{"name": "web_search", "description": "search the web"}],
-        });
-        let (system, _) = build_prompt(&config, &json!({"question": "weather in SF today?"}));
+        }));
+        let (system, _) = build_prompt(&config, &json!({"question": "what is it today?"}));
 
-        // The policy comes after the catalog, so the model reads the rule with the tools in view.
         let tools_at = system.find("web_search").expect("catalog rendered");
-        let policy_at = system.find("MUST use them").expect("policy rendered");
+        let policy_at = system.find("live and connected").expect("policy rendered");
         assert!(policy_at > tools_at, "{system}");
-        assert!(system.contains("time-sensitive"), "{system}");
         assert!(
-            system.contains("Never reply that you lack real-time data"),
+            system.contains("rather than answering from memory"),
+            "{system}"
+        );
+        assert!(
+            system.contains("Never reply that you lack access"),
             "{system}"
         );
     }
 
-    /// Replies are read aloud, so the style rule is not decoration: without it the model answers
-    /// a one-line question with a paragraph recounting which fetches failed.
     #[test]
     fn build_prompt_demands_a_terse_spoken_answer() {
-        let (system, _) = build_prompt(&json!({"tool_calling": true}), &json!({}));
+        let (system, _) = build_prompt(&config_of(json!({"tool_calling": true})), &json!({}));
 
         assert!(system.contains("read aloud"), "{system}");
         assert!(
             system.contains("a fragment is better than a sentence"),
             "{system}"
         );
+        assert!(
+            system.contains("Give the value, not a write-up"),
+            "{system}"
+        );
         assert!(system.contains("Never narrate your process"), "{system}");
         assert!(system.contains("Never add advice"), "{system}");
-        // The style rule is the last thing the model reads, after the tool policy.
-        let policy_at = system.find("MUST use them").expect("policy rendered");
+        let policy_at = system.find("live and connected").expect("policy rendered");
         let style_at = system.find("Final answer style").expect("style rendered");
         assert!(style_at > policy_at, "{system}");
     }
 
-    /// Searching isn't the goal — the answer is. The policy must push the model from snippets to
-    /// web_fetch and then to a concrete, cited answer, never to "check one of these sites".
     #[test]
-    fn build_prompt_requires_drilling_down_to_a_concrete_cited_answer() {
-        let config = json!({"tool_calling": true});
-        let (system, _) = build_prompt(&config, &json!({}));
+    fn build_prompt_requires_drilling_down_to_the_actual_value() {
+        let (system, _) = build_prompt(&config_of(json!({"tool_calling": true})), &json!({}));
 
         assert!(
-            system.contains("call web_fetch on the most relevant results"),
+            system.contains("Keep going until you have the actual value"),
             "{system}"
         );
         assert!(
-            system.contains("pass\nthem together so whichever responds first wins"),
+            system.contains("use what it gave you to call another"),
             "{system}"
         );
+        assert!(system.contains("whichever responds first wins"), "{system}");
         assert!(
-            system.contains("with the real data in it — the numbers, dates and names"),
-            "{system}"
-        );
-        assert!(
-            system.contains("Never reply with a list of sites to check"),
+            system.contains("Never tell the user to go look somewhere else"),
             "{system}"
         );
         assert!(
@@ -418,27 +490,26 @@ mod tests {
             "{system}"
         );
         assert!(
-            system.contains("never decline because you are unsure a tool is available"),
+            system.contains("Never decline because you are unsure a"),
             "{system}"
         );
     }
 
     #[test]
     fn build_prompt_without_tool_calling_carries_no_tool_use_policy() {
-        let (system, _) = build_prompt(&json!({}), &json!({}));
-        assert!(!system.contains("MUST use them"), "{system}");
+        let (system, _) = build_prompt(&config_of(json!({})), &json!({}));
+        assert!(!system.contains("live and connected"), "{system}");
     }
 
     #[test]
     fn build_prompt_renders_a_tool_error_observation_so_the_model_can_recover() {
         let state = json!({
-            "question": "weather in SF?",
-            "tool_result": [{"error": "error sending request for url (https://www.accuweather.com/)"}],
+            "question": "what is it?",
+            "tool_result": [{"error": "error sending request for url (https://example.invalid/)"}],
         });
-        let (system, user) = build_prompt(&json!({"tool_calling": true}), &state);
+        let (system, user) = build_prompt(&config_of(json!({"tool_calling": true})), &state);
         assert!(user.contains("ERROR"), "{user}");
-        assert!(user.contains("accuweather.com"), "{user}");
-        // ...and the contract tells it what it may do about that.
+        assert!(user.contains("example.invalid"), "{user}");
         assert!(system.contains("call a different tool"), "{system}");
     }
 
@@ -481,7 +552,6 @@ mod tests {
     struct FakeLlmRouter {
         received: Mutex<Vec<CompleteRequest>>,
         reply: String,
-        /// What the second and later calls answer, when the test needs the two turns to differ.
         then_reply: Option<String>,
     }
 
@@ -563,7 +633,7 @@ mod tests {
             .execute(
                 "llm",
                 &json!({"tool_calling": true}),
-                &json!({"question": "weather in SF?"}),
+                &json!({"question": "what is it?"}),
                 "e:llm:0",
             )
             .await
@@ -574,7 +644,7 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].tier, EnumValue::Known(QualityTier::Medium));
         assert!(received[0].system_prompt.contains("tool_call"));
-        assert_eq!(received[0].user_prompt, "weather in SF?");
+        assert_eq!(received[0].user_prompt, "what is it?");
         assert_eq!(
             received[0].sampling.response_format,
             Some(EnumValue::Known(ResponseFormat::JsonObject))
@@ -582,32 +652,38 @@ mod tests {
     }
 
     #[test]
-    fn a_narration_or_a_refusal_is_recognised_but_a_real_answer_is_not() {
-        assert!(needs_tool_nudge(
-            "I do not see the actual weather data in the fetch results. I will search for a more \
-             reliable weather source for San Francisco today."
+    fn the_nudge_condition_is_a_tool_less_first_answer_whatever_the_wording() {
+        let tool_calling = LlmNodeConfig::parse(&json!({"tool_calling": true})).expect("config");
+        let plain = LlmNodeConfig::parse(&json!({})).expect("config");
+        let answered = json!({"tool_call": Value::Null, "reply": "anything at all"});
+        let called_a_tool = json!({"tool_call": {"name": "some_tool"}, "reply": Value::Null});
+        let no_tool_yet = json!({"question": "q"});
+        let after_a_tool = json!({"question": "q", "tool_result": [{"ok": true}]});
+
+        assert!(answered_before_consulting_any_tool(
+            &tool_calling,
+            &no_tool_yet,
+            &answered
         ));
-        assert!(needs_tool_nudge("Let me search for that."));
-        assert!(needs_tool_nudge("I'll check the forecast page."));
-        assert!(!needs_tool_nudge(
-            "The search results say it is 62F and foggy in San Francisco today."
-        ));
-        assert!(!needs_tool_nudge(""));
-        // The live kb_search refusal: tools listed, model declines anyway.
-        assert!(needs_tool_nudge(
-            "I do not have access to a search tool for this specific project's knowledge base. \
-             The kb_search tool is listed but I cannot confirm its operational status."
-        ));
-        assert!(!needs_tool_nudge(
-            "Claude Academy offers three courses: Prompting, Agents, and Evals."
-        ));
+        assert!(
+            !answered_before_consulting_any_tool(&tool_calling, &after_a_tool, &answered),
+            "a reply that follows a real tool result is the answer the loop was for"
+        );
+        assert!(
+            !answered_before_consulting_any_tool(&tool_calling, &no_tool_yet, &called_a_tool),
+            "the model did use a tool"
+        );
+        assert!(
+            !answered_before_consulting_any_tool(&plain, &no_tool_yet, &answered),
+            "a node with no tools offered has nothing to be nudged towards"
+        );
     }
 
     #[tokio::test]
-    async fn a_refusal_while_tools_are_listed_is_nudged_into_the_call() {
+    async fn an_answer_given_before_any_tool_ran_is_nudged_once_into_the_call() {
         let fake = Arc::new(FakeLlmRouter::then(
-            r#"{"tool_call": null, "reply": "I do not have access to the knowledge base."}"#,
-            r#"{"tool_call": {"name": "kb_search", "args": {"query": "Claude Academy courses"}}}"#,
+            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
+            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
         ));
         let url = serve(Arc::clone(&fake)).await;
         let executor = LlmTaskExecutor::new(&url).expect("client");
@@ -616,51 +692,24 @@ mod tests {
             .execute(
                 "llm",
                 &json!({"tool_calling": true}),
-                &json!({"question": "which Claude Academy courses exist?"}),
+                &json!({"question": "which courses exist?"}),
                 "e:llm:0",
             )
             .await
             .expect("execute");
 
-        assert_eq!(output["tool_call"]["name"], json!("kb_search"));
-        assert_eq!(fake.calls(), 2);
-    }
-
-    /// The model announcing its next step used to end the execution: the graph reads a null
-    /// tool_call as "this is the final answer". One nudge, inside the same node, turns the
-    /// narration into the call it was describing.
-    #[tokio::test]
-    async fn a_narrated_intent_is_nudged_once_into_the_tool_call_it_described() {
-        let fake = Arc::new(FakeLlmRouter::then(
-            r#"{"tool_call": null, "reply": "I will search for a more reliable weather source."}"#,
-            r#"{"tool_call": {"name": "web_search", "args": {"query": "san francisco weather today"}}}"#,
-        ));
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url).expect("client");
-
-        let output = executor
-            .execute(
-                "llm",
-                &json!({"tool_calling": true}),
-                &json!({"question": "weather in SF?"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        assert_eq!(output["tool_call"]["name"], json!("web_search"));
+        assert_eq!(output["tool_call"]["name"], json!("some_search"));
         assert_eq!(fake.calls(), 2);
         let received = fake.received.lock().expect("lock");
-        assert!(received[1].system_prompt.contains("Do it now"));
+        assert!(received[1].system_prompt.contains("without using any tool"));
         assert!(received[1].system_prompt.contains("connected and working"));
-        // Both turns were really paid for, so both are charged to the budget.
         assert_eq!(output["usage"]["tokens_in"], json!(FAKE_TOKENS_IN * 2));
     }
 
     #[tokio::test]
-    async fn a_real_answer_is_never_nudged() {
+    async fn an_answer_that_follows_a_tool_result_is_never_nudged() {
         let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "It is 62F and foggy in San Francisco."}"#,
+            r#"{"tool_call": null, "reply": "62F and foggy."}"#,
         ));
         let url = serve(Arc::clone(&fake)).await;
         let executor = LlmTaskExecutor::new(&url).expect("client");
@@ -669,24 +718,36 @@ mod tests {
             .execute(
                 "llm",
                 &json!({"tool_calling": true}),
-                &json!({"question": "weather in SF?"}),
+                &json!({"question": "q", "tool_result": ["62F, fog"]}),
                 "e:llm:0",
             )
             .await
             .expect("execute");
 
-        assert_eq!(
-            output["reply"],
-            json!("It is 62F and foggy in San Francisco.")
-        );
+        assert_eq!(output["reply"], json!("62F and foggy."));
         assert_eq!(fake.calls(), 1);
     }
 
-    /// The nudge is bounded at one: a model that narrates twice is not retried forever.
     #[tokio::test]
-    async fn a_model_that_narrates_twice_is_not_nudged_again() {
+    async fn a_node_without_tool_calling_is_never_nudged() {
         let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "I will search for a better source."}"#,
+            r#"{"tool_call": null, "reply": "Four."}"#,
+        ));
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&url).expect("client");
+
+        executor
+            .execute("llm", &json!({}), &json!({"question": "2+2?"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(fake.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_answers_tool_lessly_twice_is_not_nudged_again() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "I will look into it."}"#,
         ));
         let url = serve(Arc::clone(&fake)).await;
         let executor = LlmTaskExecutor::new(&url).expect("client");
@@ -695,7 +756,7 @@ mod tests {
             .execute(
                 "llm",
                 &json!({"tool_calling": true}),
-                &json!({"question": "weather in SF?"}),
+                &json!({"question": "q"}),
                 "e:llm:0",
             )
             .await

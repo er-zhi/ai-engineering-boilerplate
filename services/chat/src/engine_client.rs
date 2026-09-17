@@ -1,9 +1,10 @@
-// Thin wrapper over the engine.v1.EngineService this stack already runs — same
-// client-construction pattern as services/tool/src/tools/kb_client.rs uses for knowledge-base.
+// The only place Chat talks to engine.v1.EngineService.
 
+use chrono::{DateTime, Utc};
+use common::principal::{Principal, SESSION_ID_HEADER, USER_ID_HEADER};
 use common::proto::engine::v1::{
-    EngineServiceClient, ExecutionEvent, InterruptRequest, StartExecutionRequest,
-    StreamEventsRequest,
+    EngineServiceClient, ExecutionEvent, ExecutionEventKind, InterruptRequest,
+    StartExecutionRequest, StreamEventsRequest,
 };
 use connectrpc::Protocol;
 use connectrpc::client::{CallOptions, ClientConfig, HttpClient};
@@ -11,15 +12,39 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineEvent {
+    pub id: String,
+    pub kind: ExecutionEventKind,
+    pub payload_json: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl From<ExecutionEvent> for EngineEvent {
+    fn from(event: ExecutionEvent) -> Self {
+        Self {
+            id: event.id,
+            kind: event.payload_kind.as_known().unwrap_or_default(),
+            payload_json: event.payload_json,
+            result: event.result,
+            error: event.error,
+            occurred_at: DateTime::parse_from_rfc3339(&event.occurred_at)
+                .map(|at| at.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        }
+    }
+}
+
+fn principal_options(principal: &Principal) -> CallOptions {
+    CallOptions::default()
+        .with_header(USER_ID_HEADER, principal.user_id.to_string())
+        .with_header(SESSION_ID_HEADER, principal.session_id.as_str())
+}
+
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
-/// `StreamEvents` needs its own, far longer deadline. A client timeout is a *whole-call*
-/// deadline, and connectrpc enforces it on every frame poll of a streaming call, not just on
-/// connect (`connectrpc::client`'s `poll_body` wraps each frame in `with_deadline`). Under
-/// `CALL_TIMEOUT` any Engine execution running longer than 20s had its event stream cut
-/// mid-flight, so `TopicManager::finish_topic` never ran and the topic stuck at `Running`
-/// forever. `CallOptions` has no "no deadline" setting (an unset per-call timeout just falls
-/// back to the client's default), so this is a long finite bound instead.
-const STREAM_TIMEOUT: Duration = Duration::from_secs(3_600);
+const LONGEST_WATCHABLE_EXECUTION: Duration = Duration::from_secs(3_600);
 
 pub struct EngineClient {
     inner: EngineServiceClient<HttpClient>,
@@ -28,11 +53,9 @@ pub struct EngineClient {
 
 impl EngineClient {
     pub fn new(engine_url: &str) -> Result<Self, String> {
-        Self::with_timeouts(engine_url, CALL_TIMEOUT, STREAM_TIMEOUT)
+        Self::with_timeouts(engine_url, CALL_TIMEOUT, LONGEST_WATCHABLE_EXECUTION)
     }
 
-    /// `new`, with both deadlines given explicitly — tests use it to drive the gap between the
-    /// short unary timeout and the long streaming one without waiting out the real values.
     pub fn with_timeouts(
         engine_url: &str,
         call_timeout: Duration,
@@ -53,39 +76,53 @@ impl EngineClient {
         })
     }
 
-    pub async fn start_execution(&self, graph_id: &str, input_json: &str) -> Result<Uuid, String> {
+    pub async fn start_execution(
+        &self,
+        principal: &Principal,
+        graph_id: &str,
+        input_json: &str,
+    ) -> Result<Uuid, String> {
         let response = self
             .inner
-            .start_execution(StartExecutionRequest {
-                graph_id: graph_id.to_owned(),
-                input_json: input_json.to_owned(),
-                ..Default::default()
-            })
+            .start_execution_with_options(
+                StartExecutionRequest {
+                    graph_id: graph_id.to_owned(),
+                    input_json: input_json.to_owned(),
+                    ..Default::default()
+                },
+                principal_options(principal),
+            )
             .await
             .map_err(|e| e.to_string())?
             .into_owned();
         Uuid::parse_str(&response.execution_id).map_err(|e| e.to_string())
     }
 
-    pub async fn interrupt(&self, execution_id: Uuid, input_json: &str) -> Result<(), String> {
+    pub async fn interrupt(
+        &self,
+        principal: &Principal,
+        execution_id: Uuid,
+        input_json: &str,
+    ) -> Result<(), String> {
         self.inner
-            .interrupt(InterruptRequest {
-                execution_id: execution_id.to_string(),
-                input_json: input_json.to_owned(),
-                ..Default::default()
-            })
+            .interrupt_with_options(
+                InterruptRequest {
+                    execution_id: execution_id.to_string(),
+                    input_json: input_json.to_owned(),
+                    ..Default::default()
+                },
+                principal_options(principal),
+            )
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    /// Opens the stream, then drains it in a spawned task forwarding each event through the
-    /// returned channel — the receiver ends (`recv()` returns `None`) when the stream ends
-    /// cleanly, errors, or every receiver is dropped, whichever comes first.
     pub async fn stream_events(
         &self,
+        principal: &Principal,
         execution_id: Uuid,
-    ) -> Result<mpsc::UnboundedReceiver<ExecutionEvent>, String> {
+    ) -> Result<mpsc::UnboundedReceiver<EngineEvent>, String> {
         let mut stream = self
             .inner
             .stream_events_with_options(
@@ -94,7 +131,7 @@ impl EngineClient {
                     user_id: None,
                     ..Default::default()
                 },
-                CallOptions::default().with_timeout(self.stream_timeout),
+                principal_options(principal).with_timeout(self.stream_timeout),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -103,11 +140,14 @@ impl EngineClient {
             loop {
                 match stream.message::<ExecutionEvent>().await {
                     Ok(Some(item)) => {
-                        if sender.send(item.to_owned_message()).is_err() {
-                            break; // receiver dropped — nobody's listening anymore
+                        if sender
+                            .send(EngineEvent::from(item.to_owned_message()))
+                            .is_err()
+                        {
+                            break;
                         }
                     }
-                    Ok(None) => break, // clean end of stream
+                    Ok(None) => break,
                     Err(error) => {
                         tracing::error!(%error, "engine event stream error");
                         break;
@@ -137,8 +177,7 @@ mod tests {
     struct FakeEngine {
         execution_id: String,
         received_interrupts: Mutex<Vec<InterruptRequest>>,
-        /// How long `stream_events` waits before emitting its one event — stands in for an
-        /// Engine execution that takes a while to finish.
+        received_principals: Mutex<Vec<Option<Principal>>>,
         stream_delay: Duration,
     }
 
@@ -150,8 +189,25 @@ mod tests {
         Arc::new(FakeEngine {
             execution_id: execution_id.to_string(),
             received_interrupts: Mutex::new(Vec::new()),
+            received_principals: Mutex::new(Vec::new()),
             stream_delay,
         })
+    }
+
+    impl FakeEngine {
+        fn record(&self, ctx: &RequestContext) {
+            self.received_principals
+                .lock()
+                .expect("lock")
+                .push(common::principal::from_metadata(ctx.headers()));
+        }
+    }
+
+    fn a_principal() -> Principal {
+        Principal {
+            user_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4().to_string(),
+        }
     }
 
     #[allow(refining_impl_trait)]
@@ -165,9 +221,10 @@ mod tests {
         }
         async fn start_execution(
             &self,
-            _ctx: RequestContext,
+            ctx: RequestContext,
             _request: ServiceRequest<'_, StartExecutionRequest>,
         ) -> ServiceResult<StartExecutionResponse> {
+            self.record(&ctx);
             Response::ok(StartExecutionResponse {
                 execution_id: self.execution_id.clone(),
                 ..Default::default()
@@ -175,9 +232,10 @@ mod tests {
         }
         async fn interrupt(
             &self,
-            _ctx: RequestContext,
+            ctx: RequestContext,
             request: ServiceRequest<'_, InterruptRequest>,
         ) -> ServiceResult<InterruptResponse> {
+            self.record(&ctx);
             self.received_interrupts
                 .lock()
                 .expect("lock")
@@ -207,14 +265,16 @@ mod tests {
         }
         async fn stream_events(
             &self,
-            _ctx: RequestContext,
+            ctx: RequestContext,
             _request: ServiceRequest<'_, StreamEventsRequest>,
         ) -> ServiceResult<ServiceStream<ExecutionEvent>> {
+            self.record(&ctx);
             let event = ExecutionEvent {
                 id: "e1".to_owned(),
                 execution_id: self.execution_id.clone(),
-                payload_kind: "ExecutionCompleted".to_owned(),
-                payload_json: r#"{"final_state":{}}"#.to_owned(),
+                payload_kind: ExecutionEventKind::ExecutionCompleted.into(),
+                payload_json: r#"{"final_state":{},"result":"done"}"#.to_owned(),
+                result: Some("done".to_owned()),
                 ..Default::default()
             };
             let delay = self.stream_delay;
@@ -258,7 +318,7 @@ mod tests {
         let client = EngineClient::new(&url).expect("client");
 
         let got = client
-            .start_execution("agent", r#"{"question": "hi"}"#)
+            .start_execution(&a_principal(), "agent", r#"{"question": "hi"}"#)
             .await
             .expect("start");
 
@@ -273,7 +333,7 @@ mod tests {
         let client = EngineClient::new(&url).expect("client");
 
         client
-            .interrupt(execution_id, r#"{"question": "more"}"#)
+            .interrupt(&a_principal(), execution_id, r#"{"question": "more"}"#)
             .await
             .expect("interrupt");
 
@@ -289,21 +349,19 @@ mod tests {
         let url = serve(fake).await;
         let client = EngineClient::new(&url).expect("client");
 
-        let mut events = client.stream_events(execution_id).await.expect("stream");
+        let mut events = client
+            .stream_events(&a_principal(), execution_id)
+            .await
+            .expect("stream");
         let event = events.recv().await.expect("one event");
 
-        assert_eq!(event.payload_kind, "ExecutionCompleted");
+        assert_eq!(event.kind, ExecutionEventKind::ExecutionCompleted);
         assert!(
             events.recv().await.is_none(),
             "stream ends cleanly after one event"
         );
     }
 
-    /// The finding: a client timeout is a whole-call deadline that connectrpc re-applies to
-    /// every frame of a *streaming* call, so an execution outliving the unary timeout had its
-    /// event stream cut before `ExecutionCompleted` ever arrived — leaving the topic `Running`
-    /// forever. The two halves below are the same fake and the same wait; only the streaming
-    /// deadline differs.
     #[tokio::test]
     async fn an_execution_outliving_the_unary_timeout_still_delivers_its_completion() {
         let unary_timeout = Duration::from_millis(200);
@@ -311,24 +369,66 @@ mod tests {
         let execution_id = Uuid::new_v4();
         let url = serve(fake_engine_delayed(execution_id, slower_than_unary_timeout)).await;
 
-        // The regression, reproduced: the short deadline applied to the streaming call too.
-        let short = EngineClient::with_timeouts(&url, unary_timeout, unary_timeout)
-            .expect("client with a short streaming deadline");
-        let mut cut = short.stream_events(execution_id).await.expect("stream");
+        let too_short_to_outlast_the_execution =
+            EngineClient::with_timeouts(&url, unary_timeout, unary_timeout)
+                .expect("client with a short streaming deadline");
+        let mut cut = too_short_to_outlast_the_execution
+            .stream_events(&a_principal(), execution_id)
+            .await
+            .expect("stream");
         assert!(
             cut.recv().await.is_none(),
             "a streaming deadline shorter than the execution cuts the stream before its \
              completion event — this is what left topics stuck at Running"
         );
 
-        // The fix: the streaming call carries its own, much longer deadline.
-        let client = EngineClient::with_timeouts(&url, unary_timeout, Duration::from_secs(30))
-            .expect("client");
-        let mut events = client.stream_events(execution_id).await.expect("stream");
+        let outlasts_the_execution =
+            EngineClient::with_timeouts(&url, unary_timeout, Duration::from_secs(30))
+                .expect("client");
+        let mut events = outlasts_the_execution
+            .stream_events(&a_principal(), execution_id)
+            .await
+            .expect("stream");
         let event = events
             .recv()
             .await
             .expect("the completion event must survive a wait longer than the unary timeout");
-        assert_eq!(event.payload_kind, "ExecutionCompleted");
+        assert_eq!(event.kind, ExecutionEventKind::ExecutionCompleted);
+    }
+
+    #[tokio::test]
+    async fn every_engine_call_carries_the_principal() {
+        let execution_id = Uuid::new_v4();
+        let fake = fake_engine(execution_id);
+        let url = serve(Arc::clone(&fake)).await;
+        let client = EngineClient::new(&url).expect("client");
+        let principal = a_principal();
+
+        client
+            .start_execution(&principal, "agent", "{}")
+            .await
+            .expect("start");
+        client
+            .interrupt(&principal, execution_id, "{}")
+            .await
+            .expect("interrupt");
+        client
+            .stream_events(&principal, execution_id)
+            .await
+            .expect("stream");
+
+        let seen = fake.received_principals.lock().expect("lock");
+        assert_eq!(
+            seen.len(),
+            3,
+            "start_execution, interrupt and stream_events"
+        );
+        for received in seen.iter() {
+            assert_eq!(
+                received.as_ref(),
+                Some(&principal),
+                "every Engine call must name the user it is made for"
+            );
+        }
     }
 }

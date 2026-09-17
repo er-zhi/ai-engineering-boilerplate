@@ -1,35 +1,94 @@
-// The live topic-lifecycle event bus GetSession's snapshot (Task 3) doesn't cover — a plain
-// broadcast channel, one process, no persistence. TopicManager (Task 5) publishes; StreamEvents
-// (Task 7) subscribes.
+// Chat's own lifecycle event and the in-process bus that carries it.
 
-use common::proto::chat::v1::ChatEvent;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 const DEFAULT_CAPACITY: usize = 256;
 
-/// `StreamEvents`' two halves in the only order that loses nothing: open the live subscription
-/// **first**, then read the DB snapshot it will be chained onto.
-///
-/// The other order leaves a window between the snapshot read and the subscribe in which a
-/// published event reaches nobody — `EventBus` is a plain broadcast channel with no history, so
-/// an event missed there is missed for good, and a topic could finish without the client ever
-/// hearing about it. Subscribing first can instead deliver an event twice (once implied by the
-/// snapshot, once live). That is the right way round to be wrong: the client refreshes with
-/// `GetSession` on a lifecycle event, so a duplicate is a redundant refresh, while a gap is a
-/// permanently stale panel.
-pub async fn subscribe_then_snapshot<T, E, Fut>(
-    bus: &EventBus,
-    snapshot: Fut,
-) -> Result<(broadcast::Receiver<ChatEvent>, T), E>
-where
-    Fut: std::future::Future<Output = Result<T, E>>,
-{
-    let live = bus.subscribe();
-    Ok((live, snapshot.await?))
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicEventKind {
+    TopicCreated,
+    TopicQueued,
+    TopicStarted,
+    TopicProgress,
+    TopicCompleted,
+    TopicFailed,
+    TopicCancelled,
+    FocusChanged,
+    Notification,
+    SessionReset,
+}
+
+impl TopicEventKind {
+    #[must_use]
+    pub fn as_column(self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(spelling)) => spelling,
+            _ => {
+                debug_assert!(false, "a TopicEventKind is serialized as a string");
+                String::new()
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn from_column(kind: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(kind.to_owned())).ok()
+    }
+}
+
+impl std::fmt::Display for TopicEventKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.as_column())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopicEvent {
+    pub event_id: Uuid,
+    pub session_id: Uuid,
+    pub topic_id: Option<i64>,
+    pub kind: TopicEventKind,
+    pub payload: serde_json::Value,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl TopicEvent {
+    #[must_use]
+    pub fn new(
+        session_id: Uuid,
+        topic_id: Option<i64>,
+        kind: TopicEventKind,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            session_id,
+            topic_id,
+            kind,
+            payload: serde_json::json!({}),
+            occurred_at,
+        }
+    }
+
+    #[must_use]
+    pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
+        self.payload = payload;
+        self
+    }
+
+    #[must_use]
+    pub fn with_event_id(mut self, event_id: Uuid) -> Self {
+        self.event_id = event_id;
+        self
+    }
 }
 
 pub struct EventBus {
-    sender: broadcast::Sender<ChatEvent>,
+    sender: broadcast::Sender<TopicEvent>,
 }
 
 impl Default for EventBus {
@@ -45,15 +104,21 @@ impl EventBus {
         Self { sender }
     }
 
-    /// No subscribers is not an error — publishing when nobody's listening is normal (e.g. no
-    /// chat frontend is currently connected).
-    pub fn publish(&self, event: ChatEvent) {
-        let _ = self.sender.send(event);
+    pub fn publish(&self, event: TopicEvent) {
+        no_live_subscriber_is_not_an_error(self.sender.send(event));
     }
 
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<ChatEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<TopicEvent> {
         self.sender.subscribe()
+    }
+}
+
+fn no_live_subscriber_is_not_an_error(
+    sent: Result<usize, broadcast::error::SendError<TopicEvent>>,
+) {
+    if sent.is_err() {
+        tracing::trace!("a chat event was published with no live StreamEvents subscriber");
     }
 }
 
@@ -61,51 +126,44 @@ impl EventBus {
 mod tests {
     use super::*;
 
+    fn event(kind: TopicEventKind) -> TopicEvent {
+        TopicEvent::new(Uuid::new_v4(), Some(1), kind, Utc::now())
+    }
+
+    #[test]
+    fn a_stored_spelling_this_build_does_not_know_is_not_a_kind() {
+        assert_eq!(TopicEventKind::from_column("something_else"), None);
+    }
+
     #[tokio::test]
     async fn a_subscriber_receives_a_published_event() {
         let bus = EventBus::new(8);
         let mut receiver = bus.subscribe();
-        let event = ChatEvent {
-            topic_id: "1".to_owned(),
-            kind: "topic_progress".to_owned(),
-            ..Default::default()
-        };
+        let published = event(TopicEventKind::TopicProgress);
 
-        bus.publish(event.clone());
+        bus.publish(published.clone());
 
         let received = receiver.recv().await.expect("recv");
-        assert_eq!(received, event);
+        assert_eq!(received, published);
     }
 
     #[test]
     fn publishing_with_no_subscribers_does_not_panic() {
         let bus = EventBus::new(8);
-        bus.publish(ChatEvent::default());
+        bus.publish(event(TopicEventKind::TopicStarted));
     }
 
-    /// The finding: `StreamEvents` read its DB snapshot before subscribing, so anything
-    /// published in between vanished. The snapshot future here publishes while it is in flight —
-    /// exactly the event that used to be dropped — and it must still arrive on the live stream.
     #[tokio::test]
-    async fn an_event_published_during_the_snapshot_read_still_reaches_the_subscriber() {
+    async fn an_event_published_after_subscribing_is_still_there_to_read_later() {
         let bus = EventBus::new(8);
-        let published_mid_read = ChatEvent {
-            topic_id: "7".to_owned(),
-            kind: "topic_completed".to_owned(),
-            ..Default::default()
-        };
+        let mut live = bus.subscribe();
+        let published = event(TopicEventKind::TopicCompleted);
 
-        let (mut live, snapshot) = subscribe_then_snapshot::<_, (), _>(&bus, async {
-            bus.publish(published_mid_read.clone());
-            Ok(vec!["the snapshot rows"])
-        })
-        .await
-        .expect("snapshot");
+        bus.publish(published.clone());
 
-        assert_eq!(snapshot, vec!["the snapshot rows"]);
         assert_eq!(
             live.try_recv().expect("the event must not have been lost"),
-            published_mid_read
+            published
         );
     }
 }

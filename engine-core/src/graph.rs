@@ -1,8 +1,4 @@
-// The graph itself: Graph, Node, Edge, Condition. A Graph is plain data — JSON in, JSON out —
-// so RegisterGraph can store exactly what GraphBuilder produces, with no second format for
-// built-in graphs. Condition is a closed set over RFC 6901 JSON Pointers, not a scripting
-// language: step() is synchronous and pure, so a condition can only ever inspect state already
-// computed this super-step, never perform I/O.
+// Defines the graph as plain data: Graph, Node, Edge and Condition.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,23 +12,25 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub entry: NodeId,
+    #[serde(default)]
+    pub answer_pointer: Option<String>,
 }
 
 impl Graph {
-    /// The node's own definition, by id. Returns `None` for an id the graph doesn't contain —
-    /// callers treat that as a malformed graph, caught by `validate()` at registration time.
+    #[must_use]
+    pub fn answer(&self, state: &serde_json::Value) -> Option<serde_json::Value> {
+        state.pointer(self.answer_pointer.as_deref()?).cloned()
+    }
+
     #[must_use]
     pub fn node(&self, id: &NodeId) -> Option<&Node> {
         self.nodes.iter().find(|node| node.id() == id)
     }
 
-    /// Every edge leading out of `from`.
     pub fn edges_from<'a>(&'a self, from: &'a NodeId) -> impl Iterator<Item = &'a Edge> {
         self.edges.iter().filter(move |edge| &edge.from == from)
     }
 
-    /// Every structural problem found, not just the first — `RegisterGraph` calls this once,
-    /// `step()` trusts a registered graph is valid and never re-checks these at runtime.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut problems = Vec::new();
         let known: std::collections::HashSet<&NodeId> = self.nodes.iter().map(Node::id).collect();
@@ -81,20 +79,20 @@ pub enum Node {
     },
     FanOut {
         id: NodeId,
-        source: String, // JSON Pointer to an array in state
+        source: String,
         item_var: String,
         target: NodeId,
     },
     FanIn {
         id: NodeId,
-        key: String, // where the folded array of branch results is written in state
+        key: String,
         reducer: Reducer,
     },
     Subgraph {
         id: NodeId,
         graph_id: GraphId,
         version: Option<u32>,
-        input: String, // JSON Pointer to the value passed as the child execution's input
+        input: String,
         output_key: String,
     },
     Wait {
@@ -160,10 +158,6 @@ pub enum Condition {
     Or(Vec<Condition>),
 }
 
-/// Evaluates a condition against `state`. `Condition::Failed` is handled by the caller (`step`),
-/// not here — this function only ever sees the state a node produced, never whether it errored,
-/// so it always returns `false` for `Failed` and `step` special-cases the failed-node path
-/// before consulting conditions at all.
 #[must_use]
 pub fn evaluate_condition(condition: &Condition, state: &serde_json::Value) -> bool {
     match condition {
@@ -277,14 +271,13 @@ mod tests {
                 condition: Condition::Always,
             }],
             entry: NodeId("end".into()),
+            answer_pointer: None,
         };
         assert!(g.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_a_fan_out_target_with_more_than_one_fan_in_downstream() {
-        // A FanOut target must lead to exactly one FanIn — otherwise "which barrier does this
-        // branch's result belong to" has no single answer.
         let g = Graph {
             id: crate::ids::GraphId("bad".into()),
             version: 1,
@@ -325,14 +318,55 @@ mod tests {
                 },
             ],
             entry: NodeId("spread".into()),
+            answer_pointer: None,
         };
         assert!(g.validate().is_err());
     }
 
     #[test]
+    fn a_graph_resolves_the_answer_its_pointer_declares() {
+        let mut g = crate::builder::simple_graph();
+        g.answer_pointer = Some("/llm/reply".to_owned());
+
+        assert_eq!(
+            g.answer(&json!({"llm": {"reply": "42"}})),
+            Some(json!("42"))
+        );
+        assert_eq!(g.answer(&json!({"llm": {}})), None);
+    }
+
+    #[test]
+    fn a_graph_declaring_no_answer_has_none_rather_than_an_error() {
+        let mut g = crate::builder::simple_graph();
+        g.answer_pointer = None;
+
+        assert_eq!(g.answer(&json!({"llm": {"reply": "42"}})), None);
+    }
+
+    #[test]
+    fn a_stored_definition_from_before_the_answer_pointer_still_deserializes() {
+        let without_the_field = json!({
+            "id": "legacy",
+            "version": 1,
+            "user_id": null,
+            "nodes": [{"type": "End", "id": "end"}],
+            "edges": [],
+            "entry": "end",
+        });
+
+        let g: Graph = serde_json::from_value(without_the_field).expect("deserialize");
+
+        assert_eq!(g.answer_pointer, None);
+    }
+
+    #[test]
     fn validate_accepts_the_three_built_in_graphs() {
         assert!(crate::builder::simple_graph().validate().is_ok());
-        assert!(crate::builder::rag_graph().validate().is_ok());
+        assert!(
+            crate::builder::rag_graph("any_search_slug")
+                .validate()
+                .is_ok()
+        );
         assert!(crate::builder::agent_graph().validate().is_ok());
     }
 }

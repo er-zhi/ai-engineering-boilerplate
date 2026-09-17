@@ -21,7 +21,15 @@ pub struct ServiceSchema {
     pub schema: &'static str,
     pub role: &'static str,
     pub password_var: &'static str,
-    pub entity_prefix: &'static str,
+    pub entities: Entities,
+}
+
+// A service either has entities the registry syncs, or it creates its tables itself — a partitioned parent
+// cannot be expressed as an entity. A registry glob that matches nothing looks like the first while doing
+// the second, silently, so "no registry" is a case the caller has to name rather than a glob that misses.
+pub enum Entities {
+    Registry(&'static str),
+    CreatedByTheService,
 }
 
 pub struct TestDb {
@@ -125,10 +133,9 @@ async fn connect_isolated(
         service.role
     );
     let db = Database::connect(role_url).await.unwrap();
-    db.get_schema_registry(service.entity_prefix)
-        .sync(&db)
-        .await
-        .unwrap();
+    if let Entities::Registry(prefix) = service.entities {
+        db.get_schema_registry(prefix).sync(&db).await.unwrap();
+    }
 
     TestDb {
         db,

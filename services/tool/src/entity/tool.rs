@@ -1,7 +1,4 @@
-// tool.tools: the registry — one row per tool, system (user_id NULL) or user-owned. Reference
-// data, grows with tool count, not with time — no partitioning needed (gate-database "Growth").
-// Uniqueness per owner is NOT expressed here via unique_key (Postgres treats NULL <> NULL, so
-// two system tools could share a slug) — see the manual index in main.rs.
+// tool.tools: the registry — one row per tool, system (user_id NULL) or user-owned.
 
 use sea_orm::entity::prelude::*;
 
@@ -54,9 +51,13 @@ pub struct Model {
 
 impl ActiveModelBehavior for ActiveModel {}
 
-/// The uniqueness `unique_key` cannot express — see this file's header comment. Run once, right
-/// after schema-sync, same sanctioned mechanism as `services/engine`'s partial index.
-pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 1] = [
-    "CREATE UNIQUE INDEX IF NOT EXISTS tools_owner_slug_idx ON tool.tools \
-     (COALESCE(user_id, '00000000-0000-0000-0000-000000000000'::uuid), slug)",
-];
+pub const MANUAL_UNIQUE_INDEX_NAME: &str = "tools_owner_slug_idx";
+
+const UNIQUE_SLUG_PER_OWNER: &str = "CREATE UNIQUE INDEX IF NOT EXISTS tools_owner_slug_idx ON tool.tools \
+     (COALESCE(user_id, '00000000-0000-0000-0000-000000000000'::uuid), slug)";
+
+const SLUG_LOOKUP_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS tools_user_slug_idx ON tool.tools (user_id, slug)";
+
+pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 2] =
+    [UNIQUE_SLUG_PER_OWNER, SLUG_LOOKUP_INDEX];

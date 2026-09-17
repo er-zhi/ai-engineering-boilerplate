@@ -32,12 +32,43 @@ Entities are the source of truth: schema sync builds the tables from them on sta
 | Data | Rule |
 |---|---|
 | Operational logs | Never in the DB — stdout/stderr → Docker logs |
-| Audit or usage records | Domain tables with an explicit purpose, bounded payload retention, and cleanup |
+| Audit or usage records | Domain tables with an explicit purpose, bounded payload retention, date-partitioned (see Growth below), cleanup by dropping partitions |
 | Raw HTML, files, blobs | Never permanent — store the extracted result |
 | Raw data, temporary | Only with `expires_at` + automatic cleanup |
 | Domain data | Permanent — entities, metadata, embeddings, status |
 
 Prefer in-memory processing. If temporary rows are unavoidable: `expires_at timestamptz NOT NULL`, a per-table TTL, and `DELETE WHERE expires_at < now()` on startup plus a periodic interval. No temporary table without a cleanup path.
+
+## Growth: Hot Tables and Unbounded Tables
+
+Every new table answers two questions in its entity's header comment: **what bounds its row
+count**, and **which queries hit it on the hot path**. A table with no bound is a finding until
+it is classified as one of these:
+
+| Table class | Rule |
+|---|---|
+| Hot working set (queue rows, leases, checkpoints, anything a worker loop polls) | Holds only live work. Terminal rows leave on a bounded schedule (grace period + periodic batch delete). Its polling query has a partial index covering exactly the rows it can pick. Never grows with history. |
+| Append-only log (events, audit, usage, request records) | **Partitioned by date from the first version** — `PARTITION BY RANGE (occurred_at)` or equivalent, one partition per month (per day above ~10M rows/month). Retention is `DROP PARTITION`, never `DELETE` over millions of rows. Read paths always carry the partition key or the parent-table PK-with-key. |
+| Reference / domain data | Grows with entities, not with time; a normal table. Per-owner reads (`user_id`, `tenant_id`) are served by a composite index leading with the owner key, not by owner partitioning — a partition per user degrades the planner, and hash partitioning adds nothing an index does not. |
+
+Why partition at creation and not "when it hurts": converting a populated table to a
+partitioned one is a full rewrite under lock, and every FK and unique index across the
+partition key has to be redesigned at that moment. Doing it while the table is empty costs one
+`CREATE TABLE ... PARTITION BY` plus a monthly-partition helper.
+
+Partitioning is a schema object SeaORM's schema-sync cannot express, so it falls under the
+`CREATE INDEX IF NOT EXISTS` exception below: one literal statement per partition/parent at the
+owning service's startup, documented at the entity. Sharding across databases is out of scope
+for this boilerplate (one Postgres, see `docs/architecture.md`); date partitioning is the
+minimum that keeps that one Postgres viable.
+
+Checklist for the reviewer:
+
+- New entity without a row-count bound in its header comment → finding.
+- Log-shaped table (`occurred_at`/`created_at` + append-only) without a partition key → finding.
+- Worker poll query without a partial index on its status predicate → finding.
+- Cleanup implemented as `DELETE` over a time-partitioned table instead of `DROP PARTITION` → finding.
+- Hot table joined to or scanned together with a log table on the tick path → finding.
 
 ## Queries
 

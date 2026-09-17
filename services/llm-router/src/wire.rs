@@ -1,31 +1,13 @@
 // Translates the published proto contract into the router's own types and back.
 
 use buffa::EnumValue;
-use common::llm::{RESPONSE_FORMATS, SERVED_TIERS, Sampling, limits};
-use common::proto::llm_router::v1::{
-    CompleteResponse, QualityTier, ResponseFormat, Sampling as WireSampling, TierContract,
-};
+use common::proto::llm_router::v1::{CompleteResponse, DecideResponse, QualityTier, TierContract};
+use serde::Serialize;
+use serde_json::Value;
 
+use crate::decision::Verdict;
+use crate::llm::{RESPONSE_FORMATS, SERVED_TIERS, limits};
 use crate::router::Answer;
-
-pub fn sampling_from(wire: WireSampling) -> Sampling {
-    Sampling {
-        temperature: wire.temperature,
-        top_p: wire.top_p,
-        max_tokens: wire.max_tokens,
-        stop: wire.stop,
-        frequency_penalty: wire.frequency_penalty,
-        presence_penalty: wire.presence_penalty,
-        seed: wire.seed,
-        logit_bias: wire.logit_bias.into_iter().collect(),
-        logprobs: wire.logprobs,
-        top_logprobs: wire.top_logprobs,
-        response_format: wire
-            .response_format
-            .and_then(|format| format.as_known())
-            .filter(|format| *format != ResponseFormat::Unspecified),
-    }
-}
 
 pub fn tier_contracts() -> Vec<TierContract> {
     SERVED_TIERS
@@ -59,64 +41,43 @@ pub fn known_tier(tier: EnumValue<QualityTier>) -> QualityTier {
     tier.as_known().unwrap_or(QualityTier::Unspecified)
 }
 
+pub fn decide_response_from(verdict: Verdict) -> DecideResponse {
+    DecideResponse {
+        model_used: verdict.model_used,
+        answers: verdict.answers,
+        tokens_in: verdict.tokens_in,
+        tokens_out: verdict.tokens_out,
+        ..Default::default()
+    }
+}
+
+// A google.protobuf.Value is the JSON it stands for, with every number a double; a field the caller left unset is JSON null.
+// A value that will not serialize is refused rather than degraded to null: the model would be asked about nothing and the call would still bill.
+pub fn json_from(value: Option<impl Serialize>) -> Result<Value, String> {
+    serde_json::to_value(value).map_err(|error| format!("could not be read as JSON: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use common::proto::llm_router::v1::{FinishReason, ReasoningMode};
+    use common::proto::llm_router::v1::{DecideRequest, FinishReason, NoulAnswer, ReasoningMode};
 
     use super::*;
     use crate::provider::Completion;
 
-    #[test]
-    fn every_setting_the_caller_sent_survives_the_translation() {
-        let wire = WireSampling {
-            temperature: Some(0.2),
-            top_p: Some(0.9),
-            max_tokens: Some(300),
-            stop: vec!["\n\n".to_owned()],
-            frequency_penalty: Some(0.5),
-            presence_penalty: Some(-0.5),
-            seed: Some(42),
-            logit_bias: [("1234".to_owned(), -100.0)].into_iter().collect(),
-            logprobs: Some(true),
-            top_logprobs: Some(3),
-            response_format: Some(EnumValue::Known(ResponseFormat::JsonObject)),
+    fn llm_router_answer(id: &str, noul: f64) -> common::proto::llm_router::v1::Answer {
+        common::proto::llm_router::v1::Answer {
+            id: id.to_owned(),
+            answer: NoulAnswer {
+                noul,
+                ..Default::default()
+            }
+            .into(),
             ..Default::default()
-        };
-
-        let sampling = sampling_from(wire);
-
-        assert_eq!(sampling.temperature, Some(0.2));
-        assert_eq!(sampling.top_p, Some(0.9));
-        assert_eq!(sampling.max_tokens, Some(300));
-        assert_eq!(sampling.stop, ["\n\n"]);
-        assert_eq!(sampling.frequency_penalty, Some(0.5));
-        assert_eq!(sampling.presence_penalty, Some(-0.5));
-        assert_eq!(sampling.seed, Some(42));
-        assert_eq!(sampling.logit_bias.get("1234"), Some(&-100.0));
-        assert_eq!(sampling.logprobs, Some(true));
-        assert_eq!(sampling.top_logprobs, Some(3));
-        assert_eq!(sampling.response_format, Some(ResponseFormat::JsonObject));
+        }
     }
 
     #[test]
-    fn a_caller_that_set_nothing_asks_for_nothing() {
-        let sampling = sampling_from(WireSampling::default());
-
-        assert_eq!(sampling, Sampling::default());
-    }
-
-    #[test]
-    fn a_response_format_we_do_not_know_is_left_unset() {
-        let wire = WireSampling {
-            response_format: Some(EnumValue::Known(ResponseFormat::Unspecified)),
-            ..Default::default()
-        };
-
-        assert_eq!(sampling_from(wire).response_format, None);
-    }
-
-    #[test]
-    fn the_published_contract_matches_the_limits_in_common() {
+    fn the_published_contract_matches_the_tier_limits() {
         let contracts = tier_contracts();
 
         assert_eq!(contracts.len(), SERVED_TIERS.len());
@@ -164,6 +125,49 @@ mod tests {
         assert_eq!(response.tokens_out, 2);
         assert!(response.used_backup);
         assert_eq!(response.finish_reason, EnumValue::Known(FinishReason::Stop));
+    }
+
+    #[test]
+    fn a_verdict_carries_the_model_the_answers_and_the_counts_back_to_the_caller() {
+        let verdict = Verdict {
+            model_used: "jev-1.13.0".to_owned(),
+            answers: vec![
+                llm_router_answer("is_urgent", 0.92),
+                llm_router_answer("is_billing", 0.11),
+            ],
+            tokens_in: 312,
+            tokens_out: 48,
+            sent: serde_json::json!({}),
+            reply: serde_json::json!({}),
+        };
+
+        let response = decide_response_from(verdict);
+
+        assert_eq!(response.model_used, "jev-1.13.0");
+        assert_eq!(response.tokens_in, 312);
+        assert_eq!(response.tokens_out, 48);
+        let asked: Vec<&str> = response
+            .answers
+            .iter()
+            .map(|answer| answer.id.as_str())
+            .collect();
+        assert_eq!(asked, ["is_urgent", "is_billing"]);
+    }
+
+    #[test]
+    fn a_state_reads_as_the_json_it_stands_for_and_an_unset_one_as_null() {
+        let sent: DecideRequest =
+            serde_json::from_value(serde_json::json!({"state": {"payouts": "failing", "days": 3}}))
+                .unwrap();
+
+        assert_eq!(
+            json_from(sent.state.into_option()).unwrap(),
+            serde_json::json!({"payouts": "failing", "days": 3.0})
+        );
+        assert_eq!(
+            json_from(DecideRequest::default().state.into_option()).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]

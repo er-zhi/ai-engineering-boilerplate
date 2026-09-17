@@ -1,19 +1,15 @@
-// Test-only Postgres for engine: the shared container bootstrapped with this service's own role
-// and schema, plus everything main.rs does to the schema after schema-sync — the partitioned
-// execution_events parent (schema-sync never creates it, see execution_event.rs), this month's
-// and next month's partitions, and the startup indexes — so a test sees the same schema the
-// running service does. Same shape as knowledge-base's and llm-router's.
+// Test-only Postgres for engine, carrying the schema the running service has.
 
 #![cfg(feature = "test-support")]
 
-use common::test_db::{ServiceSchema, TestDb};
+use common::test_db::{Entities, ServiceSchema, TestDb};
 use sea_orm::ConnectionTrait;
 
 const ENGINE: ServiceSchema = ServiceSchema {
     schema: "engine",
     role: "engine_user",
     password_var: "ENGINE_DB_PASSWORD",
-    entity_prefix: "engine::entity::*",
+    entities: Entities::Registry("engine::entity::*"),
 };
 
 pub async fn start() -> TestDb {
@@ -21,6 +17,7 @@ pub async fn start() -> TestDb {
     for statement in crate::execution_event::TABLE_STATEMENTS
         .iter()
         .chain(crate::entity::execution::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC.iter())
+        .chain(crate::entity::schedule::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC.iter())
         .chain(crate::execution_event::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC.iter())
     {
         test.db

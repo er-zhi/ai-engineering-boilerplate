@@ -32,7 +32,7 @@ Knowledge Base calls LLM Router for enrichment and the native embedder for docum
 - `common` contains wire contracts and code already shared by multiple services, not business logic or repositories.
 - Frontend is a one-shot build container. It copies static files to a volume that Gateway mounts read-only; it is not a runtime server or Cargo workspace member.
 - `native/embedder-ane` is the only host-native component. Core ML has no Linux-container equivalent, so Knowledge Base reaches it through `host.docker.internal`.
-- OpenRouter credentials exist only in LLM Router. Callers request a quality tier, never a provider or model slug.
+- Provider credentials exist only in LLM Router. Callers request a quality tier for completion, or send typed questions for a decision, and never choose a provider or model slug.
 
 ## Repository Layout
 
@@ -40,7 +40,7 @@ Knowledge Base calls LLM Router for enrichment and the native embedder for docum
 common/                     shared Rust contracts and utilities
 services/crawler/           crawl jobs, pages, and link graph
 services/knowledge-base/    enrichment, embeddings, and retrieval
-services/llm-router/        tier routing, fallback, and request audit
+services/llm-router/        tier routing, fallback, structured decisions, and request audit
 services/gateway/           authentication, public API, static serving
 services/frontend/          browser files copied into Gateway's volume
 native/embedder-ane/        host-native Core ML embedding process
@@ -54,3 +54,4 @@ native/embedder-ane/        host-native Core ML embedding process
 - Crawl-to-Knowledge-Base delivery has no durable retry queue; a later successful crawl retries the hand-off.
 - Any future durable job queue must sit behind a service-owned `Queue` or `JobQueue` trait so domain code depends only on that abstraction. Its first adapter should use the owning service's PostgreSQL schema; SQS, RabbitMQ, or another broker may replace that adapter later without entering business logic.
 - One PostgreSQL instance and Docker Compose are intentional until scale measurements require more infrastructure.
+- Tables that grow with time rather than with entities (events, audit, usage) are date-partitioned from their first version; hot worker tables hold only live rows. Rationale and reviewer checklist: [gate-database](../.agents/skills/code-review/gate-database/SKILL.md#growth-hot-tables-and-unbounded-tables).

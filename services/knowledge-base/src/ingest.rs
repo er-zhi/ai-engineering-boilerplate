@@ -12,7 +12,6 @@ use crate::entity::{document, document_chunk};
 use crate::llm_client::{EmbedKind, LlmClient};
 use crate::store::{DocumentStore, DocumentWrite};
 
-// See chunk::MAX_CHUNK_CHARS for why these are sized against the embedder's 128-token window.
 const MAX_HEADER_TITLE_CHARS: usize = 60;
 const MAX_HEADER_SUMMARY_CHARS: usize = 120;
 

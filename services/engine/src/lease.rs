@@ -1,121 +1,139 @@
-// Claiming and releasing an execution's lease: the only place engine touches
-// FOR UPDATE SKIP LOCKED. A single UPDATE...WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT
-// 1)...RETURNING claims a fresh Ready row, one whose lease expired (its owner crashed mid-tick),
-// or one parked on a WaitKind::Timer whose `until` has passed — one query serves "new work",
-// "crash recovery" and "the clock is the external event", no separate sweep and no timer daemon.
+// Claims and releases an execution's lease.
 
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
+use sea_orm::{
+    ActiveModelTrait,
+    ActiveValue::{Set, Unchanged},
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
+    TransactionTrait,
+    sea_query::{Expr, LockBehavior, LockType},
+};
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Claims one execution for this worker, or `None` when nothing is due.
-///
-/// The third `WHERE` disjunct is what makes `WaitKind::Timer` actually tick: `wait_kind` is jsonb
-/// holding `WaitKind`'s plain externally tagged serde shape (`{"Timer": {"until": "<rfc3339>"}}`),
-/// so "this timer elapsed" is a jsonb path plus a `timestamptz` cast. The claim deliberately
-/// leaves `wait_kind` untouched — the tick that picks the row up re-runs its `current_nodes` (still
-/// the `Wait` node) with a synthetic `Ok(Value::Null)` output, and `step()`'s ordinary per-output
-/// edge evaluation walks past the `Wait` node, which is the same unparking path `resume()` already
-/// relies on. `release_lease` then overwrites `status`/`wait_kind` at commit time.
+use crate::entity::execution;
+
+const FALLBACK_LEASE: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+
+const ELAPSED_TIMER_WAIT: &str =
+    "wait_kind ? 'Timer' AND (wait_kind -> 'Timer' ->> 'until')::timestamptz <= $1";
+
 pub async fn claim_one_ready(
     db: &DatabaseConnection,
     owner: &str,
     lease_for: Duration,
 ) -> Result<Option<Uuid>, DbErr> {
-    let lease_until = Utc::now()
-        + chrono::Duration::from_std(lease_for).unwrap_or_else(|_| chrono::Duration::seconds(30));
-    let stmt = Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-        UPDATE engine.executions
-        SET status = 'running', lease_owner = $1, lease_until = $2, updated_at = now()
-        WHERE id = (
-            SELECT id FROM engine.executions
-            WHERE status = 'ready'
-               OR (status = 'running' AND lease_until < now())
-               -- a Waiting(Timer) row whose until has passed (see the doc comment above)
-               OR (
-                   status = 'waiting'
-                   AND wait_kind ? 'Timer'
-                   AND (wait_kind -> 'Timer' ->> 'until')::timestamptz <= now()
-               )
-            ORDER BY updated_at
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
+    let now = Utc::now();
+    let lease_until = now + chrono::Duration::from_std(lease_for).unwrap_or(FALLBACK_LEASE);
+
+    let txn = db.begin().await?;
+    let Some(row) = execution::Entity::find()
+        .filter(claimable(now))
+        .order_by_asc(execution::Column::UpdatedAt)
+        .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+
+    execution::ActiveModel {
+        id: Unchanged(row.id),
+        status: Set(execution::Status::Running),
+        lease_owner: Set(Some(owner.to_owned())),
+        lease_until: Set(Some(lease_until)),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .update(&txn)
+    .await?;
+    txn.commit().await?;
+    Ok(Some(row.id))
+}
+
+fn claimable(now: chrono::DateTime<Utc>) -> Condition {
+    Condition::any()
+        .add(execution::Column::Status.eq(execution::Status::Ready))
+        .add(
+            Condition::all()
+                .add(execution::Column::Status.eq(execution::Status::Running))
+                .add(execution::Column::LeaseUntil.lt(now)),
         )
-        RETURNING id
-        ",
-        [owner.into(), lease_until.into()],
-    );
-    let row = db.query_one_raw(stmt).await?;
-    row.map(|r| r.try_get("", "id")).transpose()
+        .add(
+            Condition::all()
+                .add(execution::Column::Status.eq(execution::Status::Waiting))
+                .add(Expr::cust_with_values(ELAPSED_TIMER_WAIT, [now])),
+        )
 }
 
-/// Makes every execution left `running` by a previous engine process claimable again, returning
-/// how many were freed. Call once at startup, before the tick loop starts.
-///
-/// `claim_one_ready` already reclaims an abandoned lease — but only once it expires, and
-/// `LEASE_DURATION` is 5 minutes (it has to cover a worst-case tick, nothing renews it mid-tick).
-/// A container replaced mid-tick therefore leaves its execution frozen for those 5 minutes, and
-/// anything serialized behind it (Chat's topic, `Interrupt`, `Resume`) blocks with "is mid-tick,
-/// retry shortly" the whole time. Expiring the lease at startup hands the row straight back to
-/// the ordinary claim path, which resumes it from its last checkpoint — no execution is failed
-/// for having been interrupted, because nothing about it was lost.
-///
-/// This assumes the process that just started owns no running execution and no *other* engine
-/// process is mid-tick: true for this stack, which runs a single engine replica (`compose.yaml`).
-/// Were a second replica added, this would need to skip leases still held by a live peer — a
-/// worker registry or a heartbeat-renewed short lease, neither of which exists yet.
-pub async fn expire_abandoned_leases(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
-    let result = db
-        .execute_raw(Statement::from_string(
-            DbBackend::Postgres,
-            r"
-            UPDATE engine.executions
-            SET lease_until = now()
-            WHERE status = 'running' AND lease_until > now()
-            ",
+const SOLE_ENGINE_LOCK_KEY: i64 = 8085;
+
+pub async fn claim_sole_engine_lock(
+    db: &DatabaseConnection,
+) -> Result<Option<DatabaseTransaction>, DbErr> {
+    let txn = db.begin().await?;
+    let taken = txn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT pg_try_advisory_xact_lock({SOLE_ENGINE_LOCK_KEY}) AS taken"),
         ))
-        .await?;
-    Ok(result.rows_affected())
+        .await?
+        .ok_or_else(|| DbErr::Custom("the advisory lock query returned no row".to_owned()))?
+        .try_get::<bool>("", "taken")?;
+    if !taken {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    Ok(Some(txn))
 }
 
-/// Takes `&impl ConnectionTrait`, not `&DatabaseConnection` specifically — Task 15's tick commit
-/// calls this with a `&DatabaseTransaction` (also `ConnectionTrait`) so the status/wait_kind/
-/// current_nodes update lands in the same transaction as that tick's checkpoint and events; this
-/// task's own tests below call it with `&test.db` (a `DatabaseConnection`), which implements the
-/// same trait, so they keep compiling unchanged.
+pub async fn expire_abandoned_leases(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
+    let now = Utc::now();
+    let result = execution::Entity::update_many()
+        .set(execution::ActiveModel {
+            lease_until: Set(Some(now)),
+            ..Default::default()
+        })
+        .filter(execution::Column::Status.eq(execution::Status::Running))
+        .filter(execution::Column::LeaseUntil.gt(now))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected)
+}
+
 pub async fn release_lease(
     db: &impl ConnectionTrait,
     execution_id: Uuid,
-    status: &str,
+    owner: Option<&str>,
+    status: execution::Status,
     wait_kind: Option<serde_json::Value>,
     current_nodes: serde_json::Value,
-) -> Result<(), DbErr> {
-    let stmt = Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-        UPDATE engine.executions
-        SET status = $2, wait_kind = $3, current_nodes = $4, lease_owner = NULL,
-            lease_until = NULL, updated_at = now()
-        WHERE id = $1
-        ",
-        [
-            execution_id.into(),
-            status.into(),
-            wait_kind.into(),
-            current_nodes.into(),
-        ],
-    );
-    db.execute_raw(stmt).await?;
-    Ok(())
+) -> Result<u64, DbErr> {
+    let result = execution::Entity::update_many()
+        .set(execution::ActiveModel {
+            status: Set(status),
+            wait_kind: Set(wait_kind),
+            current_nodes: Set(current_nodes),
+            lease_owner: Set(None),
+            lease_until: Set(None),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        })
+        .filter(execution::Column::Id.eq(execution_id))
+        .filter(match owner {
+            Some(owner) => execution::Column::LeaseOwner.eq(owner),
+            None => execution::Column::LeaseOwner.is_null(),
+        })
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected)
 }
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::*;
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use std::time::Duration;
 
     async fn seed_ready_execution(db: &DatabaseConnection) -> Uuid {
@@ -125,7 +143,7 @@ mod tests {
             graph_id: Set("agent".to_owned()),
             graph_version: Set(1),
             user_id: Set(None),
-            status: Set("ready".to_owned()),
+            status: Set(execution::Status::Ready),
             wait_kind: Set(None),
             current_nodes: Set(serde_json::json!([])),
             iteration: Set(0),
@@ -200,7 +218,6 @@ mod tests {
     async fn startup_recovery_frees_an_execution_a_replaced_engine_left_running() {
         let test = crate::test_db::start().await;
         let id = seed_ready_execution(&test.db).await;
-        // A previous process claimed it with a long lease and then died mid-tick.
         claim_one_ready(
             &test.db,
             "engine-before-the-restart",
@@ -253,16 +270,133 @@ mod tests {
             .await
             .expect("claim");
 
-        release_lease(&test.db, id, "completed", None, serde_json::json!([]))
-            .await
-            .expect("release");
+        let released = release_lease(
+            &test.db,
+            id,
+            Some("worker-1"),
+            execution::Status::Completed,
+            None,
+            serde_json::json!([]),
+        )
+        .await
+        .expect("release");
 
+        assert_eq!(released, 1);
         let row = crate::entity::execution::Entity::find_by_id(id)
             .one(&test.db)
             .await
             .expect("query")
             .expect("row still there");
-        assert_eq!(row.status, "completed");
+        assert_eq!(row.status, execution::Status::Completed);
         assert_eq!(row.lease_owner, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_by_a_worker_that_no_longer_holds_the_lease_changes_nothing() {
+        let test = crate::test_db::start().await;
+        let id = seed_ready_execution(&test.db).await;
+        claim_one_ready(&test.db, "worker-1", Duration::from_millis(1))
+            .await
+            .expect("claim")
+            .expect("claimed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        claim_one_ready(&test.db, "worker-2", Duration::from_secs(30))
+            .await
+            .expect("reclaim")
+            .expect("reclaimed");
+
+        let released = release_lease(
+            &test.db,
+            id,
+            Some("worker-1"),
+            execution::Status::Completed,
+            None,
+            serde_json::json!([]),
+        )
+        .await
+        .expect("release");
+
+        assert_eq!(released, 0);
+        let row = crate::entity::execution::Entity::find_by_id(id)
+            .one(&test.db)
+            .await
+            .expect("query")
+            .expect("row still there");
+        assert_eq!(row.status, execution::Status::Running);
+        assert_eq!(row.lease_owner.as_deref(), Some("worker-2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_of_an_unleased_execution_needs_no_owner() {
+        let test = crate::test_db::start().await;
+        let id = seed_ready_execution(&test.db).await;
+
+        let released = release_lease(
+            &test.db,
+            id,
+            None,
+            execution::Status::Cancelled,
+            None,
+            serde_json::json!([]),
+        )
+        .await
+        .expect("release");
+
+        assert_eq!(released, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_engine_process_cannot_take_the_sole_engine_lock() {
+        let test = crate::test_db::start().await;
+        let first = claim_sole_engine_lock(&test.db)
+            .await
+            .expect("lock attempt")
+            .expect("nothing else holds it");
+
+        assert!(
+            claim_sole_engine_lock(&test.db)
+                .await
+                .expect("lock attempt")
+                .is_none()
+        );
+
+        drop(first);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_elapsed_timer_wait_is_claimable_and_an_unelapsed_one_is_not() {
+        let test = crate::test_db::start().await;
+        let elapsed = seed_ready_execution(&test.db).await;
+        let pending = seed_ready_execution(&test.db).await;
+        let park = |id: Uuid, until: chrono::DateTime<Utc>| execution::ActiveModel {
+            id: Unchanged(id),
+            status: Set(execution::Status::Waiting),
+            wait_kind: Set(Some(
+                serde_json::to_value(engine_core::WaitKind::Timer { until }).expect("serialize"),
+            )),
+            ..Default::default()
+        };
+        park(elapsed, Utc::now() - chrono::TimeDelta::minutes(1))
+            .update(&test.db)
+            .await
+            .expect("park elapsed");
+        park(pending, Utc::now() + chrono::TimeDelta::hours(1))
+            .update(&test.db)
+            .await
+            .expect("park pending");
+
+        let claimed = claim_one_ready(&test.db, "worker-1", Duration::from_secs(30))
+            .await
+            .expect("claim")
+            .expect("the elapsed timer is due");
+        assert_eq!(claimed, elapsed);
+
+        assert_eq!(
+            claim_one_ready(&test.db, "worker-2", Duration::from_secs(30))
+                .await
+                .expect("second claim"),
+            None,
+            "the timer that has not elapsed stays parked"
+        );
     }
 }

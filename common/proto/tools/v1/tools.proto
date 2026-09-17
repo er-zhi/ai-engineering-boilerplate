@@ -10,13 +10,35 @@ service ToolService {
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 }
 
+enum ToolRisk {
+  TOOL_RISK_UNSPECIFIED = 0;
+  TOOL_RISK_READ_ONLY = 1;
+  TOOL_RISK_WRITE = 2;
+  TOOL_RISK_DESTRUCTIVE = 3;
+}
+
+enum ToolStatus {
+  TOOL_STATUS_UNSPECIFIED = 0;
+  TOOL_STATUS_DRAFT = 1;
+  TOOL_STATUS_VALIDATED = 2;
+  TOOL_STATUS_ACTIVE = 3;
+}
+
+enum ExecuteStatus {
+  EXECUTE_STATUS_UNSPECIFIED = 0;
+  EXECUTE_STATUS_OK = 1;
+  EXECUTE_STATUS_REQUIRES_APPROVAL = 2;
+  EXECUTE_STATUS_ERROR = 3;
+  EXECUTE_STATUS_NOT_EXECUTABLE = 4;
+}
+
 message CreateToolRequest {
   string slug = 1;
   string name = 2;
   string description = 3;
   string input_schema_json = 4;
   string output_schema_json = 5;
-  string risk = 6;             // "read_only" | "write" | "destructive"
+  ToolRisk risk = 6;
   int32 timeout_seconds = 7;
 }
 message CreateToolResponse {
@@ -46,8 +68,8 @@ message Tool {
   string name = 3;
   string description = 4;
   string input_schema_json = 5;
-  string risk = 6;
-  string status = 7;           // "draft" | "validated" | "active"
+  ToolRisk risk = 6;
+  ToolStatus status = 7;
 }
 
 message ExecuteRequest {
@@ -56,7 +78,7 @@ message ExecuteRequest {
   string idempotency_key = 3;
 }
 message ExecuteResponse {
-  string status = 1;           // "ok" | "requires_approval" | "error" | "not_executable"
+  ExecuteStatus status = 1;
   string output_json = 2;
   string error_message = 3;
 }

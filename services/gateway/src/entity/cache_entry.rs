@@ -1,4 +1,4 @@
-// gateway.sessions: the CacheStore-backed table, holding one row per opaque session token. The key is never the raw token — only its hash, so a row leak alone does not hand over a valid session.
+// gateway.sessions: the PgCacheStore table, holding one row per opaque session token. The key is never the raw token — only its hash, so a row leak alone does not hand over a valid session.
 
 use sea_orm::entity::prelude::*;
 

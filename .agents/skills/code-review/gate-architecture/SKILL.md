@@ -62,6 +62,28 @@ leaves every neighbouring one unanswered, and the list only ever grows.
 - Idempotency considered for writes other services trigger
 - Breaking API changes are intentional and documented
 
+### One Declaration, Not Two
+
+A contract is a type, and the build is what enforces it. When the same contract is written down
+twice — a declared shape in one place and the code that reads it in another — nothing keeps the two
+in step, and the drift surfaces as a runtime failure in front of a user.
+
+The rule: derive one from the other, so a mismatch cannot compile. A field name, a parameter, an
+enum variant or a status string that appears in two places is a finding even when both copies
+currently agree, because agreeing today is not a mechanism.
+
+- A tool's `input_schema` and the code reading its arguments: one args type, `deny_unknown_fields`,
+  schema generated from that type
+- A proto enum and a service matching on its spelling: the generated enum, matched exhaustively —
+  never a string literal with a `_ =>` arm
+- A database column's allowed values and the code comparing against them: one enum
+- A config key and its reader: one constant
+
+A test asserting that two declarations agree is not a fix. It is a reminder to keep copying by
+hand, it only runs when someone runs it, and it leaves the second copy in place. Delete the second
+copy instead. Tests belong on behaviour the type system cannot state — that a misspelled argument
+produces an error a model can act on, not that two spellings match.
+
 ## Docker & Compose
 
 - Own multi-stage Dockerfile, non-root user, minimal final image
@@ -91,3 +113,6 @@ leaves every neighbouring one unanswered, and the list only ever grows.
 | Tool named after a subject (`weather`, `stock_quote`) | One capability tool the model aims itself (`web_fetch` over the sources it picks) |
 | Prompt paragraph about one topic, or a per-domain source list | Behavioural policy that holds for every question |
 | `if question.contains("weather")` picking a route or endpoint | Let the model choose; give it the capability, not the branch |
+| Declared schema and the code reading it written separately | Generate the schema from the args type; `deny_unknown_fields` |
+| String literal matched against a proto enum's spelling | The generated enum, matched exhaustively |
+| Test asserting two declarations still agree | Delete one declaration; derive it from the other |

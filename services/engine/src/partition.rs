@@ -1,26 +1,10 @@
-// Monthly partitions of engine.execution_events (see execution_event.rs for why that table is
-// partitioned and why schema-sync never touches it).
-//
-// Two jobs, both idempotent and both cheap enough to run from `wakeup.rs`'s fallback-interval arm
-// once a day, as a sibling of `sweep::sweep_terminal`:
-//   * make sure this month's and next month's partitions exist — a range with no partition makes
-//     the INSERT itself fail, so next month's is always created a month ahead;
-//   * when `ENGINE_EVENTS_RETENTION_MONTHS` is set, DROP the partitions that fell out of the
-//     window. Retention on a log this size is a `DROP TABLE` of one child, never a `DELETE` of
-//     millions of rows (gate-database → "Growth").
-//
-// These are the sanctioned literal statements, like the `CREATE INDEX` ones: partition DDL has no
-// query-builder form, and `FOR VALUES FROM (...) TO (...)` takes no bind parameters at all. Every
-// value interpolated below comes from `chrono` arithmetic on a `DateTime<Utc>` or from a name this
-// module itself formatted — never from a request.
+// Creates and drops engine.execution_events' monthly partitions.
 
 use chrono::{DateTime, Datelike, Months, TimeZone, Utc};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
 const PARENT: &str = "engine.execution_events";
 
-/// Creates the partitions for the month containing `now` and the one after it, if they aren't
-/// there yet. Called at startup and once a day from the wakeup loop.
 pub async fn ensure_current_and_next(
     db: &impl ConnectionTrait,
     now: DateTime<Utc>,
@@ -29,7 +13,6 @@ pub async fn ensure_current_and_next(
     ensure_partition(db, add_months(month_start(now), 1)).await
 }
 
-/// Creates the partition holding the month that contains `month`.
 pub async fn ensure_partition(
     db: &impl ConnectionTrait,
     month: DateTime<Utc>,
@@ -47,9 +30,6 @@ pub async fn ensure_partition(
     Ok(())
 }
 
-/// Drops every partition whose month ends at or before `retention_months` before the month
-/// containing `now`, and returns the names dropped. A partition still holding part of the window
-/// is left whole — retention here is a month's granularity by construction.
 pub async fn drop_partitions_older_than(
     db: &impl ConnectionTrait,
     now: DateTime<Utc>,
@@ -59,7 +39,7 @@ pub async fn drop_partitions_older_than(
     let mut dropped = Vec::new();
     for name in partition_names(db).await? {
         let Some(start) = month_of(&name) else {
-            continue; // not one of ours — never drop a table this module did not name
+            continue;
         };
         if start < cutoff {
             db.execute_unprepared(&format!("DROP TABLE IF EXISTS engine.{name}"))
@@ -70,8 +50,6 @@ pub async fn drop_partitions_older_than(
     Ok(dropped)
 }
 
-/// The daily maintenance pass: always keep the window ahead open, and close the tail only when a
-/// retention is configured (unset = keep forever, which is the default and the spec's position).
 pub async fn maintain(
     db: &impl ConnectionTrait,
     now: DateTime<Utc>,
@@ -90,12 +68,6 @@ pub async fn maintain(
     Ok(())
 }
 
-/// Whether `execution_events` is the partitioned parent this module expects.
-///
-/// Worth asking because of the one way `TABLE_STATEMENTS`' `CREATE TABLE IF NOT EXISTS` can
-/// quietly do nothing: a database that still holds the plain table from before partitioning. The
-/// service keeps working in that state — it is the same columns — but silently without the
-/// Growth guarantee, so startup says so out loud rather than leaving it to be discovered later.
 pub async fn is_partitioned(db: &impl ConnectionTrait) -> Result<bool, DbErr> {
     let key: Option<String> = db
         .query_one_raw(Statement::from_string(
@@ -109,8 +81,6 @@ pub async fn is_partitioned(db: &impl ConnectionTrait) -> Result<bool, DbErr> {
     Ok(key.is_some_and(|key| key.contains("occurred_at")))
 }
 
-/// The parent's current children, straight from the catalog — there is no ORM entity for
-/// `pg_inherits`, and this reads no application rows.
 async fn partition_names(db: &impl ConnectionTrait) -> Result<Vec<String>, DbErr> {
     let rows = db
         .query_all_raw(Statement::from_string(
@@ -133,7 +103,6 @@ fn partition_name(month_start: DateTime<Utc>) -> String {
     )
 }
 
-/// The inverse of [`partition_name`]: `None` for any table name this module did not produce.
 fn month_of(name: &str) -> Option<DateTime<Utc>> {
     let rest = name.strip_prefix("execution_events_y")?;
     let (year, month) = rest.split_once('m')?;

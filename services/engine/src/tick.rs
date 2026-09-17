@@ -1,6 +1,4 @@
-// The event loop's unit of work: claim one Ready execution, run its active nodes, call step(),
-// persist the result in one transaction ending in NOTIFY, release the lease. See the spec's
-// "Runtime сервиса engine".
+// One unit of the event loop: claim an execution, run its nodes, commit the result.
 
 use std::time::Duration;
 
@@ -8,9 +6,7 @@ use chrono::Utc;
 use engine_core::{
     ActiveNode, CheckpointStore, Execution, Graph, Node, NodeOutput, TaskExecutor, step,
 };
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
-};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 
 use crate::entity;
@@ -18,11 +14,6 @@ use crate::lease;
 use crate::store::PgCheckpointStore;
 use crate::wire;
 
-// Generously above the worst realistic single tick (one Task node's TaskExecutor::execute —
-// LlmTaskExecutor allows RETRY_ATTEMPTS=3 calls of CALL_TIMEOUT=60s plus backoff), because this
-// fixed lease stands in for a heartbeat that doesn't exist yet: nothing renews the lease while a
-// tick runs, so a lease shorter than the tick lets a second worker reclaim and re-run it. A
-// future heartbeat task extending the lease periodically mid-tick would let this shrink back.
 const LEASE_DURATION: Duration = Duration::from_secs(300);
 
 pub struct Tick<E: TaskExecutor> {
@@ -61,11 +52,18 @@ impl<E: TaskExecutor + 'static> Tick<E> {
             .run_active_nodes(&graph, &execution, execution.current_nodes.clone())
             .await?;
         let (next_execution, events) = step(&graph, execution, outputs, Utc::now());
-        self.commit(execution_id, next_step, &next_execution, &events)
-            .await
+        crate::store::commit_step(
+            &self.db,
+            execution_id,
+            Some(&self.owner),
+            next_step,
+            &next_execution,
+            &events,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 
-    /// Loads the claimed execution's row and its registered `Graph` definition.
     async fn load_execution_and_graph(
         &self,
         execution_id: uuid::Uuid,
@@ -92,9 +90,6 @@ impl<E: TaskExecutor + 'static> Tick<E> {
         Ok((row, graph))
     }
 
-    /// Rebuilds the in-flight `Execution` from its latest checkpoint (or the row's own
-    /// `current_nodes`, for an execution that has never checkpointed yet), and the step number
-    /// the next checkpoint should be written at.
     async fn load_current_state(
         &self,
         execution_id: uuid::Uuid,
@@ -121,22 +116,20 @@ impl<E: TaskExecutor + 'static> Tick<E> {
             .iter()
             .any(|active| matches!(graph.node(&active.node), Some(Node::Subgraph { .. })))
         {
-            return Err(
-                "Subgraph is not wired at the service level yet (Task 15 scope note)".to_owned(),
-            );
+            return Err("Subgraph is not wired at the service level yet".to_owned());
         }
 
-        let status = wire::columns_to_status(&row.status, row.wait_kind.clone())?;
+        let status = wire::columns_to_status(row.status, row.wait_kind.clone())?;
         let execution = Execution {
             id: engine_core::ExecutionId(execution_id),
             graph_id: engine_core::GraphId(row.graph_id.clone()),
-            graph_version: u32::try_from(row.graph_version).unwrap_or(0),
+            graph_version: wire::counter_column(row.graph_version, "graph_version")?,
             user_id: row.user_id.map(engine_core::UserId),
             status,
             current_nodes,
             state,
-            iteration: u32::try_from(row.iteration).unwrap_or(0),
-            max_iterations: u32::try_from(row.max_iterations).unwrap_or(0),
+            iteration: wire::counter_column(row.iteration, "iteration")?,
+            max_iterations: wire::counter_column(row.max_iterations, "max_iterations")?,
             deadline: row.deadline,
             budget: serde_json::from_value(row.budget.clone()).map_err(|e| e.to_string())?,
         };
@@ -151,15 +144,15 @@ impl<E: TaskExecutor + 'static> Tick<E> {
     ) -> Result<Vec<NodeOutput>, String> {
         let mut join_set = tokio::task::JoinSet::new();
         for active in current_nodes {
-            let call = match graph.node(&active.node) {
+            let task_call = match graph.node(&active.node) {
                 Some(Node::Task { kind, config, .. }) => Some((kind.clone(), config.clone())),
-                _ => None, // control node (FanOut/FanIn/End/a resumed Wait) — no real work
+                _ => None,
             };
             let state_for_call = branch_state(&execution.state, graph, &active);
             let key = format!("{}:{}:{}", execution.id, active.node, execution.iteration);
-            let executor = std::sync::Arc::clone(&self.executor); // owned clone — JoinSet::spawn needs 'static, a borrow of self doesn't outlive this call
+            let executor = std::sync::Arc::clone(&self.executor);
             join_set.spawn(async move {
-                let result = match call {
+                let result = match task_call {
                     Some((kind, config)) => executor
                         .execute(&kind, &config, &state_for_call, &key)
                         .await
@@ -178,53 +171,8 @@ impl<E: TaskExecutor + 'static> Tick<E> {
         }
         Ok(outputs)
     }
-
-    async fn commit(
-        &self,
-        execution_id: uuid::Uuid,
-        step_number: u32,
-        execution: &Execution,
-        events: &[engine_core::ExecutionEvent],
-    ) -> Result<(), String> {
-        let checkpoint = engine_core::Checkpoint {
-            schema_version: engine_core::CHECKPOINT_SCHEMA_VERSION,
-            execution_id: execution.id,
-            step: step_number,
-            state: execution.state.clone(),
-            current_nodes: execution.current_nodes.clone(),
-        };
-        let (status_column, wait_kind_column) = wire::status_to_columns(&execution.status);
-        let current_nodes_json =
-            serde_json::to_value(&execution.current_nodes).map_err(|e| e.to_string())?;
-
-        let txn = self.db.begin().await.map_err(|e| e.to_string())?;
-        sea_orm::ActiveModelTrait::insert(wire::checkpoint_to_active_model(&checkpoint), &txn)
-            .await
-            .map_err(|e| e.to_string())?;
-        for event in events {
-            sea_orm::ActiveModelTrait::insert(wire::event_to_active_model(event), &txn)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        lease::release_lease(
-            &txn,
-            execution_id,
-            &status_column,
-            wait_kind_column,
-            current_nodes_json,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        txn.execute_unprepared("NOTIFY engine_tick")
-            .await
-            .map_err(|e| e.to_string())?;
-        txn.commit().await.map_err(|e| e.to_string())
-    }
 }
 
-/// Adds a FanOut branch's item into a per-call copy of state (see engine-core Task 5's
-/// `ActiveNode.branch`) — the shared execution state is never mutated here, only this one call's
-/// view of it.
 fn branch_state(state: &Value, graph: &Graph, active: &ActiveNode) -> Value {
     let Some(branch) = active.branch else {
         return state.clone();
@@ -289,7 +237,7 @@ mod tests {
             graph_id: Set("t".to_owned()),
             graph_version: Set(1),
             user_id: Set(None),
-            status: Set("ready".to_owned()),
+            status: Set(crate::entity::execution::Status::Ready),
             wait_kind: Set(None),
             current_nodes: Set(
                 serde_json::to_value(vec![ActiveNode::plain(engine_core::NodeId("a".into()))])
@@ -333,7 +281,7 @@ mod tests {
             .await
             .expect("query")
             .expect("row");
-        assert_eq!(row.status, "completed");
+        assert_eq!(row.status, crate::entity::execution::Status::Completed);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,7 +1,4 @@
-// ExecutionEvent: the append-only record of everything that happens to an execution. The only
-// public contract other services see is this shape's proto reflection in
-// common/proto/engine/v1 (added in Task 13) — Event<P> itself stays local to engine-core, it is
-// not a shared common:: type (see the spec's "Что реально переиспользуется" table).
+// Defines the append-only record of everything that happens to an execution.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -48,6 +45,8 @@ pub enum ExecutionPayload {
     Interrupted,
     ExecutionCompleted {
         final_state: serde_json::Value,
+        #[serde(default)]
+        result: Option<serde_json::Value>,
     },
     ExecutionFailed {
         error: String,

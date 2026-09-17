@@ -1,24 +1,11 @@
-// web_search: Brave Search API behind SearchProvider, so a future provider swap doesn't touch
-// the tool that calls it. BRAVE_SEARCH_API_KEY lives directly in this service's env today —
-// documented as temporary, moves to Integrations Service once that exists (spec, "Что это").
+// web_search backed by the Brave Search API, behind SearchProvider.
 
 use serde::Deserialize;
 use url::Url;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct SearchResult {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
-}
+use crate::providers::{SearchProvider, SearchResult};
 
-pub trait SearchProvider: Send + Sync {
-    fn search(
-        &self,
-        query: &str,
-        limit: u8,
-    ) -> impl Future<Output = Result<Vec<SearchResult>, String>> + Send;
-}
+const SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
 
 pub struct BraveSearchProvider {
     api_key: String,
@@ -28,11 +15,11 @@ pub struct BraveSearchProvider {
 
 impl BraveSearchProvider {
     #[must_use]
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, client: reqwest::Client) -> Self {
         Self {
             api_key,
-            base_url: "https://api.search.brave.com/res/v1/web/search".to_owned(),
-            client: reqwest::Client::new(),
+            base_url: SEARCH_URL.to_owned(),
+            client,
         }
     }
 
@@ -42,7 +29,7 @@ impl BraveSearchProvider {
         Self {
             api_key,
             base_url,
-            client: reqwest::Client::new(),
+            client: crate::service::bounded_http_client().expect("client"),
         }
     }
 }

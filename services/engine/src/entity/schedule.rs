@@ -1,8 +1,4 @@
-// engine.schedules: one row per cron-scheduled graph run. A schedule is not an execution — it is
-// the standing instruction to start a fresh one every time `next_run_at` comes due, which the
-// scheduler loop then advances to the expression's next fire time (see scheduler.rs). Surrogate
-// i64 primary key, like graph.rs; `last_execution_id` is a breadcrumb to the most recent
-// execution this schedule started, not a foreign key the loop depends on.
+// The engine.schedules table: one row per standing cron instruction, advanced in place rather than appended to; the scheduler polls it for due rows through schedules_due_idx.
 
 use sea_orm::entity::prelude::*;
 
@@ -14,7 +10,7 @@ pub struct Model {
     pub id: i64,
     #[sea_orm(column_type = "String(StringLen::N(128))")]
     pub graph_id: String,
-    pub graph_version: Option<i32>, // NULL = whichever version is latest at fire time
+    pub graph_version: Option<i32>,
     #[sea_orm(column_type = "String(StringLen::N(128))")]
     pub cron_expr: String,
     #[sea_orm(column_type = "JsonBinary")]
@@ -28,3 +24,7 @@ pub struct Model {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 1] =
+    ["CREATE INDEX IF NOT EXISTS schedules_due_idx \
+     ON engine.schedules (next_run_at) WHERE enabled"];

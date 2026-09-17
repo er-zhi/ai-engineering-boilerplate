@@ -1,4 +1,4 @@
-// Deployment config: which models serve each tier. The limits callers must respect live in common::llm.
+// Deployment config: which models serve each tier. The limits callers must respect live in llm.rs.
 
 use common::proto::llm_router::v1::QualityTier;
 

@@ -3,11 +3,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use buffa::EnumValue;
 use common::principal::Principal;
 use common::proto::chat::v1::{
-    ChatEvent, ChatService, ChatServiceClient, CreateTopicRequest, CreateTopicResponse,
-    GetSessionRequest, GetSessionResponse, ResetSessionRequest, ResetSessionResponse,
-    SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse, StreamEventsRequest,
+    ChatEvent, ChatEventKind, ChatService, ChatServiceClient, CreateTopicRequest,
+    CreateTopicResponse, GetSessionRequest, GetSessionResponse, ResetSessionRequest,
+    ResetSessionResponse, SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse,
+    StreamEventsRequest, TopicStatus,
 };
 use common::proto::crawler::v1::CrawlerServiceClient;
 use common::proto::knowledge_base::v1::KnowledgeBaseServiceClient;
@@ -21,9 +23,7 @@ use super::start_gateway;
 use crate::auth::COOKIE_NAME;
 use crate::proxy::{CHAT_CALL_TIMEOUT, Gateway};
 
-/// Neither backend is reachable, and neither is called: these tests only exercise the Chat
-/// passthrough, but `Gateway` owns a client for all three.
-fn unreachable<C>(build: impl Fn(HttpClient, ClientConfig) -> C) -> C {
+fn unreachable_and_never_called<C>(build: impl Fn(HttpClient, ClientConfig) -> C) -> C {
     build(
         HttpClient::plaintext_http2_only(),
         ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
@@ -33,20 +33,17 @@ fn unreachable<C>(build: impl Fn(HttpClient, ClientConfig) -> C) -> C {
     )
 }
 
-/// The real Chat rejects any request without a Principal in its metadata; this fake does the
-/// same thing, and records the Principal it saw so the test can check what Gateway sent.
 #[derive(Default)]
 struct FakeChat {
-    seen: Mutex<Vec<Principal>>,
-    /// How long `stream_events` waits before emitting its one event.
-    stream_delay: Duration,
+    principals_seen: Mutex<Vec<Principal>>,
+    stream_delay_before_first_event: Duration,
 }
 
 impl FakeChat {
     fn principal(&self, ctx: &RequestContext) -> Result<Principal, ConnectError> {
         let principal = common::principal::from_metadata(ctx.headers())
             .ok_or_else(|| ConnectError::invalid_argument("request needs a Principal"))?;
-        self.seen.lock().unwrap().push(principal.clone());
+        self.principals_seen.lock().unwrap().push(principal.clone());
         Ok(principal)
     }
 }
@@ -61,7 +58,7 @@ impl ChatService for FakeChat {
         self.principal(&ctx)?;
         Response::ok(CreateTopicResponse {
             topic_id: "1".to_owned(),
-            status: "running".to_owned(),
+            status: EnumValue::Known(TopicStatus::Running),
             ..Default::default()
         })
     }
@@ -82,7 +79,7 @@ impl ChatService for FakeChat {
     ) -> ServiceResult<SendTurnResponse> {
         self.principal(&ctx)?;
         Response::ok(SendTurnResponse {
-            topic_id: "1".to_owned(),
+            topic_ids: vec!["1".to_owned()],
             ..Default::default()
         })
     }
@@ -111,12 +108,12 @@ impl ChatService for FakeChat {
         _request: ServiceRequest<'_, StreamEventsRequest>,
     ) -> ServiceResult<ServiceStream<ChatEvent>> {
         self.principal(&ctx)?;
-        let delay = self.stream_delay;
+        let delay = self.stream_delay_before_first_event;
         Response::stream_ok(futures::stream::once(async move {
             tokio::time::sleep(delay).await;
             Ok(ChatEvent {
                 topic_id: "1".to_owned(),
-                kind: "topic_completed".to_owned(),
+                kind: EnumValue::Known(ChatEventKind::TopicCompleted),
                 ..Default::default()
             })
         }))
@@ -145,15 +142,13 @@ fn chat_client_to(url: &str, timeout: Duration) -> ChatServiceClient<HttpClient>
 async fn gateway_over(fake: Arc<FakeChat>, chat_timeout: Duration) -> String {
     let chat_url = start_fake_chat(fake).await;
     start_gateway(Gateway {
-        crawler: unreachable(CrawlerServiceClient::new),
-        knowledge_base: unreachable(KnowledgeBaseServiceClient::new),
+        crawler: unreachable_and_never_called(CrawlerServiceClient::new),
+        knowledge_base: unreachable_and_never_called(KnowledgeBaseServiceClient::new),
         chat: chat_client_to(&chat_url, chat_timeout),
     })
     .await
 }
 
-/// A browser's request, as it reaches Gateway: the session cookie `require_session` already
-/// validated is on the Connect request's own headers.
 fn with_session_cookie(token: &str) -> CallOptions {
     CallOptions::default().with_header(
         axum::http::header::COOKIE,
@@ -161,10 +156,6 @@ fn with_session_cookie(token: &str) -> CallOptions {
     )
 }
 
-/// The finding: Gateway discarded the `RequestContext` and forwarded every Chat RPC with no
-/// Principal headers at all, so Chat's `require_principal` rejected *every* real request with
-/// `invalid_argument` — the whole feature was unreachable through Gateway. All five RPCs have
-/// to stamp one, which is why this walks all five rather than spot-checking one.
 #[tokio::test]
 async fn every_chat_rpc_reaches_chat_with_a_principal_built_from_the_session_cookie() {
     let fake = Arc::new(FakeChat::default());
@@ -201,7 +192,7 @@ async fn every_chat_rpc_reaches_chat_with_a_principal_built_from_the_session_coo
         .await
         .expect("the stream must open, which means the Principal was accepted");
 
-    let seen = fake.seen.lock().unwrap();
+    let seen = fake.principals_seen.lock().unwrap();
     assert_eq!(seen.len(), 6, "all six RPCs must carry a Principal");
     for principal in seen.iter() {
         assert_eq!(
@@ -216,8 +207,6 @@ async fn every_chat_rpc_reaches_chat_with_a_principal_built_from_the_session_coo
     }
 }
 
-/// A request with no session cookie never reaches Chat: Gateway has nothing to build a
-/// `session_id` from, and `require_session` means this cannot be a browser request.
 #[tokio::test]
 async fn a_chat_rpc_without_a_session_cookie_is_refused_by_gateway() {
     let fake = Arc::new(FakeChat::default());
@@ -230,20 +219,15 @@ async fn a_chat_rpc_without_a_session_cookie_is_refused_by_gateway() {
         .expect_err("no cookie, no Principal");
 
     assert_eq!(error.code, connectrpc::ErrorCode::Unauthenticated);
-    assert!(fake.seen.lock().unwrap().is_empty());
+    assert!(fake.principals_seen.lock().unwrap().is_empty());
 }
 
-/// The finding: Gateway proxied `StreamEvents` on the same 10s unary deadline. A client timeout
-/// is a whole-call deadline connectrpc re-applies to every frame, so the browser's event feed
-/// was cut after ten seconds whatever the topic was doing. Same fake, same wait, with a chat
-/// client whose default deadline is far too short — only the per-call streaming deadline saves
-/// it.
 #[tokio::test]
 async fn the_event_stream_outlives_the_unary_deadline() {
     let unary_timeout = Duration::from_millis(200);
     let fake = Arc::new(FakeChat {
-        seen: Mutex::new(Vec::new()),
-        stream_delay: Duration::from_secs(1),
+        principals_seen: Mutex::new(Vec::new()),
+        stream_delay_before_first_event: Duration::from_secs(1),
     });
     let gateway_url = gateway_over(Arc::clone(&fake), unary_timeout).await;
     let client = chat_client_to(&gateway_url, Duration::from_secs(30));
@@ -261,5 +245,8 @@ async fn the_event_stream_outlives_the_unary_deadline() {
         .expect("an event arriving after the unary deadline must still be forwarded")
         .expect("one event");
 
-    assert_eq!(event.to_owned_message().kind, "topic_completed");
+    assert_eq!(
+        event.to_owned_message().kind,
+        EnumValue::Known(ChatEventKind::TopicCompleted)
+    );
 }

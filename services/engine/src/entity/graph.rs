@@ -1,6 +1,4 @@
-// engine.graphs: one row per (graph_id, version). user_id NULL means a system graph
-// (GraphBuilder output, registered at startup — see main.rs). Surrogate i64 primary key,
-// (graph_id, version) as the real natural key, matching document.rs's established pattern.
+// The engine.graphs table: one row per registered (graph_id, version).
 
 use sea_orm::entity::prelude::*;
 

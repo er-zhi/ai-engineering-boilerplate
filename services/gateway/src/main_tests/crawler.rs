@@ -1,3 +1,5 @@
+// Gateway's Crawler passthrough: what it forwards, and what it retries.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

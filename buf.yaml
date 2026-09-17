@@ -4,6 +4,13 @@ modules:
 lint:
   use:
     - STANDARD
+  except:
+    # RPC_RESPONSE_STANDARD_NAME wants every response named `<Rpc>Response`. Two shapes here are
+    # deliberately not that, and wrapping them would add a one-field envelope to every client for
+    # nothing: a getter returns the resource itself (`GetExecution` -> `Execution`, the shape
+    # Google's own AIP-131 prescribes), and a server stream yields the domain event it streams
+    # (`StreamEvents` -> `ExecutionEvent`, `ChatEvent`), which is the element, not a response.
+    - RPC_RESPONSE_STANDARD_NAME
 breaking:
   use:
     - PACKAGE

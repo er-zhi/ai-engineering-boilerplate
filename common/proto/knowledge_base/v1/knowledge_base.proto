@@ -28,21 +28,33 @@ message IngestResponse {
   bool skipped = 2;
 }
 
+// What a stored page is, as knowledge-base classified it while ingesting.
+enum PageType {
+  PAGE_TYPE_UNSPECIFIED = 0;
+  PAGE_TYPE_OTHER = 1;
+  PAGE_TYPE_PRODUCT = 2;
+  PAGE_TYPE_KNOWLEDGE = 3;
+  PAGE_TYPE_INSTRUCTION = 4;
+  PAGE_TYPE_DOCUMENTATION = 5;
+  PAGE_TYPE_BLOG = 6;
+}
+
 message SearchRequest {
+  reserved 2; // was a repeated page-type string whose vocabulary lived in this comment
   string query = 1;
-  // Restricts results to these page types ("product", "knowledge", "instruction", "documentation",
-  // "blog", "other"). Empty means every type.
-  repeated string page_types = 2;
+  // Restricts results to these page types. Empty means every type.
+  repeated PageType page_types = 4;
   // How many documents to return: 0 means 10, at most 50.
   uint32 limit = 3;
 }
 
 message SearchResult {
+  reserved 5; // was a page-type string whose vocabulary lived in SearchRequest's comment
   string source = 1;
   string source_id = 2;
   string title = 3;
   string summary = 4;
-  string page_type = 5;
+  PageType page_type = 12;
   float score = 6;
   repeated string keywords = 7;
   // The passage of this document that matched the query best.

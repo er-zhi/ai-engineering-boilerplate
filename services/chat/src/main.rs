@@ -1,27 +1,37 @@
-// chat: session/topic orchestration over Engine. Connects to Postgres, syncs its schema,
-// recovers any topics left Running from a prior process, serves Connect RPC.
+// Serves chat.v1.ChatService: prepares the schema, recovers running topics, validates every entry.
 
 use std::sync::Arc;
 
 use axum::routing::get;
-use chat::status_to_str;
+use buffa::EnumValue;
+use chat::classifier::MAX_TITLE_CHARS;
+use chat::entity::message::MAX_CONTENT_CHARS;
+use chat::events::TopicEvent;
+use chat::events::TopicEventKind;
 use chat::topic_manager::TopicManager;
+use chat::topic_status::status_proto;
 use chrono::Utc;
+use common::execution_input::ExecutionInput;
 use common::proto::chat::v1::{
-    ChatEvent, ChatService, CreateTopicRequest, CreateTopicResponse, GetSessionRequest,
-    GetSessionResponse, Message as MessageProto, ResetSessionRequest, ResetSessionResponse,
-    SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse, StreamEventsRequest,
-    Topic as TopicProto,
+    ChatEvent, ChatEventKind, ChatService, CreateTopicRequest, CreateTopicResponse,
+    GetSessionRequest, GetSessionResponse, Message as MessageProto, ResetSessionRequest,
+    ResetSessionResponse, SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse,
+    StreamEventsRequest, Topic as TopicProto,
 };
 use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
     ServiceStream,
 };
 use futures::StreamExt;
-use sea_orm::Database;
+use sea_orm::{ConnectionTrait, Database};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use uuid::Uuid;
 
 const CHAT_PORT: &str = "0.0.0.0:8088";
+const MAX_INPUT_JSON_BYTES: usize = 16 * 1024;
+const PARTITION_MAINTENANCE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+const EVENTS_RETENTION_MONTHS_VAR: &str = "CHAT_EVENTS_RETENTION_MONTHS";
 
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
@@ -33,18 +43,75 @@ fn require_principal(ctx: &RequestContext) -> Result<Uuid, ConnectError> {
         .ok_or_else(|| ConnectError::invalid_argument("request needs a Principal in the metadata"))
 }
 
-/// The self-contained question a topic was started with. The classifier writes it into
-/// `input_json.question` (it carries the context a background worker needs, which the short
-/// `title` does not); topics created before that, or through `CreateTopic` with some other input
-/// shape, fall back to their title.
+fn bounded_title(title: String) -> Result<String, ConnectError> {
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return Err(ConnectError::invalid_argument(format!(
+            "title is longer than {MAX_TITLE_CHARS} characters"
+        )));
+    }
+    Ok(title)
+}
+
+fn bounded_content(content: String) -> Result<String, ConnectError> {
+    if content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(ConnectError::invalid_argument(format!(
+            "content is longer than {MAX_CONTENT_CHARS} characters"
+        )));
+    }
+    Ok(content)
+}
+
+fn bounded_input_json(input_json: &str) -> Result<serde_json::Value, ConnectError> {
+    if input_json.len() > MAX_INPUT_JSON_BYTES {
+        return Err(ConnectError::invalid_argument(format!(
+            "input_json is larger than {MAX_INPUT_JSON_BYTES} bytes"
+        )));
+    }
+    if input_json.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(input_json)
+        .map_err(|_| ConnectError::invalid_argument("input_json is not valid JSON"))?;
+    if !parsed.is_object() {
+        return Err(ConnectError::invalid_argument(
+            "input_json must be a JSON object",
+        ));
+    }
+    Ok(parsed)
+}
+
 fn question_of(topic: &chat::entity::topic::Model) -> String {
-    serde_json::from_str::<serde_json::Value>(&topic.input_json)
-        .ok()
-        .as_ref()
-        .and_then(|input| input.get("question"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| topic.title.clone())
+    let question = ExecutionInput::in_state(&topic.input_json).question;
+    if question.is_empty() {
+        return topic.title.clone();
+    }
+    question
+}
+
+fn event_kind_to_proto(kind: TopicEventKind) -> ChatEventKind {
+    match kind {
+        TopicEventKind::TopicCreated => ChatEventKind::TopicCreated,
+        TopicEventKind::TopicQueued => ChatEventKind::TopicQueued,
+        TopicEventKind::TopicStarted => ChatEventKind::TopicStarted,
+        TopicEventKind::TopicProgress => ChatEventKind::TopicProgress,
+        TopicEventKind::TopicCompleted => ChatEventKind::TopicCompleted,
+        TopicEventKind::TopicFailed => ChatEventKind::TopicFailed,
+        TopicEventKind::TopicCancelled => ChatEventKind::TopicCancelled,
+        TopicEventKind::FocusChanged => ChatEventKind::FocusChanged,
+        TopicEventKind::Notification => ChatEventKind::Notification,
+        TopicEventKind::SessionReset => ChatEventKind::SessionReset,
+    }
+}
+
+fn chat_event(event: TopicEvent) -> ChatEvent {
+    ChatEvent {
+        topic_id: event.topic_id.map(|id| id.to_string()).unwrap_or_default(),
+        kind: EnumValue::Known(event_kind_to_proto(event.kind)),
+        payload_json: event.payload.to_string(),
+        occurred_at: event.occurred_at.to_rfc3339(),
+        session_id: event.session_id.to_string(),
+        ..Default::default()
+    }
 }
 
 struct ChatServiceImpl {
@@ -65,13 +132,15 @@ impl ChatService for ChatServiceImpl {
             .map(|id| id.parse::<i64>())
             .transpose()
             .map_err(|_| ConnectError::invalid_argument("parent_id is not a valid id"))?;
+        let title = bounded_title(msg.title)?;
+        let input_json = bounded_input_json(&msg.input_json)?;
         let (topic_id, status) = self
             .topics
-            .create_topic(user_id, parent_id, msg.title, msg.input_json)
+            .create_topic(user_id, parent_id, title, input_json)
             .await?;
         Response::ok(CreateTopicResponse {
             topic_id: topic_id.to_string(),
-            status: status_to_str(status).to_owned(),
+            status: EnumValue::Known(status_proto(status)),
             ..Default::default()
         })
     }
@@ -100,9 +169,9 @@ impl ChatService for ChatServiceImpl {
         let msg = request.to_owned_message();
         let turn_id = Uuid::parse_str(&msg.turn_id)
             .map_err(|_| ConnectError::invalid_argument("turn_id is not a valid uuid"))?;
-        let topic_ids = self.topics.send_turn(user_id, turn_id, msg.content).await?;
+        let content = bounded_content(msg.content)?;
+        let topic_ids = self.topics.send_turn(user_id, turn_id, content).await?;
         Response::ok(SendTurnResponse {
-            topic_id: topic_ids.first().map(i64::to_string).unwrap_or_default(),
             topic_ids: topic_ids.iter().map(i64::to_string).collect(),
             ..Default::default()
         })
@@ -125,7 +194,7 @@ impl ChatService for ChatServiceImpl {
                     id: t.id.to_string(),
                     parent_id: t.parent_id.map(|id| id.to_string()),
                     question: question_of(&t),
-                    status: status_to_str(t.status).to_owned(),
+                    status: EnumValue::Known(status_proto(t.status)),
                     execution_id: t.execution_id.map(|id| id.to_string()),
                     result_summary: t.result_summary,
                     created_at: t.created_at.to_rfc3339(),
@@ -166,47 +235,80 @@ impl ChatService for ChatServiceImpl {
         _request: ServiceRequest<'_, StreamEventsRequest>,
     ) -> ServiceResult<ServiceStream<ChatEvent>> {
         let user_id = require_principal(&ctx)?;
-        let session_id = self.topics.session.get_or_create_session(user_id).await?.id;
-        // Subscribe before reading the replay, never after — see `subscribe_then_snapshot`.
-        // The replay is the session's whole stored history in `chat.events`, not a synthetic
-        // `topic_created` per topic: that is what lets a reloaded page rebuild the debug panel
-        // (and everything else it saw) instead of starting blank.
-        let (live, replay) = chat::events::subscribe_then_snapshot(
-            &self.topics.events,
-            self.topics.stored_events(session_id),
-        )
-        .await?;
-        let replay = replay.into_iter().map(Ok);
-        // The bus is one process-wide broadcast channel, so it carries every user's events; the
-        // live tail is filtered down to this session here rather than left to the client.
-        let wanted = session_id.to_string();
-        let live = tokio_stream::wrappers::BroadcastStream::new(live).filter_map(move |item| {
-            let wanted = wanted.clone();
-            async move {
-                item.ok()
-                    .filter(|event: &ChatEvent| event.session_id == wanted)
-                    .map(Ok)
-            }
-        });
+        let session = self.topics.session_of_user(user_id).await?;
+        let (live, replay) = self.topics.subscribe_and_replay(&session).await?;
+        let replay = replay.into_iter().map(|event| Ok(chat_event(event)));
+        let this_session = session.id;
+        let live =
+            tokio_stream::wrappers::BroadcastStream::new(live).filter_map(move |item| async move {
+                match item {
+                    Ok(event) if event.session_id == this_session => Some(Ok(chat_event(event))),
+                    Ok(_) => None,
+                    Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            session_id = %this_session,
+                            skipped,
+                            "chat event subscriber fell behind; its transcript is now incomplete \
+                             until it reloads"
+                        );
+                        None
+                    }
+                }
+            });
         Response::stream_ok(futures::stream::iter(replay).chain(live))
     }
 }
 
-/// Keeps `chat.events`' partition window open ahead of `now`. Startup alone is not enough: a
-/// process that stays up across a month boundary would hit a range with no partition, and the
-/// INSERT itself fails then. Once a day is far more often than needed and costs two `IF NOT
-/// EXISTS` statements.
+fn events_retention_months() -> Option<u32> {
+    let value = std::env::var(EVENTS_RETENTION_MONTHS_VAR).ok()?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    match value.parse::<u32>() {
+        Ok(months) if months > 0 => Some(months),
+        _ => {
+            tracing::warn!(
+                value,
+                "{EVENTS_RETENTION_MONTHS_VAR} is not a positive number of months, keeping every \
+                 partition"
+            );
+            None
+        }
+    }
+}
+
 fn spawn_partition_maintenance(db: sea_orm::DatabaseConnection) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
-        ticker.tick().await; // fires immediately; startup already did this pass
+        let mut ticker = tokio::time::interval(PARTITION_MAINTENANCE_INTERVAL);
+        ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Err(error) = chat::event_log::ensure_current_and_next(&db, Utc::now()).await {
-                tracing::error!(%error, "failed to open the next chat.events partition");
+            if let Err(error) =
+                chat::event_log::maintain(&db, Utc::now(), events_retention_months()).await
+            {
+                tracing::error!(%error, "chat.events partition maintenance failed");
             }
         }
     });
+}
+
+async fn prepare_schema(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    db.get_schema_registry("chat::entity::*").sync(db).await?;
+    for statement in chat::entity::topic::INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC.iter() {
+        db.execute_unprepared(statement).await?;
+    }
+    chat::event_log::setup(db).await?;
+    if !chat::event_log::is_partitioned(db).await? {
+        tracing::error!(
+            "chat.events exists as a plain table, so the partitioned CREATE TABLE was a no-op: \
+             the event log will grow without a DROP PARTITION retention path. Drop the table (its \
+             contents are a replayable log, not working state) and restart."
+        );
+    }
+    chat::event_log::maintain(db, Utc::now(), events_retention_months()).await?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -215,9 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = env("DATABASE_URL")?;
     let db = Database::connect(&database_url).await?;
-    db.get_schema_registry("chat::entity::*").sync(&db).await?;
-    // `chat.events` is partitioned, so schema-sync cannot own it — see `chat::event_log`.
-    chat::event_log::setup(&db).await?;
+    prepare_schema(&db).await?;
     spawn_partition_maintenance(db.clone());
 
     let topics = Arc::new(TopicManager::new(
@@ -239,4 +339,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("chat listening on {CHAT_PORT}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_over_long_field_is_refused_at_the_entry_with_the_limit_named() {
+        let title = bounded_title("x".repeat(MAX_TITLE_CHARS + 1))
+            .expect_err("an over-long title must be refused");
+        assert_eq!(title.code, connectrpc::ErrorCode::InvalidArgument);
+        assert!(
+            title
+                .message
+                .unwrap_or_default()
+                .contains(&MAX_TITLE_CHARS.to_string())
+        );
+
+        let content = bounded_content("x".repeat(MAX_CONTENT_CHARS + 1))
+            .expect_err("an over-long turn must be refused");
+        assert_eq!(content.code, connectrpc::ErrorCode::InvalidArgument);
+
+        let input = bounded_input_json(&"x".repeat(MAX_INPUT_JSON_BYTES + 1))
+            .expect_err("an over-large input_json must be refused");
+        assert_eq!(input.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn input_json_is_normalized_into_an_object_or_refused() {
+        assert_eq!(
+            bounded_input_json("").expect("empty"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            bounded_input_json(r#"{"question":"hi"}"#).expect("object"),
+            serde_json::json!({"question": "hi"})
+        );
+        for rejected in ["[1,2]", "\"text\"", "{not json}"] {
+            assert_eq!(
+                bounded_input_json(rejected)
+                    .expect_err("only a JSON object may reach the database")
+                    .code,
+                connectrpc::ErrorCode::InvalidArgument,
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_at_the_limit_is_accepted() {
+        let exact = "x".repeat(MAX_TITLE_CHARS);
+        assert_eq!(bounded_title(exact.clone()).expect("at the limit"), exact);
+    }
 }

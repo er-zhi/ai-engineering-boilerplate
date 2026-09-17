@@ -19,7 +19,8 @@ chrono = { workspace = true }
 common = { workspace = true }
 connectrpc = { workspace = true, features = ["axum", "client"] }
 cron = { workspace = true }
-engine-core = { path = "../../engine-core" }
+engine-core = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
@@ -34,8 +35,11 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-support"] }
-engine-core = { path = "../../engine-core", features = ["test-support"] }
-futures = { workspace = true }
+# The integration tests under `tests/` link engine as an external crate, so they only see
+# `engine::test_db` when engine's own test-support feature is on. Depending on ourselves turns it
+# on for test targets alone, so `cargo nextest run --workspace` compiles without `--all-features`.
+engine = { path = ".", features = ["test-support"] }
+engine-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

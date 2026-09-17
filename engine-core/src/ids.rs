@@ -1,5 +1,4 @@
-// Newtype identifiers for engine-core. GraphId/NodeId are human-chosen strings (graph slugs and
-// per-graph node names); ExecutionId/UserId are UUIDs minted at creation time.
+// Declares the newtype identifiers used across engine-core.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

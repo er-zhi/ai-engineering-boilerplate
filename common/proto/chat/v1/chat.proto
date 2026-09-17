@@ -12,13 +12,25 @@ service ChatService {
 }
 
 message CreateTopicRequest {
-  optional string parent_id = 1;  // unset = new root topic
+  optional string parent_id = 1; // unset = new root topic
   string title = 2;
-  string input_json = 3;          // merged into the new topic's execution's initial state
+  string input_json = 3; // merged into the new topic's execution's initial state
 }
 message CreateTopicResponse {
+  reserved 2; // was a status string whose vocabulary lived in this comment
   string topic_id = 1;
-  string status = 2;              // "running" | "queued" — see policy in Task 3
+  TopicStatus status = 3;
+}
+
+// Where a topic has got to. Queued and Running are the admission policy Chat applies when a
+// topic is created; the rest are the outcomes its execution reaches.
+enum TopicStatus {
+  TOPIC_STATUS_UNSPECIFIED = 0;
+  TOPIC_STATUS_QUEUED = 1;
+  TOPIC_STATUS_RUNNING = 2;
+  TOPIC_STATUS_COMPLETED = 3;
+  TOPIC_STATUS_FAILED = 4;
+  TOPIC_STATUS_CANCELLED = 5;
 }
 
 message SetFocusRequest {
@@ -27,11 +39,11 @@ message SetFocusRequest {
 message SetFocusResponse {}
 
 message SendTurnRequest {
-  string turn_id = 1;   // idempotency key: a repeat with the same turn_id is a no-op
-  string content = 2;   // routed to the session's current focus topic
+  string turn_id = 1; // idempotency key: a repeat with the same turn_id is a no-op
+  string content = 2; // routed to the session's current focus topic
 }
 message SendTurnResponse {
-  string topic_id = 1;           // the first topic that received it — kept for older clients
+  reserved 1; // was the first routed topic_id, before a turn could reach several topics
   repeated string topic_ids = 2; // every topic the classifier routed this turn to
 }
 
@@ -41,35 +53,51 @@ message GetSessionResponse {
   repeated Topic topics = 2;
 }
 message Topic {
+  reserved 4; // was a status string whose vocabulary lived in this comment
   string id = 1;
   optional string parent_id = 2;
   string title = 3;
-  string status = 4;              // "queued"|"running"|"completed"|"failed"|"cancelled"
+  TopicStatus status = 11;
   optional string execution_id = 5;
   optional string result_summary = 6;
-  string question = 7;            // the self-contained question the topic was started with
-  string created_at = 8;          // RFC 3339
-  string updated_at = 9;          // RFC 3339
+  string question = 7; // the self-contained question the topic was started with
+  string created_at = 8; // RFC 3339
+  string updated_at = 9; // RFC 3339
   repeated Message messages = 10; // the user turns delivered to this topic, oldest first
 }
 message Message {
   string id = 1;
   string content = 2;
-  string created_at = 3;          // RFC 3339
-  string turn_id = 4;             // idempotency key from SendTurn; lets clients collapse the
-                                   // same turn's rows across the topics it was routed to
+  string created_at = 3; // RFC 3339
+  string turn_id = 4; // idempotency key from SendTurn; lets clients collapse the
+  // same turn's rows across the topics it was routed to
 }
 
 message ResetSessionRequest {}
 message ResetSessionResponse {}
 
 message StreamEventsRequest {}
+// Everything that can happen to a session's topics. A stored event this Chat no longer knows
+// arrives as UNSPECIFIED rather than as a name the client would have to guess at.
+enum ChatEventKind {
+  CHAT_EVENT_KIND_UNSPECIFIED = 0;
+  CHAT_EVENT_KIND_TOPIC_CREATED = 1;
+  CHAT_EVENT_KIND_TOPIC_QUEUED = 2;
+  CHAT_EVENT_KIND_TOPIC_STARTED = 3;
+  CHAT_EVENT_KIND_TOPIC_PROGRESS = 4;
+  CHAT_EVENT_KIND_TOPIC_COMPLETED = 5;
+  CHAT_EVENT_KIND_TOPIC_FAILED = 6;
+  CHAT_EVENT_KIND_FOCUS_CHANGED = 7;
+  CHAT_EVENT_KIND_NOTIFICATION = 8;
+  CHAT_EVENT_KIND_SESSION_RESET = 9;
+  CHAT_EVENT_KIND_TOPIC_CANCELLED = 10;
+}
+
 message ChatEvent {
+  reserved 2; // was a kind string whose vocabulary lived in this comment
   string topic_id = 1;
-  // "topic_created"|"topic_queued"|"topic_started"|"focus_changed"|"topic_progress"|
-  // "topic_completed"|"topic_failed"|"topic_cancelled"|"notification"
-  string kind = 2;
+  ChatEventKind kind = 6;
   string payload_json = 3;
-  string occurred_at = 4;         // RFC 3339
-  string session_id = 5;          // the session this event belongs to
+  string occurred_at = 4; // RFC 3339
+  string session_id = 5; // the session this event belongs to
 }

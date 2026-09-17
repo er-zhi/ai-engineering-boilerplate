@@ -28,6 +28,11 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# A wildcard on a registry dependency is a supply-chain hole — any future version satisfies it.
+# A wildcard on a `path` dependency is not: it resolves to a crate in this workspace, pinned by the
+# same commit as the code depending on it. Denying those would only force a version number to be
+# restated in every intra-workspace dependency and kept in sync by hand.
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]

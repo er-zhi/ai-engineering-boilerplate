@@ -1,8 +1,4 @@
-// Integration tests: the tick loop against a real (testcontainers) Postgres, a fake
-// TaskExecutor. Proves what a unit test can't — that claim/run/step/commit actually compose
-// correctly against the database, that a crashed worker's lease is reclaimed, and (at the bottom)
-// that the sweep takes finished executions out of the hot tables without touching the event log
-// they left behind.
+// Integration tests for the tick loop, lease recovery and the sweep against Postgres.
 
 use std::time::Duration;
 
@@ -27,7 +23,6 @@ async fn register_simple(service: &Service) {
         .expect("register");
 }
 
-/// `Task -> Wait(Timer{until}) -> End`, registered as graph `timer` v1.
 async fn register_timer_graph(service: &Service, until: chrono::DateTime<Utc>) {
     let definition = serde_json::to_string(
         &engine_core::GraphBuilder::new()
@@ -46,9 +41,6 @@ async fn register_timer_graph(service: &Service, until: chrono::DateTime<Utc>) {
         .expect("register");
 }
 
-/// Seeds a row already parked on the `Wait` node, exactly as a tick that reached it would have
-/// left it: `status = waiting`, `wait_kind = {"Timer":{"until":...}}`, `current_nodes` still
-/// pointing at the `Wait` node.
 async fn seed_waiting_on_timer(
     db: &sea_orm::DatabaseConnection,
     until: chrono::DateTime<Utc>,
@@ -59,7 +51,7 @@ async fn seed_waiting_on_timer(
         graph_id: Set("timer".to_owned()),
         graph_version: Set(1),
         user_id: Set(None),
-        status: Set("waiting".to_owned()),
+        status: Set(engine::entity::execution::Status::Waiting),
         wait_kind: Set(Some(
             serde_json::to_value(engine_core::WaitKind::Timer { until }).expect("serialize"),
         )),
@@ -128,8 +120,6 @@ async fn a_crashed_workers_lease_is_reclaimed_and_the_execution_still_completes(
         .await
         .expect("start");
 
-    // Simulate worker-1 claiming the execution and then crashing before it ever commits: the
-    // lease exists, `status` is "running", but nothing ever released it.
     let claimed = claim_one_ready(
         &test.db,
         "worker-1-about-to-crash",
@@ -139,11 +129,8 @@ async fn a_crashed_workers_lease_is_reclaimed_and_the_execution_still_completes(
     .expect("claim")
     .expect("claimed");
     assert_eq!(claimed, execution_id);
-    tokio::time::sleep(Duration::from_millis(20)).await; // let the 1ms lease expire
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // worker-2 runs a completely ordinary tick — it doesn't know or care that worker-1 died;
-    // claim_one_ready's WHERE clause (status='ready' OR expired lease) picks this row up exactly
-    // like a fresh one, which is the whole point: recovery is not a special code path.
     let executor = FakeTaskExecutor::default();
     executor.respond("llm", Ok(json!({"tool_call": null, "reply": "recovered"})));
     let tick = Tick::new(test.db.clone(), executor, "worker-2".to_owned());
@@ -173,9 +160,6 @@ async fn a_timer_whose_deadline_passed_is_reclaimed_and_the_execution_completes(
     register_timer_graph(&service, until).await;
     let execution_id = seed_waiting_on_timer(&test.db, until).await;
 
-    // Nothing resumes this row: no Interrupt, no Resume, no NOTIFY. claim_one_ready's third
-    // disjunct picks it up purely because Timer.until is in the past, and the ordinary tick
-    // machinery unparks it by feeding the Wait node a synthetic Ok(Null) output.
     let tick = Tick::new(
         test.db.clone(),
         FakeTaskExecutor::default(),
@@ -214,9 +198,6 @@ async fn a_timer_that_has_not_elapsed_yet_is_left_alone() {
     );
 }
 
-// --- Task 26: sweeping terminal executions out of the hot tables ---
-
-/// Runs `simple` to `Completed` through a real tick, and returns its id.
 async fn run_to_completion(test: &common::test_db::TestDb, service: &Service) -> uuid::Uuid {
     let execution_id = service
         .start_execution("simple".to_owned(), None, r#"{"question": "hi"}"#, None)
@@ -305,8 +286,6 @@ async fn get_execution_on_a_swept_id_is_not_found() {
         .await
         .expect("sweep");
 
-    // The client contract for a result older than the retention window is StreamEvents, which
-    // still has every event for this id — GetExecution is for the live working set.
     let result = service.get_execution(execution_id).await;
 
     assert!(
@@ -321,13 +300,11 @@ async fn the_sweep_leaves_unfinished_work_and_fresh_results_alone() {
     let service = Service::new(test.db.clone());
     register_simple(&service).await;
     let completed = run_to_completion(&test, &service).await;
-    // A second execution nobody has ticked yet: still `ready`, i.e. still the working set.
     let ready = service
         .start_execution("simple".to_owned(), None, r#"{"question": "later"}"#, None)
         .await
         .expect("start");
 
-    // One hour of retention: the row above finished seconds ago, so nothing is due at all.
     let swept = sweep_terminal(&test.db, Duration::from_secs(3600), 500)
         .await
         .expect("sweep");
@@ -347,7 +324,6 @@ async fn the_sweep_leaves_unfinished_work_and_fresh_results_alone() {
         );
     }
 
-    // And with no grace period at all, only the terminal row goes — `ready` is never sweepable.
     assert_eq!(
         sweep_terminal(&test.db, Duration::ZERO, 500)
             .await

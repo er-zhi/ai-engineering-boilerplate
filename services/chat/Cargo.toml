@@ -26,11 +26,17 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-uuid = { workspace = true }
+# v5: `chat.events` dedups on a uuid, and Engine's event id is a string — hashing it into the
+# column keeps one Engine event on one row across every replay.
+uuid = { workspace = true, features = ["v5"] }
 
 [features]
 test-support = ["common/test-support"]
 
 [dev-dependencies]
+# Depending on ourselves turns on `test-support` for the test targets alone, so the unit tests
+# that need `test_db` are compiled by a plain `cargo nextest run --workspace` instead of being
+# silently skipped until someone remembers `--all-features`.
+chat = { path = ".", features = ["test-support"] }
 common = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

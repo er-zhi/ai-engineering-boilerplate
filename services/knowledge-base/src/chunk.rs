@@ -1,11 +1,6 @@
-// Splits document text into passages of at most MAX_CHUNK_CHARS, breaking on lines, then sentences, then words.
+// Splits document text into passages that fit the embedder's window, breaking on lines, then sentences, then words.
 
-// Sized against the embedder's 128-token fixed window together with ingest.rs's context header
-// (MAX_HEADER_TITLE_CHARS + MAX_HEADER_SUMMARY_CHARS): measured against the real tokenizer, a
-// header+passage at these limits runs ~107 tokens for typical English, leaving headroom before
-// the 128-token cut. Denser text (non-Latin scripts, code, URLs) can still truncate — that
-// remains the accepted, logged exception, not the common case this budget is sized for.
-pub const MAX_CHUNK_CHARS: usize = 300;
+pub const MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW: usize = 300;
 
 struct Piece<'a> {
     text: &'a str,
@@ -19,7 +14,8 @@ pub fn split(text: &str) -> Vec<String> {
 
     for piece in pieces(text) {
         let piece_chars = len(piece.text);
-        if current_chars > 0 && current_chars + 1 + piece_chars > MAX_CHUNK_CHARS {
+        if current_chars > 0 && current_chars + 1 + piece_chars > MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW
+        {
             chunks.push(std::mem::take(&mut current));
             current_chars = 0;
         }
@@ -50,13 +46,13 @@ fn pieces(text: &str) -> Vec<Piece<'_>> {
 }
 
 fn fit(line: &str) -> Vec<&str> {
-    if len(line) <= MAX_CHUNK_CHARS {
+    if len(line) <= MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW {
         return vec![line];
     }
     sentences(line)
         .into_iter()
         .flat_map(|sentence| {
-            if len(sentence) <= MAX_CHUNK_CHARS {
+            if len(sentence) <= MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW {
                 vec![sentence]
             } else {
                 sentence.split_whitespace().flat_map(hard_split).collect()
@@ -87,7 +83,7 @@ fn hard_split(word: &str) -> Vec<&str> {
     let boundaries: Vec<usize> = word
         .char_indices()
         .map(|(index, _)| index)
-        .step_by(MAX_CHUNK_CHARS)
+        .step_by(MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW)
         .chain(std::iter::once(word.len()))
         .collect();
     boundaries
@@ -136,7 +132,11 @@ mod tests {
         let chunks = split(&text);
 
         assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|chunk| len(chunk) <= MAX_CHUNK_CHARS));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| len(chunk) <= MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW)
+        );
         assert_eq!(
             chunks
                 .iter()
@@ -153,7 +153,11 @@ mod tests {
 
         let chunks = split(&line);
 
-        assert!(chunks.iter().all(|chunk| len(chunk) <= MAX_CHUNK_CHARS));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| len(chunk) <= MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW)
+        );
         assert!(chunks.iter().all(|chunk| chunk.ends_with('.')));
     }
 
@@ -164,7 +168,11 @@ mod tests {
         let chunks = split(&sentence);
 
         assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|chunk| len(chunk) <= MAX_CHUNK_CHARS));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| len(chunk) <= MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW)
+        );
         assert_eq!(
             chunks
                 .iter()
@@ -176,12 +184,16 @@ mod tests {
 
     #[test]
     fn an_unbroken_run_of_text_is_cut_at_character_boundaries() {
-        let run = "ё".repeat(MAX_CHUNK_CHARS * 2 + 10);
+        let run = "ё".repeat(MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW * 2 + 10);
 
         let chunks = split(&run);
 
         assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|chunk| len(chunk) <= MAX_CHUNK_CHARS));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| len(chunk) <= MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW)
+        );
         assert_eq!(chunks.concat(), run);
     }
 }

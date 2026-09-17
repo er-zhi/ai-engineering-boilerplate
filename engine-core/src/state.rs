@@ -1,15 +1,9 @@
-// Applying a node's output to execution state: three reducers (Replace/Append/Merge) over
-// top-level keys, matching the spec's "State" section. Parallel branches from the same
-// super-step never race here — step() applies every output sequentially within one call.
+// Applies a node's output to execution state through one of three reducers.
 
 use serde_json::{Map, Value};
 
 use crate::graph::Reducer;
 
-/// Writes `value` into `state[key]` according to `reducer`. `Append` requires the existing value
-/// at `key` (if any) to already be an array — non-array existing values are replaced with a new
-/// single-element array rather than silently dropped, so an Append reducer on a fresh key
-/// behaves the same as on one already holding a list.
 pub fn apply_reducer(state: &mut Value, key: &str, reducer: Reducer, value: Value) {
     let object = state
         .as_object_mut()

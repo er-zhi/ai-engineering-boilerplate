@@ -1,19 +1,19 @@
-// Checks each request against the tier contract, routes it to a model, and records what the call cost and how it went.
+// Checks each completion request against the tier contract, routes it to a model, and records what the call cost and how it went.
 
 use std::time::Instant;
 
-use common::llm::{Sampling, fit_to_limits, limits};
-use common::proto::llm_router::v1::{CompleteRequest, CompleteResponse, FinishReason};
+use common::proto::llm_router::v1::{CompleteRequest, CompleteResponse, FinishReason, Sampling};
 use connectrpc::ConnectError;
 use serde_json::json;
 
 use crate::adapters::openai_compatible::request_body;
-use crate::entity::request::Outcome;
+use crate::audit::request::Outcome;
+use crate::llm::{fit_to_limits, limits};
 use crate::log::{Attempt, RequestLog};
 use crate::provider::{CallError, Prompt, Provider};
 use crate::router;
 use crate::tiers::Tiers;
-use crate::wire::{known_tier, response_from, sampling_from};
+use crate::wire::{known_tier, response_from};
 
 const NO_MODEL_ANSWERED: &str =
     "no model on this tier answered; the request log holds the provider's reply";
@@ -70,7 +70,7 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
                 Ok(response_from(answer))
             }
             Err(failed) => {
-                let (CallError::WorthRetrying(message) | CallError::Final(message)) = &failed.error;
+                let message = failed.error.message();
                 self.record(Attempt {
                     tier,
                     model_used: failed.model_used.clone(),
@@ -92,7 +92,9 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
                 );
                 Err(match failed.error {
                     CallError::WorthRetrying(_) => ConnectError::unavailable(NO_MODEL_ANSWERED),
-                    CallError::Final(_) => ConnectError::internal(PROVIDER_REFUSED),
+                    CallError::Refused(_) | CallError::Final(_) => {
+                        ConnectError::internal(PROVIDER_REFUSED)
+                    }
                 })
             }
         }
@@ -116,7 +118,7 @@ fn validated_prompt(request: CompleteRequest) -> Result<Prompt, ConnectError> {
         return Err(ConnectError::invalid_argument("user_prompt is required"));
     }
 
-    let mut sampling = sampling_from(request.sampling.into_option().unwrap_or_default());
+    let mut sampling = request.sampling.into_option().unwrap_or_default();
     validate_sampling(&sampling)?;
     fit_to_limits(
         &request.system_prompt,
@@ -208,12 +210,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use buffa::EnumValue;
-    use chrono::{DateTime, Utc};
-    use common::llm::limits as tier_limits;
-    use common::proto::llm_router::v1::{QualityTier, Sampling as WireSampling};
+    use common::proto::llm_router::v1::QualityTier;
     use sea_orm::DbErr;
 
     use super::*;
+    use crate::llm::limits as tier_limits;
     use crate::provider::Completion;
 
     #[derive(Clone)]
@@ -267,10 +268,6 @@ mod tests {
             self.attempts.lock().unwrap().push(attempt);
             Ok(())
         }
-
-        async fn drop_expired_payloads(&self, _now: DateTime<Utc>) -> Result<u64, DbErr> {
-            Ok(0)
-        }
     }
 
     fn answered() -> Result<Completion, CallError> {
@@ -301,7 +298,7 @@ mod tests {
         }
     }
 
-    async fn assert_sampling_refused(sampling: WireSampling, field: &str) {
+    async fn assert_sampling_refused(sampling: Sampling, field: &str) {
         let provider = Scripted::new(vec![answered()]);
         let log = Recorded::new();
         let router = Router::new(provider.clone(), log.clone(), tiers());
@@ -382,6 +379,33 @@ mod tests {
         );
     }
 
+    // Nothing of the caller's reaches a completion provider, so neither non-retryable arm is ever reported
+    // as the caller's own request, and neither one asks the backup.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_the_provider_would_not_take_is_this_services_own_to_own() {
+        for rejected in [
+            CallError::Final("the provider answered 400".to_owned()),
+            CallError::Refused("the provider answered 422".to_owned()),
+        ] {
+            let provider = Scripted::new(vec![Err(rejected)]);
+            let log = Recorded::new();
+            let router = Router::new(provider.clone(), log.clone(), tiers());
+
+            let error = router
+                .complete(asking(QualityTier::Low, "https://example.com"))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.code, connectrpc::ErrorCode::Internal, "{error:?}");
+            assert!(
+                format!("{error:?}").contains("refused this request"),
+                "{error:?}"
+            );
+            assert_eq!(provider.asked().len(), 1, "the backup is never asked");
+            assert_eq!(log.attempts(), 1);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_tier_the_router_does_not_serve_is_refused_before_any_model_is_called() {
         let provider = Scripted::new(vec![answered()]);
@@ -423,7 +447,7 @@ mod tests {
 
         let error = router
             .complete(CompleteRequest {
-                sampling: WireSampling {
+                sampling: Sampling {
                     max_tokens: Some(over_the_limit),
                     ..Default::default()
                 }
@@ -449,7 +473,7 @@ mod tests {
     async fn temperature_outside_zero_to_two_or_non_finite_is_refused() {
         for temperature in [-0.1, 2.1, f64::NAN, f64::INFINITY] {
             assert_sampling_refused(
-                WireSampling {
+                Sampling {
                     temperature: Some(temperature),
                     ..Default::default()
                 },
@@ -463,7 +487,7 @@ mod tests {
     async fn top_p_outside_zero_to_one_is_refused() {
         for top_p in [-0.1, 1.1] {
             assert_sampling_refused(
-                WireSampling {
+                Sampling {
                     top_p: Some(top_p),
                     ..Default::default()
                 },
@@ -476,7 +500,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn frequency_penalty_outside_minus_two_to_two_is_refused() {
         assert_sampling_refused(
-            WireSampling {
+            Sampling {
                 frequency_penalty: Some(2.1),
                 ..Default::default()
             },
@@ -488,7 +512,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn presence_penalty_outside_minus_two_to_two_is_refused() {
         assert_sampling_refused(
-            WireSampling {
+            Sampling {
                 presence_penalty: Some(-2.1),
                 ..Default::default()
             },
@@ -500,7 +524,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn more_than_four_stop_sequences_are_refused() {
         assert_sampling_refused(
-            WireSampling {
+            Sampling {
                 stop: vec!["x".to_owned(); MAX_STOP_SEQUENCES + 1],
                 ..Default::default()
             },
@@ -512,7 +536,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_individual_stop_sequence_over_the_byte_limit_is_refused() {
         assert_sampling_refused(
-            WireSampling {
+            Sampling {
                 stop: vec!["x".repeat(MAX_STOP_SEQUENCE_BYTES + 1)],
                 ..Default::default()
             },
@@ -524,7 +548,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stop_sequences_over_the_total_byte_limit_are_refused() {
         assert_sampling_refused(
-            WireSampling {
+            Sampling {
                 stop: vec!["x".repeat(MAX_TOTAL_STOP_BYTES / MAX_STOP_SEQUENCES + 1); 4],
                 ..Default::default()
             },
@@ -539,7 +563,7 @@ mod tests {
             .map(|token| (token.to_string(), 0.0))
             .collect();
         assert_sampling_refused(
-            WireSampling {
+            Sampling {
                 logit_bias,
                 ..Default::default()
             },
@@ -551,7 +575,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn logit_bias_values_outside_minus_one_hundred_to_one_hundred_are_refused() {
         assert_sampling_refused(
-            WireSampling {
+            Sampling {
                 logit_bias: [("42".to_owned(), 100.1)].into_iter().collect(),
                 ..Default::default()
             },
@@ -564,7 +588,7 @@ mod tests {
     async fn top_logprobs_outside_zero_to_twenty_are_refused() {
         for top_logprobs in [-1, MAX_TOP_LOGPROBS + 1] {
             assert_sampling_refused(
-                WireSampling {
+                Sampling {
                     top_logprobs: Some(top_logprobs),
                     ..Default::default()
                 },
@@ -581,7 +605,7 @@ mod tests {
 
         router
             .complete(CompleteRequest {
-                sampling: WireSampling {
+                sampling: Sampling {
                     temperature: Some(2.0),
                     top_p: Some(1.0),
                     stop: vec!["x".repeat(MAX_TOTAL_STOP_BYTES / MAX_STOP_SEQUENCES); 4],

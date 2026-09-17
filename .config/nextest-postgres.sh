@@ -34,33 +34,20 @@ until docker exec "$container_name" sh -c '[ "$(cat /proc/1/comm)" = postgres ]'
   sleep 0.25
 done
 
+# Every service whose tests take a database. A service missing here silently falls back to a
+# container of its own per test (`common::test_db::start`), which is what makes a suite slow.
+SCHEMAS="crawler gateway knowledge_base llm_router engine tool chat"
+
 bootstrap_roles() {
-  docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d postgres >/dev/null <<'SQL'
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'crawler_user') THEN
-    CREATE ROLE crawler_user LOGIN PASSWORD 'test';
+  for schema in $SCHEMAS; do
+    printf "DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%s_user') THEN
+    CREATE ROLE %s_user LOGIN PASSWORD 'test';
   END IF;
-END $$;
-ALTER ROLE crawler_user SET search_path TO crawler, public;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'gateway_user') THEN
-    CREATE ROLE gateway_user LOGIN PASSWORD 'test';
-  END IF;
-END $$;
-ALTER ROLE gateway_user SET search_path TO gateway, public;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'knowledge_base_user') THEN
-    CREATE ROLE knowledge_base_user LOGIN PASSWORD 'test';
-  END IF;
-END $$;
-ALTER ROLE knowledge_base_user SET search_path TO knowledge_base, public;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'llm_router_user') THEN
-    CREATE ROLE llm_router_user LOGIN PASSWORD 'test';
-  END IF;
-END $$;
-ALTER ROLE llm_router_user SET search_path TO llm_router, public;
-SQL
+END \$\$;
+ALTER ROLE %s_user SET search_path TO %s, public;
+" "$schema" "$schema" "$schema" "$schema"
+  done | docker exec -i "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d postgres >/dev/null
 }
 
 attempt=0

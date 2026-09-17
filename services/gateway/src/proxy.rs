@@ -30,18 +30,12 @@ pub(crate) const CRAWLER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CRAWLER_CALL_ATTEMPTS: usize = 3;
 const CRAWLER_RETRY_DELAY: Duration = Duration::from_millis(100);
 pub(crate) const KNOWLEDGE_BASE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-// SendTurn runs an LLM classification (up to 30s) before returning, so the unary bound must
-// outlast it.
-pub(crate) const CHAT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
-/// `StreamEvents` is a long-lived stream, and a client timeout is a *whole-call* deadline that
-/// connectrpc re-checks on every frame — the 10s unary bound would cut the browser's event feed
-/// after ten seconds, every time. Long and finite: `CallOptions` cannot express "no deadline".
-pub(crate) const CHAT_STREAM_CALL_TIMEOUT: Duration = Duration::from_secs(3_600);
+const CHAT_SEND_TURN_CLASSIFICATION_BUDGET: Duration = Duration::from_secs(30);
+pub(crate) const CHAT_CALL_TIMEOUT: Duration =
+    Duration::from_secs(CHAT_SEND_TURN_CLASSIFICATION_BUDGET.as_secs() * 2);
+pub(crate) const CHAT_STREAM_WHOLE_CALL_DEADLINE: Duration = Duration::from_secs(3_600);
 
-/// This deployment has exactly one logical user. Gateway authenticates a single shared password
-/// and stores nothing user-identifying on a session (`web.rs`: the session row's value is
-/// empty), so Chat's Principal-per-user-id model degenerates to this constant.
-const DEFAULT_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
+const SINGLE_TENANT_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 pub struct Gateway {
     pub(crate) crawler: CrawlerServiceClient<HttpClient>,
@@ -77,13 +71,6 @@ impl Gateway {
     }
 }
 
-/// Chat rejects any request without a Principal in its metadata (`chat`'s `require_principal`),
-/// and Gateway is its only caller — so every proxied Chat RPC carries one, built here.
-///
-/// The user id is the single-tenant constant above; the session id is the caller's own session
-/// token, read from the `Cookie` header exactly the way `require_session` reads it. That
-/// middleware has already validated this cookie by the time any of these handlers run, so a
-/// missing one means the request did not come through Gateway's session flow at all.
 fn chat_call_options(ctx: &RequestContext) -> Result<CallOptions, ConnectError> {
     let session_token = ctx
         .headers()
@@ -92,7 +79,7 @@ fn chat_call_options(ctx: &RequestContext) -> Result<CallOptions, ConnectError> 
         .and_then(|cookies| cookie_value(cookies, COOKIE_NAME))
         .ok_or_else(|| ConnectError::unauthenticated("no session cookie on the request"))?;
     CallOptions::default()
-        .with_header(USER_ID_HEADER, DEFAULT_USER_ID)
+        .with_header(USER_ID_HEADER, SINGLE_TENANT_USER_ID)
         .try_with_header(SESSION_ID_HEADER, session_token)
 }
 
@@ -271,7 +258,7 @@ impl ChatService for Gateway {
         ctx: RequestContext,
         request: ServiceRequest<'_, StreamEventsRequest>,
     ) -> ServiceResult<ServiceStream<ChatEvent>> {
-        let options = chat_call_options(&ctx)?.with_timeout(CHAT_STREAM_CALL_TIMEOUT);
+        let options = chat_call_options(&ctx)?.with_timeout(CHAT_STREAM_WHOLE_CALL_DEADLINE);
         let mut stream = self
             .chat
             .stream_events_with_options(request.to_owned_message(), options)
@@ -281,11 +268,13 @@ impl ChatService for Gateway {
             loop {
                 match stream.message::<ChatEvent>().await {
                     Ok(Some(item)) => {
-                        if sender.send(Ok(item.to_owned_message())).is_err() {
-                            break; // receiver dropped
+                        let receiver_still_listening =
+                            sender.send(Ok(item.to_owned_message())).is_ok();
+                        if !receiver_still_listening {
+                            break;
                         }
                     }
-                    Ok(None) => break, // clean end of stream
+                    Ok(None) => break,
                     Err(error) => {
                         let _ = sender.send(Err(error));
                         break;

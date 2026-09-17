@@ -1,14 +1,29 @@
-// engine.executions: one row per running/finished graph execution. current_nodes is a
-// denormalized copy of the latest checkpoint's position — written in the same transaction as
-// that checkpoint — so GetExecution never needs to join checkpoints (see the spec's "Схема БД").
-// state is intentionally NOT a column here: it lives only in checkpoints.
-//
-// Row-count bound (gate-database → "Growth"): a hot working set, not history — it holds only
-// executions that are still live, plus terminal ones inside `ENGINE_TERMINAL_RETENTION`, after
-// which `sweep::sweep_terminal` deletes them. Hot-path query: `lease::claim_one_ready`, once per
-// tick, covered by the partial index below.
+// The engine.executions table: live executions plus terminal ones inside ENGINE_TERMINAL_RETENTION; every tick claims one row through the partial indexes below.
 
 use sea_orm::entity::prelude::*;
+
+pub const LEASE_OWNER_MAX_LEN: u32 = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
+pub enum Status {
+    #[sea_orm(num_value = 0)]
+    Ready,
+    #[sea_orm(num_value = 1)]
+    Running,
+    #[sea_orm(num_value = 2)]
+    Waiting,
+    #[sea_orm(num_value = 3)]
+    Completed,
+    #[sea_orm(num_value = 4)]
+    Failed,
+    #[sea_orm(num_value = 5)]
+    Cancelled,
+}
+
+pub const CLAIMABLE_STATUSES: [Status; 3] = [Status::Ready, Status::Running, Status::Waiting];
+
+pub const TERMINAL_STATUSES: [Status; 3] = [Status::Completed, Status::Failed, Status::Cancelled];
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
@@ -20,17 +35,17 @@ pub struct Model {
     pub graph_id: String,
     pub graph_version: i32,
     pub user_id: Option<Uuid>,
-    #[sea_orm(column_type = "String(StringLen::N(32))")]
-    pub status: String, // Ready|Running|Waiting|Completed|Failed|Cancelled — Waiting's payload lives in current_nodes' sibling wait_kind column below
+    pub status: Status,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub wait_kind: Option<Json>,
     #[sea_orm(column_type = "JsonBinary")]
     pub current_nodes: Json,
-    pub iteration: i32,
-    pub max_iterations: i32,
+    pub iteration: i16,
+    pub max_iterations: i16,
     pub deadline: Option<DateTimeUtc>,
     #[sea_orm(column_type = "JsonBinary")]
     pub budget: Json,
+    #[sea_orm(column_type = "String(StringLen::N(LEASE_OWNER_MAX_LEN))")]
     pub lease_owner: Option<String>,
     pub lease_until: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
@@ -39,17 +54,37 @@ pub struct Model {
 
 impl ActiveModelBehavior for ActiveModel {}
 
-/// Partial index under `lease::claim_one_ready`: only rows a claim can pick enter it, so the
-/// terminal rows the claim will never want (the bulk of the table until `sweep::sweep_terminal`
-/// takes them away) cost it nothing. Same sanctioned mechanism as the `execution_events` lookup
-/// index — schema-sync has no way to express a partial index, so main.rs runs this right after it.
-///
-/// The predicate lists `waiting` as well, which the spec's version (`ready`/`running`) predates:
-/// `claim_one_ready` grew a third disjunct for elapsed `WaitKind::Timer` rows, and Postgres only
-/// uses a partial index when the query's own `WHERE` implies the index predicate. Leaving
-/// `waiting` out would put claimable rows outside the index and the claim would go back to a seq
-/// scan — the three statuses here are exactly the ones that query can return.
-pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 1] = [
+pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 2] = [
     "CREATE INDEX IF NOT EXISTS executions_claimable_updated_at_idx \
-     ON engine.executions (updated_at) WHERE status IN ('ready', 'running', 'waiting')",
+     ON engine.executions (updated_at) WHERE status IN (0, 1, 2)",
+    "CREATE INDEX IF NOT EXISTS executions_terminal_updated_at_idx \
+     ON engine.executions (updated_at) WHERE status IN (3, 4, 5)",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::ActiveEnum;
+
+    fn status_in_predicate(statuses: &[Status]) -> String {
+        let numbers: Vec<String> = statuses
+            .iter()
+            .map(|status| status.to_value().to_string())
+            .collect();
+        format!("status IN ({})", numbers.join(", "))
+    }
+
+    #[test]
+    fn the_index_predicates_list_exactly_the_statuses_they_are_named_for() {
+        let [claimable, terminal] = INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC;
+
+        assert!(
+            claimable.contains(&status_in_predicate(&CLAIMABLE_STATUSES)),
+            "{claimable}"
+        );
+        assert!(
+            terminal.contains(&status_in_predicate(&TERMINAL_STATUSES)),
+            "{terminal}"
+        );
+    }
+}

@@ -1,12 +1,12 @@
 // Test-only Postgres for the crawler: the shared container bootstrapped with this service's role and schema.
 
-use common::test_db::{ServiceSchema, TestDb};
+use common::test_db::{Entities, ServiceSchema, TestDb};
 
 const CRAWLER: ServiceSchema = ServiceSchema {
     schema: "crawler",
     role: "crawler_user",
     password_var: "CRAWLER_DB_PASSWORD",
-    entity_prefix: "crawler::entity::*",
+    entities: Entities::Registry("crawler::entity::*"),
 };
 
 pub async fn start() -> TestDb {

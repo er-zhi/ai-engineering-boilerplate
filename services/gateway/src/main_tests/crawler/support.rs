@@ -1,3 +1,5 @@
+// A fake Crawler and the clients the Crawler passthrough tests drive it with.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

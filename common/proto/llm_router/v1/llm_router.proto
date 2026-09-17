@@ -2,10 +2,19 @@ syntax = "proto3";
 
 package llm_router.v1;
 
+import "google/protobuf/struct.proto";
+
 service LlmRouterService {
   rpc Complete(CompleteRequest) returns (CompleteResponse);
   // The contract of every tier: what a caller may send, what it may ask back, and what to expect in return.
   rpc DescribeTiers(DescribeTiersRequest) returns (DescribeTiersResponse);
+}
+
+// A class of model apart from chat completion: a state plus typed questions in, typed calibrated answers out.
+service SystemOneService {
+  rpc Decide(DecideRequest) returns (DecideResponse);
+  // Which models of this class the configured provider serves.
+  rpc DescribeModels(DescribeModelsRequest) returns (DescribeModelsResponse);
 }
 
 enum QualityTier {
@@ -78,4 +87,114 @@ message CompleteResponse {
   int32 tokens_out = 4;
   bool used_backup = 5;
   FinishReason finish_reason = 6;
+}
+
+// Questions are repeated rather than a map: option and level order reaches the model, and proto maps have none.
+message DecideRequest {
+  // The JSON the model reads about. Two consequences of google.protobuf.Value to plan for: every number
+  // arrives as a double, so a large int64 loses precision and {"days": 3} reaches the model as 3.0; and an
+  // object's keys reach the model re-sorted alphabetically, because Struct is a map. Send an array where the
+  // order of the entries is part of what you are asking about.
+  google.protobuf.Value state = 1;
+  repeated Question questions = 2;
+}
+
+message Question {
+  string id = 1;
+  // What to judge. Carries the same two google.protobuf.Value consequences as DecideRequest.state: every
+  // number arrives as a double, and an object's keys reach the model re-sorted alphabetically, so an
+  // instruction whose order matters belongs in an array.
+  google.protobuf.Value instructions = 2;
+  oneof kind {
+    Noul noul = 3;
+    Choice choice = 4;
+    Score score = 5;
+  }
+}
+
+// A calibrated true/false: the descriptions are what "true" and "false" mean here.
+message Noul {
+  optional string when_true = 1;
+  optional string when_false = 2;
+}
+
+message Choice {
+  repeated ChoiceOption options = 1;
+}
+
+message ChoiceOption {
+  string name = 1;
+  // An option may go undescribed; the provider is sent JSON null for it.
+  optional string description = 2;
+}
+
+// An ordered scale, lowest level first.
+message Score {
+  repeated string levels = 1;
+}
+
+message DecideResponse {
+  string model_used = 1;
+  repeated Answer answers = 2;
+  int32 tokens_in = 3;
+  int32 tokens_out = 4;
+}
+
+message Answer {
+  string id = 1;
+  oneof answer {
+    NoulAnswer noul = 2;
+    ChoiceAnswer choice = 3;
+    ScoreAnswer score = 4;
+  }
+}
+
+message NoulAnswer {
+  double noul = 1;
+}
+
+message ChoiceAnswer {
+  string choice = 1;
+  map<string, double> probabilities = 2;
+  double confidence = 3;
+}
+
+message ScoreAnswer {
+  double score = 1;
+  map<uint32, string> legend = 2;
+  map<uint32, double> probabilities = 3;
+  double confidence = 4;
+}
+
+message DescribeModelsRequest {}
+
+message DescribeModelsResponse {
+  repeated ModelCard models = 1;
+  // What Decide accepts before it spends anything, so a caller in another language can check a request
+  // before sending it — this class's counterpart to TierContract.
+  DecisionBudget budget = 2;
+}
+
+// Every ceiling Decide enforces locally, rendered from the constants it enforces them with, so the published
+// budget and the check cannot drift. A request inside all of these is never refused for its size.
+message DecisionBudget {
+  int32 max_questions = 1;
+  int32 max_question_id_bytes = 2;
+  // instructions and state are measured as the bytes of the JSON they stand for, not as proto bytes.
+  int32 max_instructions_bytes = 3;
+  int32 max_state_bytes = 4;
+  int32 max_choice_options = 5;
+  int32 max_option_name_bytes = 6;
+  int32 max_option_description_bytes = 7;
+  int32 min_score_levels = 8;
+  int32 max_score_levels = 9;
+  // One score level's text, and each of a noul's when_true / when_false criteria.
+  int32 max_level_bytes = 10;
+}
+
+message ModelCard {
+  string name = 1;
+  string description = 2;
+  // RFC 3339
+  string release_date = 3;
 }

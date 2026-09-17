@@ -2,23 +2,18 @@
 
 use std::time::Duration;
 
-use common::llm::{Sampling, reasoning_enabled};
-use common::proto::llm_router::v1::{FinishReason, ResponseFormat};
+use common::proto::llm_router::v1::{FinishReason, ResponseFormat, Sampling};
 use serde_json::{Value, json};
 
+use crate::adapters::{
+    ClientFaults, KeyCheck, as_count, error_for_status, key_accepted, read_provider_response,
+    unreachable_provider,
+};
+use crate::llm::reasoning_enabled;
 use crate::provider::{CallError, Completion, Prompt, Provider};
 
 const COMPLETIONS_PATH: &str = "/chat/completions";
 const KEY_PATH: &str = "/key";
-const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const TOO_MANY_REQUESTS: u16 = 429;
-const FIRST_SERVER_FAULT: u16 = 500;
-
-#[derive(Debug, PartialEq)]
-pub enum KeyCheck {
-    Rejected,
-    Unreachable(String),
-}
 
 pub struct OpenAiCompatible {
     http: reqwest::Client,
@@ -48,10 +43,7 @@ impl OpenAiCompatible {
             .await
             .map_err(|error| KeyCheck::Unreachable(error.to_string()))?;
 
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(KeyCheck::Rejected);
-        }
-        Ok(())
+        key_accepted(response.status())
     }
 }
 
@@ -64,51 +56,21 @@ impl Provider for OpenAiCompatible {
             .json(&request_body(model, prompt))
             .send()
             .await
-            .map_err(|error| {
-                CallError::WorthRetrying(if error.is_timeout() {
-                    "the provider did not answer in time".to_owned()
-                } else {
-                    format!("could not reach the provider: {error}")
-                })
-            })?;
+            .map_err(unreachable_provider)?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(error_for_status(status.as_u16()));
+            // Nothing of the caller's reaches the provider here: the prompt is this service's own.
+            return Err(error_for_status(
+                status.as_u16(),
+                None,
+                ClientFaults::AlwaysFinal,
+            ));
         }
 
         let body = read_provider_response(response).await?;
         read_completion(&body)
     }
-}
-
-async fn read_provider_response(mut response: reqwest::Response) -> Result<Value, CallError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
-    {
-        return Err(provider_response_too_large());
-    }
-
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        CallError::WorthRetrying(format!("the provider sent a reply we cannot read: {error}"))
-    })? {
-        if chunk.len() > MAX_PROVIDER_RESPONSE_BYTES.saturating_sub(bytes.len()) {
-            return Err(provider_response_too_large());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-
-    serde_json::from_slice(&bytes).map_err(|error| {
-        CallError::WorthRetrying(format!("the provider sent a reply we cannot read: {error}"))
-    })
-}
-
-fn provider_response_too_large() -> CallError {
-    CallError::WorthRetrying(format!(
-        "the provider response is larger than {MAX_PROVIDER_RESPONSE_BYTES} bytes"
-    ))
 }
 
 pub fn request_body(model: &str, prompt: &Prompt) -> Value {
@@ -136,8 +98,10 @@ fn read_completion(body: &Value) -> Result<Completion, CallError> {
 
     let content = choice["message"]["content"].as_str().unwrap_or_default();
     if content.is_empty() {
-        let reasoning_tokens =
-            as_count(&body["usage"]["completion_tokens_details"]["reasoning_tokens"]);
+        let reasoning_tokens = as_count(
+            "reasoning_tokens",
+            &body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        );
         return Err(if reasoning_tokens > 0 {
             CallError::Final(format!(
                 "the model spent {reasoning_tokens} completion tokens on reasoning and returned no content"
@@ -166,15 +130,6 @@ fn finish_reason_from(reported: &str) -> FinishReason {
     }
 }
 
-fn error_for_status(status: u16) -> CallError {
-    let message = format!("the provider answered {status}");
-    if status == TOO_MANY_REQUESTS || status >= FIRST_SERVER_FAULT {
-        CallError::WorthRetrying(message)
-    } else {
-        CallError::Final(message)
-    }
-}
-
 fn apply_sampling(body: &mut Value, sampling: &Sampling) {
     set_if_present(body, "temperature", sampling.temperature);
     set_if_present(body, "top_p", sampling.top_p);
@@ -191,7 +146,10 @@ fn apply_sampling(body: &mut Value, sampling: &Sampling) {
     if !sampling.logit_bias.is_empty() {
         body["logit_bias"] = json!(sampling.logit_bias);
     }
-    let named_format = match sampling.response_format {
+    let named_format = match sampling
+        .response_format
+        .and_then(|format| format.as_known())
+    {
         Some(ResponseFormat::Text) => Some("text"),
         Some(ResponseFormat::JsonObject) => Some("json_object"),
         Some(ResponseFormat::Unspecified) | None => None,
@@ -208,22 +166,17 @@ fn set_if_present(body: &mut Value, field: &str, value: Option<impl Into<Value>>
 }
 
 fn usage_count(body: &Value, field: &str) -> i32 {
-    as_count(&body["usage"][field])
-}
-
-fn as_count(value: &Value) -> i32 {
-    value
-        .as_i64()
-        .and_then(|count| i32::try_from(count).ok())
-        .unwrap_or_default()
+    as_count(field, &body["usage"][field])
 }
 
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
+    use buffa::EnumValue;
     use common::proto::llm_router::v1::QualityTier;
 
     use super::*;
+    use crate::adapters::MAX_PROVIDER_RESPONSE_BYTES;
     use crate::test_provider::TestProvider;
 
     const PATIENT_ENOUGH: Duration = Duration::from_secs(5);
@@ -266,11 +219,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_key_the_provider_rejects_stops_the_service_from_starting() {
-        let stub = TestProvider::answering_key(StatusCode::UNAUTHORIZED).await;
-        let adapter = adapter_for(&stub, PATIENT_ENOUGH).await;
+    async fn any_client_fault_on_the_key_stops_the_service_from_starting() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+        ] {
+            let stub = TestProvider::answering_key(status).await;
+            let adapter = adapter_for(&stub, PATIENT_ENOUGH).await;
 
-        assert_eq!(adapter.verify_key().await, Err(KeyCheck::Rejected));
+            assert_eq!(
+                adapter.verify_key().await,
+                Err(KeyCheck::Rejected),
+                "{status} on the key path is a key or a base URL this deployment cannot use"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -282,11 +245,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_provider_that_cannot_check_keys_does_not_block_the_start() {
-        let stub = TestProvider::answering_key(StatusCode::NOT_FOUND).await;
-        let adapter = adapter_for(&stub, PATIENT_ENOUGH).await;
+    async fn a_provider_that_cannot_be_reached_at_all_does_not_block_the_start() {
+        let adapter = OpenAiCompatible::new(
+            "http://127.0.0.1:1".to_owned(),
+            TEST_KEY.to_owned(),
+            PATIENT_ENOUGH,
+        )
+        .unwrap();
 
-        adapter.verify_key().await.unwrap();
+        assert!(matches!(
+            adapter.verify_key().await,
+            Err(KeyCheck::Unreachable(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -436,7 +406,8 @@ mod tests {
             logit_bias: [("1234".to_owned(), -100.0)].into_iter().collect(),
             logprobs: Some(true),
             top_logprobs: Some(3),
-            response_format: Some(ResponseFormat::JsonObject),
+            response_format: Some(EnumValue::Known(ResponseFormat::JsonObject)),
+            ..Sampling::default()
         };
 
         let body = request_body(
@@ -458,6 +429,38 @@ mod tests {
         assert_eq!(body["logprobs"], json!(true));
         assert_eq!(body["top_logprobs"], json!(3));
         assert_eq!(body["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[test]
+    fn a_response_format_we_do_not_know_is_not_sent() {
+        let body = request_body(
+            "deepseek/deepseek-v4-flash",
+            &Prompt {
+                sampling: Sampling {
+                    response_format: Some(EnumValue::Unknown(99)),
+                    ..Sampling::default()
+                },
+                ..prompt(QualityTier::Low)
+            },
+        );
+
+        assert_eq!(body.get("response_format"), None);
+    }
+
+    #[test]
+    fn a_response_format_the_caller_left_unspecified_is_not_sent() {
+        let body = request_body(
+            "deepseek/deepseek-v4-flash",
+            &Prompt {
+                sampling: Sampling {
+                    response_format: Some(EnumValue::Known(ResponseFormat::Unspecified)),
+                    ..Sampling::default()
+                },
+                ..prompt(QualityTier::Low)
+            },
+        );
+
+        assert_eq!(body.get("response_format"), None);
     }
 
     #[test]
@@ -527,23 +530,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rate_limits_and_server_faults_are_worth_retrying() {
-        for status in [429, 500, 502, 503] {
-            assert!(
-                matches!(error_for_status(status), CallError::WorthRetrying(_)),
-                "status {status} should reach the backup"
-            );
-        }
-    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limit_on_the_key_probe_does_not_stop_the_service_from_starting() {
+        let stub = TestProvider::answering_key(StatusCode::TOO_MANY_REQUESTS).await;
+        let adapter = adapter_for(&stub, PATIENT_ENOUGH).await;
 
-    #[test]
-    fn a_rejected_request_is_not_retried() {
-        for status in [400, 401, 403, 404] {
-            assert!(
-                matches!(error_for_status(status), CallError::Final(_)),
-                "status {status} should not reach the backup"
-            );
-        }
+        assert!(
+            matches!(adapter.verify_key().await, Err(KeyCheck::Unreachable(_))),
+            "a rate limiter must not crash-loop the container"
+        );
     }
 }

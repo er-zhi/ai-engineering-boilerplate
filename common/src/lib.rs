@@ -1,8 +1,7 @@
 // Connect service stubs and message types generated from common/proto, shared by every service.
 
-pub mod cache;
+pub mod execution_input;
 pub mod extract;
-pub mod llm;
 pub mod logging;
 pub mod principal;
 #[cfg(feature = "test-support")]

@@ -1,27 +1,19 @@
-// web_fetch: GET a URL, extract its readable text the same way the crawler does (common::extract
-// — the second consumer that moved it there). A byte cap keeps a pathological page from being
-// handed to extraction (the response body is still buffered whole by reqwest first — the cap
-// bounds what gets parsed, not peak download memory), same order of magnitude as the crawler's
-// own cap. SSRF guarding (`ensure_public_url`) lives here too but is deliberately NOT called by
-// `fetch()` itself — the caller (`Service::run_web_fetch`, the actual untrusted-LLM-input
-// boundary) applies it before calling `fetch`, mirroring where `services/crawler/src/main.rs`
-// applies its own `validate_base_url` (at the RPC boundary, not inside the fetch primitive) —
-// this keeps `fetch()` itself loopback-friendly for its own tests below.
+// web_fetch: GET a URL and extract its readable text, plus the SSRF guard its callers apply.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
+use common::extract::Extracted;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use http::Uri;
+use serde_json::{Value, json};
 
 const MAX_FETCH_BYTES: usize = 5 * 1024 * 1024;
+const MIN_READABLE_TEXT_CHARS: usize = 40;
+const ANSWERS_BEFORE_CHOOSING: usize = 2;
 const MAX_URL_CHARS: usize = 4096;
 
-/// Rejects a URL that isn't an absolute http(s) URL resolving only to public addresses — blocks
-/// SSRF via loopback/private/link-local targets (e.g. the cloud metadata endpoint
-/// `169.254.169.254`, or reaching another container on this stack like `postgres:5432`), the
-/// same protection `services/crawler/src/main.rs`'s `validate_base_url`/`is_private_ip` already
-/// gives crawl targets.
 pub async fn ensure_public_url(raw: &str) -> Result<(), String> {
     if raw.is_empty() {
         return Err("url is required".to_owned());
@@ -94,28 +86,16 @@ fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct FetchedPage {
-    pub title: String,
-    pub text: String,
+#[must_use]
+pub fn readable_page_json(page: &Extracted) -> Value {
+    json!({"title": page.title, "text": page.main_text})
 }
 
-/// Why a `reqwest` send failed, in words an LLM can act on. reqwest's own Display for a transport
-/// failure is the near-useless "error sending request for url (...)" whatever went wrong, so an
-/// agent reading the error back as an observation can't tell "try again" from "this host will
-/// never answer me, use web_search instead".
-fn send_error(url: &str, error: &reqwest::Error) -> String {
+fn readable_send_failure(url: &str, error: &reqwest::Error) -> String {
     let reason = if error.is_timeout() {
         "timed out".to_owned()
     } else if error.is_connect() {
-        // DNS failure, refused connection and TLS failure all surface as connect errors; the
-        // source chain is the only thing that separates them.
-        let mut source: Option<&dyn std::error::Error> = std::error::Error::source(error);
-        let mut detail = String::new();
-        while let Some(current) = source {
-            detail = current.to_string();
-            source = current.source();
-        }
+        let detail = deepest_source(error);
         let lowered = detail.to_lowercase();
         if lowered.contains("dns") || lowered.contains("name or service not known") {
             format!("host could not be resolved ({detail})")
@@ -136,53 +116,86 @@ fn send_error(url: &str, error: &reqwest::Error) -> String {
     format!("fetch {url} failed: {reason}")
 }
 
-pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<FetchedPage, String> {
-    let response = client
+fn deepest_source(error: &reqwest::Error) -> String {
+    let mut source: Option<&dyn std::error::Error> = std::error::Error::source(error);
+    let mut detail = String::new();
+    while let Some(current) = source {
+        detail = current.to_string();
+        source = current.source();
+    }
+    detail
+}
+
+pub async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<Extracted, String> {
+    let mut response = client
         .get(url)
+        .timeout(timeout)
         .send()
         .await
-        .map_err(|e| send_error(url, &e))?;
+        .map_err(|e| readable_send_failure(url, &e))?;
     if !response.status().is_success() {
         return Err(format!("fetch {url} returned {}", response.status()));
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_FETCH_BYTES {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| readable_send_failure(url, &e))?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_FETCH_BYTES {
+            return Err(format!(
+                "{url} exceeded {MAX_FETCH_BYTES} bytes, refusing to download the rest"
+            ));
+        }
+    }
+    let page = common::extract::extract(url, &String::from_utf8_lossy(&body));
+    if page.main_text.chars().count() < MIN_READABLE_TEXT_CHARS {
         return Err(format!(
-            "{url} exceeded {MAX_FETCH_BYTES} bytes, refusing to parse"
+            "fetch {url} extracted under {MIN_READABLE_TEXT_CHARS} characters of text, \
+             so the page carried no readable content to answer from"
         ));
     }
-    let html = String::from_utf8_lossy(&bytes);
-    let extracted = common::extract::extract(url, &html);
-    Ok(FetchedPage {
-        title: extracted.title,
-        text: extracted.main_text,
-    })
+    Ok(page)
 }
 
-/// Fetches every URL concurrently and returns the first page that comes back, dropping the rest.
-/// Public pages carrying the same fact are individually unreliable — one 403s a datacentre IP,
-/// another answers with a JavaScript shell, a third is just slow — so an agent handed a single
-/// URL spends a whole turn per failure. Racing the candidates it already has costs one turn
-/// whatever any single source does. All of them failing is one error listing every reason, so the
-/// model can tell "try other pages" from "this question needs a different search".
-pub async fn fetch_first(client: &reqwest::Client, urls: &[String]) -> Result<FetchedPage, String> {
+pub async fn fetch_richest(
+    client: &reqwest::Client,
+    urls: &[String],
+    timeout: Duration,
+) -> Result<Extracted, String> {
     let mut running: FuturesUnordered<_> = urls
         .iter()
-        .map(|url| async move { (url, fetch(client, url).await) })
+        .map(|url| async move { (url, fetch(client, url, timeout).await) })
         .collect();
+    let mut answered: Vec<Extracted> = Vec::new();
     let mut errors = Vec::new();
     while let Some((url, result)) = running.next().await {
         match result {
-            Ok(page) => return Ok(page),
+            Ok(page) => {
+                answered.push(page);
+                if answered.len() >= ANSWERS_BEFORE_CHOOSING {
+                    break;
+                }
+            }
             Err(error) => errors.push(format!("{url}: {error}")),
         }
     }
-    Err(format!("every url failed — {}", errors.join("; ")))
+    answered
+        .into_iter()
+        .max_by_key(|page| page.main_text.len())
+        .ok_or_else(|| format!("every url failed — {}", errors.join("; ")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[tokio::test]
     async fn accepts_absolute_http_and_https_urls_on_public_hosts() {
@@ -228,6 +241,22 @@ mod tests {
         format!("http://{address}/page")
     }
 
+    async fn serve_after(delay: Duration, html: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/page",
+            axum::routing::get(move || async move {
+                tokio::time::sleep(delay).await;
+                axum::response::Html(html)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}/page")
+    }
+
     #[tokio::test]
     async fn fetch_extracts_title_and_text() {
         let url = serve(
@@ -236,15 +265,45 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
-        let page = fetch(&client, &url).await.expect("fetch");
+        let page = fetch(&client, &url, TEST_TIMEOUT).await.expect("fetch");
 
-        assert!(page.text.contains("Borrowing lets code use a value"));
+        assert!(page.main_text.contains("Borrowing lets code use a value"));
+        assert_eq!(
+            readable_page_json(&page),
+            json!({"title": "Hi", "text": page.main_text})
+        );
     }
 
-    /// The point of racing: the caller hands over candidates without knowing which host will
-    /// actually answer, and a dead one costs latency rather than the answer.
     #[tokio::test]
-    async fn fetch_first_returns_the_page_from_whichever_url_answers() {
+    async fn an_endless_body_is_abandoned_once_it_passes_the_cap() {
+        let app = axum::Router::new().route(
+            "/endless",
+            axum::routing::get(|| async {
+                axum::body::Body::from_stream(futures::stream::repeat_with(|| {
+                    Ok::<_, std::io::Error>(vec![b'x'; 64 * 1024])
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let client = reqwest::Client::new();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            fetch(&client, &format!("http://{address}/endless"), TEST_TIMEOUT),
+        )
+        .await
+        .expect("a body that never ends must not be buffered whole")
+        .unwrap_err();
+
+        assert!(error.contains(&MAX_FETCH_BYTES.to_string()), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_page_carrying_the_most_text_wins_not_the_one_that_answers_first() {
         let working = serve(
             "<html><head><title>Hi</title></head><body><article><p>Borrowing lets code use a value without taking ownership of it, which the borrow checker enforces.</p></article></body></html>",
         )
@@ -252,29 +311,96 @@ mod tests {
         let dead = "http://127.0.0.1:1/nothing".to_owned();
         let client = reqwest::Client::new();
 
-        let page = fetch_first(&client, &[dead.clone(), working])
+        let page = fetch_richest(&client, &[dead.clone(), working], TEST_TIMEOUT)
             .await
             .expect("one url answered");
 
-        assert!(page.text.contains("Borrowing lets code use a value"));
+        assert!(page.main_text.contains("Borrowing lets code use a value"));
     }
 
     #[tokio::test]
-    async fn fetch_first_reports_every_url_when_none_answer() {
+    async fn a_thin_page_that_answers_first_loses_to_a_fuller_one() {
+        let thin = serve(
+            "<html><head><title>Hi</title></head><body><article><p>This page says almost nothing at all about it.</p></article></body></html>",
+        )
+        .await;
+        let full = serve(ARTICLE_PAGE).await;
         let client = reqwest::Client::new();
 
-        let error = fetch_first(
+        let page = fetch_richest(&client, &[thin, full], TEST_TIMEOUT)
+            .await
+            .expect("both answered");
+
+        assert!(page.main_text.contains("Borrowing lets code use a value"));
+    }
+
+    #[tokio::test]
+    async fn a_third_url_does_not_hold_the_answer_back_once_two_have_replied() {
+        let first = serve(ARTICLE_PAGE).await;
+        let second = serve(ARTICLE_PAGE).await;
+        let never = serve_after(Duration::from_secs(30), ARTICLE_PAGE).await;
+        let client = reqwest::Client::new();
+
+        let page = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_richest(&client, &[first, second, never], TEST_TIMEOUT),
+        )
+        .await
+        .expect("two answers are enough to decide")
+        .expect("both answered");
+
+        assert!(page.main_text.contains("Borrowing lets code use a value"));
+    }
+
+    #[tokio::test]
+    async fn every_url_is_named_when_none_answer() {
+        let client = reqwest::Client::new();
+
+        let error = fetch_richest(
             &client,
             &[
                 "http://127.0.0.1:1/a".to_owned(),
                 "http://127.0.0.1:2/b".to_owned(),
             ],
+            TEST_TIMEOUT,
         )
         .await
         .expect_err("both urls are dead");
 
         assert!(error.contains("127.0.0.1:1/a"), "{error}");
         assert!(error.contains("127.0.0.1:2/b"), "{error}");
+    }
+
+    const ARTICLE_PAGE: &str = "<html><head><title>Hi</title></head><body><article><p>Borrowing lets code use a value without taking ownership of it, which the borrow checker enforces.</p></article></body></html>";
+    const SCRIPT_SHELL_PAGE: &str = "<html><head><title>Conditions and Forecast</title></head><body><div id=\"root\"></div><script src=\"/app.js\"></script></body></html>";
+
+    #[tokio::test]
+    async fn a_page_that_extracts_no_usable_text_fails_and_names_the_url() {
+        let url = serve(SCRIPT_SHELL_PAGE).await;
+        let client = reqwest::Client::new();
+
+        let error = fetch(&client, &url, TEST_TIMEOUT)
+            .await
+            .expect_err("a page whose body is rendered by script carries no text");
+
+        assert!(error.contains(&url), "{error}");
+        assert!(
+            error.contains(&MIN_READABLE_TEXT_CHARS.to_string()),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_that_extracted_nothing_usable_is_passed_over() {
+        let empty = serve(SCRIPT_SHELL_PAGE).await;
+        let readable = serve(ARTICLE_PAGE).await;
+        let client = reqwest::Client::new();
+
+        let page = fetch_richest(&client, &[empty, readable], TEST_TIMEOUT)
+            .await
+            .expect("one url carried real text");
+
+        assert!(page.main_text.contains("Borrowing lets code use a value"));
     }
 
     #[tokio::test]
@@ -290,7 +416,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
         let client = reqwest::Client::new();
 
-        let error = fetch(&client, &format!("http://{address}/missing"))
+        let error = fetch(&client, &format!("http://{address}/missing"), TEST_TIMEOUT)
             .await
             .unwrap_err();
 
@@ -301,10 +427,11 @@ mod tests {
     async fn a_transport_failure_says_what_actually_went_wrong() {
         let client = reqwest::Client::new();
 
-        // Nothing listens on port 1 — a connect failure, not reqwest's generic "error sending
-        // request for url".
-        let error = fetch(&client, "http://127.0.0.1:1/page").await.unwrap_err();
-        assert!(error.contains("http://127.0.0.1:1/page"), "{error}");
+        let unused_port = "http://127.0.0.1:1/page";
+
+        let error = fetch(&client, unused_port, TEST_TIMEOUT).await.unwrap_err();
+
+        assert!(error.contains(unused_port), "{error}");
         assert!(
             error.contains("connect") || error.contains("refused"),
             "{error}"
@@ -326,14 +453,15 @@ mod tests {
             .expect("bind");
         let address = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(50))
-            .build()
-            .expect("client");
+        let client = reqwest::Client::new();
 
-        let error = fetch(&client, &format!("http://{address}/slow"))
-            .await
-            .unwrap_err();
+        let error = fetch(
+            &client,
+            &format!("http://{address}/slow"),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
 
         assert!(error.contains("timed out"), "{error}");
     }

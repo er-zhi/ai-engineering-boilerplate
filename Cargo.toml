@@ -27,6 +27,7 @@ connectrpc-build = "0.9"
 buffa = { version = "0.9", features = ["json"] }
 buffa-types = { version = "0.9", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
+schemars = "1.2"
 axum = "0.8"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 regex = "1"
@@ -55,6 +56,7 @@ tower-http = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 common = { path = "common", version = "0.1.0" }
+engine-core = { path = "engine-core", version = "0.1.0" }
 http = "1"
 tokio-stream = "0.1"
 futures = "0.3"

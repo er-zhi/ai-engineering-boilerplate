@@ -17,6 +17,13 @@ Jobs move from `QUEUED` to `RUNNING`, then `DONE` or `FAILED`. An optional `idem
 
 The pipeline uses bounded channels with capacity one. If a stage loses a fetched page, the job fails instead of silently reporting incomplete success. `pages_skipped` is reserved for future crawl-side skipping and currently remains zero.
 
+The tokio worker pool is a fixed 8 threads rather than a CPU-derived count. `crawl_into`'s spider
+callback gets its backpressure from `block_in_place` plus a blocking send, and `block_in_place`
+converts a worker thread into a blocking one until a replacement spins up — so the pool must be
+strictly larger than the number of threads that can be parked that way at once. A CPU-derived count
+is the wrong basis for that, because a Compose `cpus:` quota does not reduce tokio's default worker
+count. `main.rs` keeps the relationship as a compile-time assertion.
+
 ## Scope
 
 | Field | Effect |

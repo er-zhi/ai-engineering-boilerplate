@@ -21,6 +21,7 @@ connectrpc = { workspace = true, features = ["axum", "client"] }
 futures = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
+schemars = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +35,10 @@ uuid = { workspace = true }
 test-support = ["common/test-support"]
 
 [dev-dependencies]
+# Depending on ourselves turns on `test-support` for the test targets alone, so the unit tests
+# that need `test_db` are compiled by a plain `cargo nextest run --workspace` instead of being
+# silently skipped until someone remembers `--all-features`.
+tool = { path = ".", features = ["test-support"] }
 axum = { workspace = true }
 common = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

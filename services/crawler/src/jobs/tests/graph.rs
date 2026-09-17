@@ -157,9 +157,3 @@ async fn a_failing_graph_store_does_not_fail_the_job_or_skip_knowledge_base() {
     );
 }
 
-fn only_docs() -> Scope {
-    Scope::new(&CrawlScope {
-        include_patterns: vec!["/docs/*".into()],
-        ..Default::default()
-    })
-}

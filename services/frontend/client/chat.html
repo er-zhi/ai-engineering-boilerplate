@@ -1,12 +1,8 @@
 <!doctype html>
+<!-- The chat page: one transcript for every topic, rebuilt from GetSession and fed by StreamEvents. -->
 <meta charset="utf-8">
 <title>Chat</title>
 <style>
-  /* The whole page is exactly one viewport tall and never scrolls as a document: each pane
-     (transcript, topic list, debug log) owns its own scrollbar instead, so the layout stays put
-     however many topics the session accumulates. Every ancestor of a scrolling pane needs
-     `min-height: 0` — a flex item's default `min-height: auto` refuses to shrink below its
-     content, which is what would otherwise push the page past 100vh. */
   body { font: 14px/1.5 system-ui, sans-serif; height: 100vh; box-sizing: border-box; margin: 0; padding: 1.5rem 1rem; overflow: hidden; display: flex; gap: 1.5rem; }
   .logout { position: absolute; top: 1.5rem; right: 1rem; }
   .logout button { background: none; border: none; text-decoration: underline; padding: 0; font: inherit; color: inherit; cursor: pointer; }
@@ -20,15 +16,11 @@
   .topic-row:hover { background: #f4f4f4; }
   .topic-row.focus { background: #eef; font-weight: 600; }
   .topic-row .status { color: #666; font-size: .8em; }
-  /* Stays pinned below the scrolling topic list rather than scrolling away with it. */
   #newSession { width: 100%; margin-top: .5rem; padding: .5rem; cursor: pointer; flex-shrink: 0; }
-  /* Which topic a line belongs to. One transcript carries every topic's turns, so without this
-     label an answer from a background topic reads as a reply to the last thing typed. */
   .msg .topic { color: #66a; font-size: .75em; margin-right: .35em; }
   #transcript { flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; padding: .75rem; margin-bottom: .75rem; }
   .msg { padding: .4rem 0; border-bottom: 1px solid #f4f4f4; }
-  .msg.notification { color: #444; font-style: italic; }
-  .msg.ack { color: #444; font-style: italic; }
+  .msg.notification, .msg.ack { color: #444; font-style: italic; }
   .msg .kind { color: #999; font-size: .75em; }
   .msg code { background: #f4f4f4; border-radius: 3px; padding: .1em .3em; font: 12px/1.4 ui-monospace, monospace; }
   .msg strong { font-weight: 600; }
@@ -39,15 +31,13 @@
   button { padding: .5rem 1.2rem; font: inherit; cursor: pointer; }
   .error { color: #b00; }
   aside.debug { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; }
-  aside.debug h2 { display: flex; justify-content: space-between; align-items: center; }
+  aside.debug h2 { display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
   aside.debug h2 button { font-size: .75em; padding: .15rem .5rem; }
-  aside.debug h2 { flex-shrink: 0; }
   #debugLog { flex: 1; min-height: 0; overflow-y: auto; background: #1e1e1e; color: #ddd; font: 11px/1.5 ui-monospace, monospace; border-radius: 4px; padding: .5rem; }
   .debug-entry { padding: .2rem 0; border-bottom: 1px solid #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
   .debug-entry.open { white-space: pre-wrap; word-break: break-all; }
   .debug-entry .ts { color: #888; }
   .debug-entry .kind { color: #7fc; }
-  .debug-entry .topic { color: #fc7; }
   .debug-entry.meta { color: #999; font-style: italic; }
   .debug-entry.err { color: #f77; }
 </style>
@@ -71,7 +61,7 @@
   </aside>
 </div>
 
-<aside class="debug" id="debugPanel">
+<aside class="debug">
   <h2>Session debug <button id="debugClear" type="button">clear</button></h2>
   <div id="debugLog"></div>
 </aside>
@@ -83,10 +73,23 @@
   const debugLog = document.getElementById("debugLog");
   const DEBUG_MAX_ENTRIES = 500;
   let focusTopicId = null;
-  // What the server last told us its focus is — `focusTopicId` is what we're *showing*, and the
-  // two diverge whenever a topic completes (the server moves focus on, or clears it).
-  let serverFocusTopicId = null;
   let topics = [];
+
+  const TOPIC_STATUS_PREFIX = "TOPIC_STATUS_";
+  const EVENT_KIND_PREFIX = "CHAT_EVENT_KIND_";
+  const QUEUED = `${TOPIC_STATUS_PREFIX}QUEUED`;
+  const COMPLETED = `${TOPIC_STATUS_PREFIX}COMPLETED`;
+  const FAILED = `${TOPIC_STATUS_PREFIX}FAILED`;
+  const CANCELLED = `${TOPIC_STATUS_PREFIX}CANCELLED`;
+  const RESOLVED = new Set([COMPLETED, FAILED, CANCELLED]);
+  const SESSION_RESET = `${EVENT_KIND_PREFIX}SESSION_RESET`;
+  const NOTIFICATION = `${EVENT_KIND_PREFIX}NOTIFICATION`;
+  const TOPIC_PROGRESS = `${EVENT_KIND_PREFIX}TOPIC_PROGRESS`;
+
+  function readable(value, prefix) {
+    const name = String(value || "");
+    return (name.startsWith(prefix) ? name.slice(prefix.length) : name).toLowerCase();
+  }
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -95,9 +98,6 @@
     return node;
   }
 
-  // Everything observable about this session: every RPC call/response, every stream event (not
-  // just the focused topic's), connection lifecycle, and errors — a running log of what the
-  // client sees, independent of what the transcript chooses to render.
   function debugLine(className, kindText, detail) {
     const entry = element("div", `debug-entry ${className}`);
     entry.appendChild(element("span", "ts", `${new Date().toLocaleTimeString()} `));
@@ -133,14 +133,15 @@
     return body;
   }
 
-  // Connect streaming wire format: each message is a 5-byte header (1 flag byte, 0x02 =
-  // end-stream; 4 big-endian length bytes) followed by that many bytes of JSON. The single
-  // request message for a server-streaming call is itself one such envelope, not bare JSON.
+  const ENVELOPE_HEADER_BYTES = 5;
+  const END_STREAM_FLAG = 0x02;
+  const MAX_ENVELOPE_PAYLOAD_BYTES = 4 * 1024 * 1024;
+
   function encodeEnvelope(message) {
     const json = new TextEncoder().encode(JSON.stringify(message));
-    const out = new Uint8Array(5 + json.length);
+    const out = new Uint8Array(ENVELOPE_HEADER_BYTES + json.length);
     new DataView(out.buffer).setUint32(1, json.length, false);
-    out.set(json, 5);
+    out.set(json, ENVELOPE_HEADER_BYTES);
     return out;
   }
 
@@ -164,13 +165,16 @@
       const { done, value } = await reader.read();
       if (done) return;
       buffer = concatBytes(buffer, value);
-      while (buffer.length >= 5) {
+      while (buffer.length >= ENVELOPE_HEADER_BYTES) {
         const flag = buffer[0];
         const length = new DataView(buffer.buffer, buffer.byteOffset + 1, 4).getUint32(0, false);
-        if (buffer.length < 5 + length) break;
-        const payload = buffer.slice(5, 5 + length);
-        buffer = buffer.slice(5 + length);
-        if (flag & 0x02) return; // end-stream envelope
+        if (length > MAX_ENVELOPE_PAYLOAD_BYTES) {
+          throw new Error(`envelope claims ${length} bytes, over the ${MAX_ENVELOPE_PAYLOAD_BYTES} allowed`);
+        }
+        if (buffer.length < ENVELOPE_HEADER_BYTES + length) break;
+        const payload = buffer.slice(ENVELOPE_HEADER_BYTES, ENVELOPE_HEADER_BYTES + length);
+        buffer = buffer.slice(ENVELOPE_HEADER_BYTES + length);
+        if (flag & END_STREAM_FLAG) return;
         yield JSON.parse(new TextDecoder().decode(payload));
       }
     }
@@ -179,16 +183,14 @@
   function progressText(payloadJson) {
     let payload;
     try { payload = JSON.parse(payloadJson); } catch { return payloadJson; }
-    const [kind, body] = Object.entries(payload)[0] || ["", {}];
-    if (kind === "NodeStarted") return `Running ${body.node}…`;
-    if (kind === "TaskOutput" && typeof body.chunk === "string") return body.chunk;
-    if (kind === "NodeCompleted") return `${body.node} done`;
-    return kind;
+    const step = payload.step || "";
+    const detail = payload.detail || {};
+    if (step === "node_started") return `Running ${detail.node}…`;
+    if (step === "task_output" && typeof detail.chunk === "string") return detail.chunk;
+    if (step === "node_completed") return `${detail.node} done`;
+    return step;
   }
 
-  // Tiny, safe markdown renderer for assistant answers: escapes HTML first (so the input can
-  // never inject markup), then converts a small subset of markdown syntax to tags. No external
-  // libraries — CSP allows none.
   function escapeHtml(text) {
     return text
       .replace(/&/g, "&amp;")
@@ -209,7 +211,7 @@
   function renderMarkdown(text) {
     const lines = text.split("\n");
     const htmlParts = [];
-    let listTag = null; // "ul" or "ol" while inside a list
+    let listTag = null;
     let paragraph = [];
 
     function flushParagraph() {
@@ -257,9 +259,6 @@
     return htmlParts.join("");
   }
 
-  // One transcript for the whole session: every topic's turns and answers interleaved in time,
-  // each tagged with the topic it belongs to — the Claude Code model, where background work
-  // reports back into the one conversation rather than into a pane of its own.
   function appendMessage(who, text, className, topicTitle) {
     const div = element("div", `msg ${className || ""}`);
     if (topicTitle) div.appendChild(element("span", "topic", `[${topicTitle}]`));
@@ -276,9 +275,6 @@
     return div;
   }
 
-  // The label tag always names the root conversation, never a child's own (possibly synthesized)
-  // title — a child topic is just more turns in the same thread, so its tag must not "flip" to
-  // whatever the classifier called the follow-up.
   function rootTitleOf(topics, topicId) {
     const byId = new Map(topics.map((t) => [t.id, t]));
     let cur = byId.get(topicId);
@@ -291,99 +287,74 @@
     return cur.title;
   }
 
-  // Two messages are "the same turn" if they share a turn_id, or — for rows a server predating
-  // turn_id might still hand back — if they carry identical content within 2 seconds of each
-  // other. Either way this collapses the one `chat.messages` row persisted per topic a turn
-  // touched down to a single user line.
-  const DEDUP_WINDOW_MS = 2000;
-  function sameTurn(a, b) {
-    if (a.turnId && b.turnId) return a.turnId === b.turnId;
-    if (a.content !== b.content) return false;
-    return Math.abs(new Date(a.createdAt) - new Date(b.createdAt)) <= DEDUP_WINDOW_MS;
+  const TURN_SEQUENCE = 0;
+  const ACK_SEQUENCE = 1;
+  const ANSWER_SEQUENCE = 2;
+
+  function atMs(iso) {
+    return new Date(iso).getTime();
   }
 
-  // Rebuilt from GetSession alone, so it is idempotent: a reload, a topic switch and a lifecycle
-  // event all produce the same transcript for the same server state.
-  //
-  // Required shape (the live bug this fixes: one multi-topic message rendered once per topic,
-  // ahead of the classifier's rewritten questions instead of behind them):
-  //   1. The user's real message, exactly once — never a topic's synthesized `question`/`title`.
-  //   2. One assistant "looking into" line per topic that turn touched, tagged with that topic's
-  //      own title (not the root), showing running/queued state.
-  //   3. Each topic's answer once it resolves, directly under its own ack line.
-  function transcriptEntries(topics) {
-    const entries = [];
-
-    // Step 1: every message across every topic, deduped down to one line per real turn. The
-    // topic tag is the root of the *first* topic that turn touched — unless the turn fanned out
-    // to more than one topic, in which case no single topic owns it, so no tag is shown.
-    const all = [];
+  function messagesByTurn(topics) {
+    const messages = [];
     topics.forEach((topic) => {
-      (topic.messages || []).forEach((message) => {
-        all.push({ topicId: topic.id, ...message });
-      });
+      (topic.messages || []).forEach((message) => messages.push({ topicId: topic.id, ...message }));
     });
-    all.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
-    const used = new Array(all.length).fill(false);
-    for (let i = 0; i < all.length; i++) {
-      if (used[i]) continue;
-      const group = [all[i]];
-      used[i] = true;
-      for (let j = i + 1; j < all.length; j++) {
-        if (!used[j] && sameTurn(all[i], all[j])) {
-          group.push(all[j]);
-          used[j] = true;
-        }
-      }
+    messages.sort((a, b) => atMs(a.createdAt) - atMs(b.createdAt));
+    const turns = new Map();
+    messages.forEach((message) => {
+      const group = turns.get(message.turnId);
+      if (group) group.push(message);
+      else turns.set(message.turnId, [message]);
+    });
+    return turns;
+  }
+
+  function userTurnEntries(topics) {
+    return [...messagesByTurn(topics).values()].map((group) => {
+      const first = group[0];
       const topicIds = new Set(group.map((m) => m.topicId));
-      const tag = topicIds.size === 1 ? rootTitleOf(topics, group[0].topicId) : undefined;
-      entries.push({ at: group[0].createdAt, who: "you", text: group[0].content, topic: tag });
+      const tag = topicIds.size === 1 ? rootTitleOf(topics, first.topicId) : undefined;
+      return { at: first.createdAt, sequence: TURN_SEQUENCE, who: "you", text: first.content, topic: tag };
+    });
+  }
+
+  function ackText(topic, resolved) {
+    if (resolved) return `🔎 Looking into: ${topic.question}`;
+    if (topic.status === QUEUED) return `⏳ Queued: ${topic.question}`;
+    return `🔎 Looking into: ${topic.question} (running…)`;
+  }
+
+  function topicEntries(topic) {
+    const openingTurn = (topic.messages || [])[0];
+    const resolved = RESOLVED.has(topic.status);
+    const entries = [
+      {
+        at: openingTurn ? openingTurn.createdAt : topic.createdAt,
+        sequence: ACK_SEQUENCE,
+        who: "assistant",
+        className: "ack",
+        text: ackText(topic, resolved),
+        topic: topic.title,
+      },
+    ];
+    if (resolved && topic.resultSummary) {
+      entries.push({
+        at: topic.updatedAt,
+        sequence: ANSWER_SEQUENCE,
+        who: "assistant",
+        text: topic.resultSummary,
+        className: topic.status === FAILED ? "error" : "",
+        topic: topic.title,
+      });
     }
+    return entries;
+  }
 
-    // Step 2 & 3: one ack per topic, tagged with that topic's own title, plus its answer once
-    // resolved. The ack sorts at the topic's own created_at, nudged 1ms later than an
-    // exactly-simultaneous user turn so it always renders below the message that started it.
-    const userAts = new Set(entries.map((e) => e.at));
-    topics.forEach((topic) => {
-      let ackAt = topic.createdAt;
-      if (userAts.has(ackAt)) {
-        ackAt = new Date(new Date(ackAt).getTime() + 1).toISOString();
-      }
-      const resolved = topic.status === "completed" || topic.status === "failed";
-      const ackText = resolved
-        ? `🔎 Looking into: ${topic.question}`
-        : topic.status === "queued"
-          ? `⏳ Queued: ${topic.question}`
-          : `🔎 Looking into: ${topic.question} (running…)`;
-      entries.push({ at: ackAt, who: "assistant", className: "ack", text: ackText, topic: topic.title });
-
-      if (resolved && topic.resultSummary) {
-        const answerAt = new Date(new Date(ackAt).getTime() + 1).toISOString();
-        entries.push({
-          at: answerAt,
-          who: "assistant",
-          text: topic.resultSummary,
-          className: topic.status === "failed" ? "error" : "",
-          topic: topic.title,
-        });
-      }
-    });
-
-    // Final ordering: a topic's row is inserted (and gets its `created_at`) inside
-    // `apply_actions`, *before* `send_turn` writes the turn's `chat.messages` row — so a topic's
-    // ack can carry an earlier timestamp than the very user message that spawned it. A plain
-    // timestamp sort would then put the ack above the user's line. Within `DEDUP_WINDOW_MS` of
-    // each other (the same window `sameTurn` already uses to treat rows as one turn), a "you"
-    // entry always sorts ahead of an assistant one, regardless of which timestamp is earlier;
-    // outside that window, timestamp order stands.
-    return entries.sort((a, b) => {
-      const ta = new Date(a.at).getTime();
-      const tb = new Date(b.at).getTime();
-      if (a.who !== b.who && Math.abs(ta - tb) <= DEDUP_WINDOW_MS) {
-        return a.who === "you" ? -1 : b.who === "you" ? 1 : 0;
-      }
-      return ta < tb ? -1 : ta > tb ? 1 : 0;
-    });
+  function transcriptEntries(topics) {
+    const entries = userTurnEntries(topics);
+    topics.forEach((topic) => entries.push(...topicEntries(topic)));
+    return entries.sort((a, b) => atMs(a.at) - atMs(b.at) || a.sequence - b.sequence);
   }
 
   function renderTranscript() {
@@ -393,23 +364,15 @@
     });
   }
 
-  // Lifecycle events change what GetSession would say, so they are rendered by reloading and
-  // re-rendering (idempotent, see renderTranscript). Everything else — progress, notifications —
-  // is appended in place, because it is never part of the snapshot.
   const LIFECYCLE = new Set([
-    "topic_created", "topic_started", "topic_queued", "topic_completed", "topic_failed",
-    "topic_cancelled", "focus_changed",
-  ]);
+    "TOPIC_CREATED", "TOPIC_STARTED", "TOPIC_QUEUED", "TOPIC_COMPLETED", "TOPIC_FAILED",
+    "TOPIC_CANCELLED", "FOCUS_CHANGED",
+  ].map((name) => EVENT_KIND_PREFIX + name));
 
-  // A single malformed or unexpected event must never kill the stream: `StreamEvents` replays
-  // the session's *entire* persisted history on every reconnect, so an uncaught throw here would
-  // die on the same event every time the client reconnects — freezing the transcript forever,
-  // since every later lifecycle event (including the one that would finish a running topic)
-  // never gets a chance to run again. Any failure is logged to the debug panel instead.
   async function renderEvent(event) {
     try {
-      debugLine("", `event ${event.kind}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
-      if (event.kind === "session_reset") {
+      debugLine("", `event ${readable(event.kind, EVENT_KIND_PREFIX)}`, `topic=${event.topicId || "-"} ${event.payloadJson || ""}`);
+      if (event.kind === SESSION_RESET) {
         await startOver();
         return;
       }
@@ -418,16 +381,16 @@
         return;
       }
       let payload = {};
-      try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
-      if (event.kind === "notification") {
+      try { payload = JSON.parse(event.payloadJson || "{}"); } catch { payload = {}; }
+      if (event.kind === NOTIFICATION) {
         appendMessage("·", payload.text || payload.kind || "", "notification", rootTitleOf(topics, event.topicId));
         return;
       }
-      if (event.kind === "topic_progress") {
+      if (event.kind === TOPIC_PROGRESS) {
         appendMessage("·", progressText(event.payloadJson), "notification", rootTitleOf(topics, event.topicId));
       }
     } catch (err) {
-      debugLine("err", `render ${event.kind}`, err.message);
+      debugLine("err", `render ${readable(event.kind, EVENT_KIND_PREFIX)}`, err.message);
     }
   }
 
@@ -436,79 +399,62 @@
     topics.forEach((topic) => {
       const row = element("div", `topic-row ${topic.id === focusTopicId ? "focus" : ""}`);
       row.appendChild(element("div", "", topic.title));
-      row.appendChild(element("div", "status", topic.status));
+      row.appendChild(element("div", "status", readable(topic.status, TOPIC_STATUS_PREFIX)));
       row.onclick = () => setFocus(topic.id);
       topicsEl.appendChild(row);
     });
   }
 
-  // The topic list is navigation and status only: clicking a row moves the server's focus and
-  // highlights it. The transcript is session-wide, so it does not change.
   async function setFocus(topicId) {
     if (topicId === focusTopicId) return;
     await callRpc("SetFocus", { topicId });
     focusTopicId = topicId;
-    serverFocusTopicId = topicId;
     renderTopics();
   }
 
-  // A reconnect replays the session's whole stored history, which is dozens of lifecycle events
-  // in a burst — one GetSession each would be a storm of identical calls. They all want the same
-  // thing (the current snapshot), so they collapse into one trailing reload.
+  const RELOAD_DEBOUNCE_MS = 50;
+  const UNRESOLVED_POLL_MS = 2000;
   let reloadTimer = null;
-  function scheduleReload() {
+  function scheduleReload(delayMs = RELOAD_DEBOUNCE_MS) {
     if (reloadTimer) return;
     reloadTimer = setTimeout(() => {
       reloadTimer = null;
       loadSession().catch((err) => debugLine("err", "GetSession", err.message));
-    }, 50);
+    }, delayMs);
+  }
+
+  function anyTopicUnresolved() {
+    return topics.some((topic) => !RESOLVED.has(topic.status));
   }
 
   async function loadSession() {
     const session = await callRpc("GetSession", {});
     topics = session.topics || [];
-    serverFocusTopicId = session.focusTopicId || null;
-    // When the last unfinished topic completes the server clears focus, so fall back to the
-    // newest topic — that is the conversation the user was just reading. It only decides which
-    // row is highlighted; the classifier, not this pointer, decides where a turn lands.
-    focusTopicId = serverFocusTopicId || (topics.length && topics[topics.length - 1].id) || null;
+    focusTopicId = session.focusTopicId || (topics.length && topics[topics.length - 1].id) || null;
     renderTopics();
     renderTranscript();
+    if (anyTopicUnresolved()) scheduleReload(UNRESOLVED_POLL_MS);
   }
 
   document.getElementById("sendForm").onsubmit = async (event) => {
     event.preventDefault();
     const input = document.getElementById("content");
     const content = input.value.trim();
-    // Always sendable: an empty session is how a first topic gets created now, so there is
-    // nothing to be focused on first.
     if (!content) return;
     input.value = "";
     appendMessage("you", content);
     try {
-      // The server classifies the message against the whole session — it may continue a topic,
-      // or open one, or open several — so the client asserts no focus beforehand and simply
-      // follows whatever comes back.
-      const sent = await callRpc("SendTurn", { turnId: crypto.randomUUID(), content });
-      const routed = (sent.topicIds && sent.topicIds[0]) || sent.topicId || null;
-      if (routed) {
-        focusTopicId = routed;
-        serverFocusTopicId = routed;
-      }
+      await callRpc("SendTurn", { turnId: crypto.randomUUID(), content });
       await loadSession();
     } catch (err) {
       appendMessage("!", err.message, "error");
     }
   };
 
-  // Wipes the whole session (every topic, every message) and starts fresh. Also reachable from
-  // another tab's own click via the `session_reset` stream event below, so both tabs land in the
-  // same empty state instead of one of them still showing topics that no longer exist server-side.
   async function startOver() {
     transcript.textContent = "";
     topics = [];
     focusTopicId = null;
-    serverFocusTopicId = null;
     await loadSession();
   }
 
@@ -522,20 +468,28 @@
     }
   };
 
+  const STREAM_RETRY_BASE_MS = 1000;
+  const STREAM_RETRY_MAX_MS = 30000;
+
   (async () => {
     await loadSession();
+    let backoffMs = STREAM_RETRY_BASE_MS;
     for (;;) {
       debugLine("meta", "stream", "connecting…");
+      let waitMs = STREAM_RETRY_BASE_MS;
       try {
         for await (const event of streamChatEvents()) {
           await renderEvent(event);
         }
         debugLine("meta", "stream", "ended cleanly");
+        backoffMs = STREAM_RETRY_BASE_MS;
       } catch (err) {
-        debugLine("err", "stream", `${err.message} — retrying in 2s`);
-        appendMessage("!", `Stream error: ${err.message} — retrying…`, "error");
+        waitMs = backoffMs;
+        backoffMs = Math.min(backoffMs * 2, STREAM_RETRY_MAX_MS);
+        debugLine("err", "stream", `${err.message} — retrying in ${waitMs / 1000}s`);
+        scheduleReload(UNRESOLVED_POLL_MS);
       }
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
   })();
 </script>

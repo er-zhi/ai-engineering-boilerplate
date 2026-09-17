@@ -1,5 +1,4 @@
-// CreateTool/ValidateTool/ActivateTool/ListTools: the lifecycle a user-created tool goes
-// through before it's callable — Execute (Task 10) is the only method that actually runs one.
+// The tool lifecycle — create, validate, activate, list — and Execute, which runs one.
 
 use buffa::EnumValue;
 use chrono::Utc;
@@ -13,17 +12,121 @@ use sea_orm::{
     QueryFilter,
 };
 use serde_json::Value;
+use std::sync::LazyLock;
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::entity::tool::{ActiveModel, Entity, Risk, Status};
 use crate::error::ToolError;
-use crate::providers::AnySearchProvider;
-use crate::providers::brave::SearchProvider;
+use crate::providers::{AnySearchProvider, SearchProvider};
 use crate::tools::kb_client::KnowledgeBaseClient;
 
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
-const VALIDATE_SYSTEM_PROMPT: &str = r#"You validate a tool definition against 2026 API design standards. You will be given a tool's name, description, JSON Schema input_schema, JSON Schema output_schema, risk level, and timeout_seconds. Respond with exactly this JSON and nothing else: {"approved": true or false, "feedback": "one or two sentences"}. Approve only if input_schema and output_schema are each a plausible JSON Schema object, description clearly states what the tool does (and, for risk "write" or "destructive", what it changes), and timeout_seconds is between 1 and 300."#;
+const FEEDBACK_PLACEHOLDER: &str = "one or two sentences";
+const UNUSABLE_VERDICT: &str = "the model did not return the expected JSON shape";
+
+static VALIDATE_SYSTEM_PROMPT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"You validate a tool definition against 2026 API design standards. You will be given a tool's name, description, JSON Schema input_schema, JSON Schema output_schema, risk level, and timeout_seconds. Respond with exactly this JSON and nothing else, with approved false when it does not pass: {}. Approve only if input_schema and output_schema are each a plausible JSON Schema object, description clearly states what the tool does (and, for risk "write" or "destructive", what it changes), and timeout_seconds is plausible for that work."#,
+        serde_json::to_string(&Verdict {
+            approved: true,
+            feedback: FEEDBACK_PLACEHOLDER.to_owned(),
+        })
+        .expect("a Verdict always serializes")
+    )
+});
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+struct Verdict {
+    approved: bool,
+    feedback: String,
+}
+
+impl Verdict {
+    fn reached(content: &str) -> (bool, String) {
+        let verdict: Self = serde_json::from_str(content).unwrap_or_default();
+        let feedback = if verdict.feedback.trim().is_empty() {
+            UNUSABLE_VERDICT.to_owned()
+        } else {
+            verdict.feedback
+        };
+        (verdict.approved, feedback)
+    }
+}
+
+pub const MAX_SLUG_CHARS: usize = 64;
+pub const MAX_NAME_CHARS: usize = 128;
+pub const MAX_DESCRIPTION_CHARS: usize = 8192;
+pub const MIN_TIMEOUT_SECONDS: i32 = 1;
+pub const MAX_TIMEOUT_SECONDS: i32 = 300;
+const DEFAULT_TOOL_HTTP_TIMEOUT: Duration = Duration::from_secs(MAX_TIMEOUT_SECONDS as u64);
+
+pub fn bounded_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(DEFAULT_TOOL_HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| format!("could not build the outbound http client: {error}"))
+}
+
+#[derive(Debug)]
+pub struct NewTool {
+    slug: String,
+    name: String,
+    description: String,
+    input_schema: Value,
+    output_schema: Value,
+    risk: Risk,
+    timeout_seconds: i32,
+}
+
+impl NewTool {
+    pub fn checked(
+        slug: String,
+        name: String,
+        description: String,
+        input_schema: Value,
+        output_schema: Value,
+        risk: Risk,
+        timeout_seconds: i32,
+    ) -> Result<Self, ToolError> {
+        bounded("slug", &slug, MAX_SLUG_CHARS)?;
+        bounded("name", &name, MAX_NAME_CHARS)?;
+        bounded("description", &description, MAX_DESCRIPTION_CHARS)?;
+        if !input_schema.is_object() || !output_schema.is_object() {
+            return Err(ToolError::InvalidRequest(
+                "input_schema and output_schema must be JSON objects".to_owned(),
+            ));
+        }
+        if !(MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&timeout_seconds) {
+            return Err(ToolError::InvalidRequest(format!(
+                "timeout_seconds must be between {MIN_TIMEOUT_SECONDS} and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
+            )));
+        }
+        Ok(Self {
+            slug,
+            name,
+            description,
+            input_schema,
+            output_schema,
+            risk,
+            timeout_seconds,
+        })
+    }
+}
+
+fn bounded(field: &str, value: &str, max_chars: usize) -> Result<(), ToolError> {
+    if value.trim().is_empty() {
+        return Err(ToolError::InvalidRequest(format!("{field} is required")));
+    }
+    let length = value.chars().count();
+    if length > max_chars {
+        return Err(ToolError::InvalidRequest(format!(
+            "{field} is {length} characters, the maximum is {max_chars}"
+        )));
+    }
+    Ok(())
+}
 
 pub struct Service {
     db: DatabaseConnection,
@@ -44,6 +147,7 @@ impl Service {
         let target = llm_router_url
             .parse()
             .map_err(|e| format!("could not parse LLM_ROUTER_URL {llm_router_url:?}: {e}"))?;
+        let http = bounded_http_client()?;
         Ok(Self {
             db,
             llm: LlmRouterServiceClient::new(
@@ -53,51 +157,34 @@ impl Service {
                     .with_default_timeout(VALIDATE_TIMEOUT)
                     .proto(),
             ),
-            search: AnySearchProvider::from_env(you_api_key, brave_api_key),
-            http: reqwest::Client::new(),
+            search: AnySearchProvider::from_api_keys(you_api_key, brave_api_key, http.clone()),
+            http,
             kb: KnowledgeBaseClient::new(knowledge_base_url)?,
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_tool(
         &self,
         user_id: Option<Uuid>,
-        slug: String,
-        name: String,
-        description: String,
-        input_schema: Value,
-        output_schema: Value,
-        risk: Risk,
-        timeout_seconds: i32,
+        new_tool: NewTool,
     ) -> Result<i64, ToolError> {
-        if !input_schema.is_object() || !output_schema.is_object() {
-            return Err(ToolError::InvalidRequest(
-                "input_schema and output_schema must be JSON objects".to_owned(),
-            ));
-        }
-        // A user-created tool cannot claim a system tool's slug: `execute`/`run_system_tool`
-        // dispatch the real system implementation by slug string alone, so a user row sharing
-        // one of these names would run as the real web_search/web_fetch/kb_search/
-        // kb_read_document — silently bypassing that row's own Draft/Validated/Active lifecycle
-        // (seeding, which legitimately owns these slugs, passes `user_id: None` and skips this
-        // check).
-        if user_id.is_some() && crate::slugs::ALL.contains(&slug.as_str()) {
+        if claims_reserved_slug(user_id, &new_tool.slug) {
             return Err(ToolError::InvalidRequest(format!(
-                "slug {slug:?} is reserved for a system tool"
+                "slug {:?} is reserved for a system tool",
+                new_tool.slug
             )));
         }
         let now = Utc::now();
         let row = ActiveModel {
             user_id: Set(user_id),
-            slug: Set(slug),
-            name: Set(name),
-            description: Set(description),
-            input_schema: Set(input_schema),
-            output_schema: Set(output_schema),
+            slug: Set(new_tool.slug),
+            name: Set(new_tool.name),
+            description: Set(new_tool.description),
+            input_schema: Set(new_tool.input_schema),
+            output_schema: Set(new_tool.output_schema),
             connection_id: Set(None),
-            risk: Set(risk),
-            timeout_seconds: Set(timeout_seconds),
+            risk: Set(new_tool.risk),
+            timeout_seconds: Set(new_tool.timeout_seconds),
             status: Set(Status::Draft),
             created_at: Set(now),
             updated_at: Set(now),
@@ -113,11 +200,8 @@ impl Service {
         tool_id: i64,
         user_id: Uuid,
     ) -> Result<(bool, String), ToolError> {
-        let tool = self.owned_tool(tool_id, user_id).await?;
-        // Re-validating an already-reviewed tool would let a duplicate/retried call silently
-        // regress it out of Active (dropping it from list_tools' catalog) or back to Draft —
-        // only a fresh Draft tool is eligible, mirroring activate_tool's own Validated-only gate.
-        if tool.status != Status::Draft {
+        let tool = self.user_owned_tool(tool_id, user_id).await?;
+        if already_reviewed(tool.status) {
             return Err(ToolError::InvalidRequest(format!(
                 "tool {tool_id} is not Draft"
             )));
@@ -135,7 +219,7 @@ impl Service {
             .llm
             .complete(CompleteRequest {
                 tier: EnumValue::Known(QualityTier::Medium),
-                system_prompt: VALIDATE_SYSTEM_PROMPT.to_owned(),
+                system_prompt: VALIDATE_SYSTEM_PROMPT.clone(),
                 user_prompt,
                 sampling: Sampling {
                     response_format: Some(EnumValue::Known(ResponseFormat::JsonObject)),
@@ -147,16 +231,7 @@ impl Service {
             .await
             .map_err(|e| ToolError::InvalidRequest(format!("llm-router call failed: {e}")))?
             .into_owned();
-        let parsed: Value = serde_json::from_str(&response.content).unwrap_or(Value::Null);
-        let approved = parsed
-            .get("approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let feedback = parsed
-            .get("feedback")
-            .and_then(Value::as_str)
-            .unwrap_or("the model did not return the expected JSON shape")
-            .to_owned();
+        let (approved, feedback) = Verdict::reached(&response.content);
 
         let mut active: ActiveModel = tool.into();
         active.status = Set(if approved {
@@ -171,7 +246,7 @@ impl Service {
     }
 
     pub async fn activate_tool(&self, tool_id: i64, user_id: Uuid) -> Result<(), ToolError> {
-        let tool = self.owned_tool(tool_id, user_id).await?;
+        let tool = self.user_owned_tool(tool_id, user_id).await?;
         if tool.status != Status::Validated {
             return Err(ToolError::InvalidRequest(format!(
                 "tool {tool_id} is not Validated"
@@ -184,8 +259,6 @@ impl Service {
         Ok(())
     }
 
-    /// The catalog `Dispatcher` (Task 14) injects into an LLM's tool-calling prompt — only
-    /// `Active` tools are eligible, since `Draft`/`Validated` rows haven't cleared review yet.
     pub async fn list_tools(
         &self,
         user_id: Option<Uuid>,
@@ -205,10 +278,7 @@ impl Service {
             .await?)
     }
 
-    /// A tool the caller owns — used by `validate_tool`/`activate_tool`, which only ever act on
-    /// the caller's own `Draft`/`Validated` tools (a system tool's `user_id` never matches any
-    /// `Principal`, so this naturally rejects attempts to validate/activate one).
-    async fn owned_tool(
+    async fn user_owned_tool(
         &self,
         tool_id: i64,
         user_id: Uuid,
@@ -241,7 +311,8 @@ impl Service {
         }
         let input: Value = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidRequest(e.to_string()))?;
-        self.run_system_tool(slug, &input).await
+        self.run_system_tool(slug, &input, registered_timeout(tool.timeout_seconds))
+            .await
     }
 
     async fn find_tool(
@@ -266,78 +337,90 @@ impl Service {
             .await?)
     }
 
-    // Split by slug into one small helper per system tool (rather than one long match arm body)
-    // purely to stay under this workspace's clippy::too_many_lines — semantically this is still
-    // exactly the four-way dispatch the brief lays out.
     async fn run_system_tool(
         &self,
         slug: &str,
         input: &Value,
+        timeout: Duration,
     ) -> Result<ExecuteOutcome, ToolError> {
         match slug {
-            crate::slugs::WEB_SEARCH => self.run_web_search(input).await,
-            crate::slugs::WEB_FETCH => self.run_web_fetch(input).await,
-            crate::slugs::KB_SEARCH => self.run_kb_search(input).await,
-            crate::slugs::KB_READ_DOCUMENT => self.run_kb_read_document(input).await,
+            crate::slugs::WEB_SEARCH => match crate::args::parse::<crate::args::Search>(input) {
+                Ok(args) => self.run_web_search(args).await,
+                Err(problem) => Ok(ExecuteOutcome::Error(problem)),
+            },
+            crate::slugs::WEB_FETCH => match crate::args::parse::<crate::args::Fetch>(input) {
+                Ok(args) => self.run_web_fetch(args, timeout).await,
+                Err(problem) => Ok(ExecuteOutcome::Error(problem)),
+            },
+            crate::slugs::KB_SEARCH => match crate::args::parse::<crate::args::Search>(input) {
+                Ok(args) => self.run_kb_search(args).await,
+                Err(problem) => Ok(ExecuteOutcome::Error(problem)),
+            },
+            crate::slugs::KB_READ_DOCUMENT => {
+                match crate::args::parse::<crate::args::ReadDocument>(input) {
+                    Ok(args) => self.run_kb_read_document(args).await,
+                    Err(problem) => Ok(ExecuteOutcome::Error(problem)),
+                }
+            }
             other => Ok(ExecuteOutcome::NotExecutable(format!(
                 "tool {other:?} has no runnable implementation yet — user-created tools need Integrations Service"
             ))),
         }
     }
 
-    async fn run_web_search(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
-        let (query, limit) = query_and_limit(input);
-        Ok(match self.search.search(query, limit).await {
+    async fn run_web_search(&self, args: crate::args::Search) -> Result<ExecuteOutcome, ToolError> {
+        let limit = match args.checked_limit() {
+            Ok(limit) => limit,
+            Err(error) => return Ok(ExecuteOutcome::Error(error)),
+        };
+        Ok(match self.search.search(&args.query, limit).await {
             Ok(results) => ExecuteOutcome::Ok(serde_json::to_value(results)?),
             Err(error) => ExecuteOutcome::Error(error),
         })
     }
 
-    /// `url` takes one page, `urls` takes candidates to race — the caller passes several when it
-    /// has pages that would each answer the question and cannot tell which will actually respond.
-    /// Every candidate is SSRF-checked before any request goes out, so one bad entry fails the
-    /// call rather than riding along with the good ones.
-    async fn run_web_fetch(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
-        let urls = match requested_urls(input) {
+    async fn run_web_fetch(
+        &self,
+        args: crate::args::Fetch,
+        timeout: Duration,
+    ) -> Result<ExecuteOutcome, ToolError> {
+        let urls = match args.checked_urls() {
             Ok(urls) => urls,
             Err(error) => return Ok(ExecuteOutcome::Error(error)),
         };
-        for url in &urls {
-            if let Err(error) = crate::tools::web_fetch::ensure_public_url(url).await {
-                return Ok(ExecuteOutcome::Error(error));
-            }
+        if let Err(error) = ensure_all_urls_public(&urls).await {
+            return Ok(ExecuteOutcome::Error(error));
         }
         Ok(
-            match crate::tools::web_fetch::fetch_first(&self.http, &urls).await {
-                Ok(page) => ExecuteOutcome::Ok(serde_json::to_value(page)?),
+            match crate::tools::web_fetch::fetch_richest(&self.http, &urls, timeout).await {
+                Ok(page) => ExecuteOutcome::Ok(crate::tools::web_fetch::readable_page_json(&page)),
                 Err(error) => ExecuteOutcome::Error(error),
             },
         )
     }
 
-    async fn run_kb_search(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
-        let (query, limit) = query_and_limit(input);
-        Ok(match self.kb.search(query, limit).await {
+    async fn run_kb_search(&self, args: crate::args::Search) -> Result<ExecuteOutcome, ToolError> {
+        let limit = match args.checked_limit() {
+            Ok(limit) => limit,
+            Err(error) => return Ok(ExecuteOutcome::Error(error)),
+        };
+        Ok(match self.kb.search(&args.query, limit).await {
             Ok(results) => ExecuteOutcome::Ok(serde_json::to_value(results)?),
             Err(error) => ExecuteOutcome::Error(error),
         })
     }
 
-    async fn run_kb_read_document(&self, input: &Value) -> Result<ExecuteOutcome, ToolError> {
-        let source = input
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let source_id = input
-            .get("source_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let version = input
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+    async fn run_kb_read_document(
+        &self,
+        args: crate::args::ReadDocument,
+    ) -> Result<ExecuteOutcome, ToolError> {
+        let version = args.version.unwrap_or_default();
         Ok(
-            match self.kb.read_document(source, source_id, version).await {
+            match self
+                .kb
+                .read_document(&args.source, &args.source_id, &version)
+                .await
+            {
                 Ok(content) => ExecuteOutcome::Ok(serde_json::json!({"content": content})),
                 Err(error) => ExecuteOutcome::Error(error),
             },
@@ -345,45 +428,28 @@ impl Service {
     }
 }
 
-/// Shared by `run_web_search` and `run_kb_search`: both slugs take the same `{query, limit}`
-/// shape, `limit` defaulting to 5 and capped at 20.
-/// The URLs a `web_fetch` call asked for, from either `url` (one) or `urls` (several to race).
-/// Capped because every entry becomes a concurrent request the moment the call is dispatched.
-fn requested_urls(input: &Value) -> Result<Vec<String>, String> {
-    const MAX_URLS: usize = 5;
-    let urls: Vec<String> = match input.get("urls").and_then(Value::as_array) {
-        Some(values) => values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-        None => input
-            .get("url")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .into_iter()
-            .collect(),
-    };
-    if urls.is_empty() {
-        return Err("url is required".to_owned());
-    }
-    if urls.len() > MAX_URLS {
-        return Err(format!("at most {MAX_URLS} urls can be fetched at once"));
-    }
-    Ok(urls)
+fn claims_reserved_slug(user_id: Option<Uuid>, slug: &str) -> bool {
+    user_id.is_some() && crate::slugs::RESERVED_FOR_SYSTEM_TOOLS.contains(&slug)
 }
 
-fn query_and_limit(input: &Value) -> (&str, u8) {
-    let query = input
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let limit = input
-        .get("limit")
-        .and_then(Value::as_u64)
-        .filter(|&v| v > 0)
-        .map_or(5, |v| u8::try_from(Ord::min(v, 20)).unwrap_or(20));
-    (query, limit)
+fn already_reviewed(status: Status) -> bool {
+    status != Status::Draft
+}
+
+async fn ensure_all_urls_public(urls: &[String]) -> Result<(), String> {
+    for url in urls {
+        crate::tools::web_fetch::ensure_public_url(url).await?;
+    }
+    Ok(())
+}
+
+fn registered_timeout(timeout_seconds: i32) -> Duration {
+    Duration::from_secs(
+        timeout_seconds
+            .clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS)
+            .unsigned_abs()
+            .into(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -405,6 +471,21 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::Arc;
+
+    const TEST_TIMEOUT_SECONDS: i32 = 30;
+
+    fn a_tool(slug: &str, name: &str, description: &str, risk: Risk) -> NewTool {
+        NewTool::checked(
+            slug.to_owned(),
+            name.to_owned(),
+            description.to_owned(),
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            risk,
+            TEST_TIMEOUT_SECONDS,
+        )
+        .expect("a valid tool definition")
+    }
 
     struct FakeLlmRouter {
         reply: String,
@@ -480,13 +561,12 @@ mod tests {
         let error = service
             .create_tool(
                 Some(user_id),
-                crate::slugs::WEB_SEARCH.into(),
-                "Shadow web search".into(),
-                "d".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
+                a_tool(
+                    crate::slugs::WEB_SEARCH,
+                    "Shadow web search",
+                    "d",
+                    Risk::ReadOnly,
+                ),
             )
             .await
             .unwrap_err();
@@ -503,13 +583,7 @@ mod tests {
         let tool_id = service
             .create_tool(
                 Some(user_id),
-                "echo".into(),
-                "Echo".into(),
-                "Echoes input".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
+                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
             )
             .await
             .expect("create");
@@ -530,13 +604,7 @@ mod tests {
         let tool_id = service
             .create_tool(
                 Some(user_id),
-                "echo".into(),
-                "Echo".into(),
-                "Echoes input".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
+                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
             )
             .await
             .expect("create");
@@ -564,13 +632,7 @@ mod tests {
         let tool_id = service
             .create_tool(
                 Some(user_id),
-                "echo".into(),
-                "Echo".into(),
-                "Echoes input".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
+                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
             )
             .await
             .expect("create");
@@ -593,13 +655,7 @@ mod tests {
         let tool_id = service
             .create_tool(
                 Some(user_id),
-                "echo".into(),
-                "Echo".into(),
-                "".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
+                a_tool("echo", "Echo", "does something unclear", Risk::ReadOnly),
             )
             .await
             .expect("create");
@@ -620,13 +676,7 @@ mod tests {
         let tool_id = service
             .create_tool(
                 Some(user_id),
-                "echo".into(),
-                "Echo".into(),
-                "Echoes input".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
+                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
             )
             .await
             .expect("create");
@@ -652,30 +702,7 @@ mod tests {
         let (_test, service) = service_with(&llm_url).await;
         let owner = Uuid::new_v4();
         let stranger = Uuid::new_v4();
-        let tool_id = service
-            .create_tool(
-                Some(owner),
-                "mine".into(),
-                "Mine".into(),
-                "d".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
-            )
-            .await
-            .expect("create");
-        // list_tools only ever returns Active rows (see its doc comment) — activate first so
-        // this genuinely exercises the ownership filter rather than passing vacuously because
-        // a Draft row is excluded from every caller's view regardless of who owns it.
-        service
-            .validate_tool(tool_id, owner)
-            .await
-            .expect("validate");
-        service
-            .activate_tool(tool_id, owner)
-            .await
-            .expect("activate");
+        create_listable_tool(&service, owner, a_tool("mine", "Mine", "d", Risk::ReadOnly)).await;
 
         let seen_by_stranger = service.list_tools(Some(stranger)).await.expect("list");
         let seen_by_owner = service.list_tools(Some(owner)).await.expect("list");
@@ -687,7 +714,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_a_read_only_system_tool_runs_it() {
         let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
-        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         seed_system_tools(&service).await;
 
@@ -705,9 +732,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn an_argument_the_tool_does_not_declare_is_refused_naming_the_one_it_takes() {
+        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
+        let (_test, service) = full_service_with(&llm_url, &kb_url).await;
+        seed_system_tools(&service).await;
+
+        let outcome = service
+            .execute(
+                None,
+                crate::slugs::KB_SEARCH,
+                r#"{"q": "borrow checker"}"#,
+                "e:kb_search:0",
+            )
+            .await
+            .expect("execute");
+
+        let ExecuteOutcome::Error(message) = outcome else {
+            panic!("a misspelled argument must not reach the provider");
+        };
+        assert!(message.contains('q'), "{message}");
+        assert!(message.contains("query"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_an_unregistered_slug_is_an_error() {
         let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
-        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
 
         let outcome = service
@@ -721,19 +772,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_a_write_tool_requires_approval_without_running_it() {
         let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
-        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         let user_id = Uuid::new_v4();
         service
             .create_tool(
                 Some(user_id),
-                "send_email".into(),
-                "Send Email".into(),
-                "Sends an email".into(),
-                json!({}),
-                json!({}),
-                Risk::Write,
-                30,
+                a_tool("send_email", "Send Email", "Sends an email", Risk::Write),
             )
             .await
             .expect("create");
@@ -749,19 +794,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_a_user_created_tool_is_not_executable() {
         let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
-        let kb_url = crate::tools::kb_client::tests_support::serve_kb().await;
+        let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         let user_id = Uuid::new_v4();
         service
             .create_tool(
                 Some(user_id),
-                "custom_thing".into(),
-                "Custom".into(),
-                "d".into(),
-                json!({}),
-                json!({}),
-                Risk::ReadOnly,
-                30,
+                a_tool("custom_thing", "Custom", "d", Risk::ReadOnly),
             )
             .await
             .expect("create");
@@ -774,19 +813,84 @@ mod tests {
         assert!(matches!(outcome, ExecuteOutcome::NotExecutable(_)));
     }
 
-    async fn seed_system_tools(service: &Service) {
-        // Mirrors Task 11's real seeding, scoped to just what Task 10's tests need.
-        service
-            .create_tool(
-                None, // system tool — create_tool takes Option<Uuid> exactly so this is expressible
-                crate::slugs::KB_SEARCH.into(),
-                "Knowledge base search".into(),
-                "Searches the knowledge base".into(),
+    #[test]
+    fn a_name_longer_than_the_column_is_an_invalid_argument_not_a_db_error() {
+        let error = NewTool::checked(
+            "echo".to_owned(),
+            "e".repeat(MAX_NAME_CHARS + 1),
+            "Echoes input".to_owned(),
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            Risk::ReadOnly,
+            TEST_TIMEOUT_SECONDS,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidRequest(_)), "{error}");
+    }
+
+    #[test]
+    fn a_slug_longer_than_the_column_is_an_invalid_argument() {
+        let error = NewTool::checked(
+            "s".repeat(MAX_SLUG_CHARS + 1),
+            "Echo".to_owned(),
+            "Echoes input".to_owned(),
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            Risk::ReadOnly,
+            TEST_TIMEOUT_SECONDS,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidRequest(_)), "{error}");
+    }
+
+    #[test]
+    fn a_timeout_outside_the_validated_range_is_rejected_at_entry() {
+        for timeout_seconds in [MIN_TIMEOUT_SECONDS - 1, MAX_TIMEOUT_SECONDS + 1] {
+            let error = NewTool::checked(
+                "echo".to_owned(),
+                "Echo".to_owned(),
+                "Echoes input".to_owned(),
                 json!({"type": "object"}),
                 json!({"type": "object"}),
                 Risk::ReadOnly,
-                30,
+                timeout_seconds,
             )
+            .unwrap_err();
+
+            assert!(
+                matches!(error, ToolError::InvalidRequest(_)),
+                "{timeout_seconds}"
+            );
+        }
+    }
+
+    async fn create_listable_tool(service: &Service, owner: Uuid, tool: NewTool) {
+        let tool_id = service
+            .create_tool(Some(owner), tool)
+            .await
+            .expect("create");
+        service
+            .validate_tool(tool_id, owner)
+            .await
+            .expect("validate");
+        service
+            .activate_tool(tool_id, owner)
+            .await
+            .expect("activate");
+    }
+
+    async fn seed_system_tools(service: &Service) {
+        let mut kb_search = a_tool(
+            crate::slugs::KB_SEARCH,
+            "Knowledge base search",
+            "Searches the knowledge base",
+            Risk::ReadOnly,
+        );
+        kb_search.input_schema = crate::args::input_schema::<crate::args::Search>();
+        service
+            .create_tool(None, kb_search)
             .await
             .expect("seed kb_search");
     }

@@ -1,44 +1,63 @@
-// Conversions between engine-core's pure types and the SeaORM entities that persist them.
-// Isolated here so nothing else in the crate hand-rolls serde_json::to_value/from_value on
-// these types — a schema_version mismatch or a bad Status string has exactly one place to fail
-// loudly instead of N call sites each getting it slightly differently.
+// Converts between engine-core's pure types and the SeaORM entities.
 
+use common::proto::engine::v1::ExecutionStatus;
 use engine_core::{Checkpoint, ExecutionEvent, Status, WaitKind};
 use sea_orm::ActiveValue::Set;
 use serde_json::Value;
 
 use crate::entity::checkpoint;
+use crate::entity::execution;
 use crate::execution_event;
 
+pub fn counter_column(value: impl TryInto<u32>, column: &str) -> Result<u32, String> {
+    value
+        .try_into()
+        .map_err(|_| format!("executions.{column} is out of range for a counter"))
+}
+
 #[must_use]
-pub fn status_to_columns(status: &Status) -> (String, Option<Value>) {
+pub fn status_to_columns(status: &Status) -> (execution::Status, Option<Value>) {
     match status {
-        Status::Ready => ("ready".to_owned(), None),
-        Status::Running => ("running".to_owned(), None),
+        Status::Ready => (execution::Status::Ready, None),
+        Status::Running => (execution::Status::Running, None),
         Status::Waiting(wait) => (
-            "waiting".to_owned(),
+            execution::Status::Waiting,
             Some(serde_json::to_value(wait).expect("WaitKind always serializes")),
         ),
-        Status::Completed => ("completed".to_owned(), None),
-        Status::Failed => ("failed".to_owned(), None),
-        Status::Cancelled => ("cancelled".to_owned(), None),
+        Status::Completed => (execution::Status::Completed, None),
+        Status::Failed => (execution::Status::Failed, None),
+        Status::Cancelled => (execution::Status::Cancelled, None),
     }
 }
 
-pub fn columns_to_status(status: &str, wait_kind: Option<Value>) -> Result<Status, String> {
+#[must_use]
+pub fn status_to_proto(status: &Status) -> ExecutionStatus {
+    match status_to_columns(status).0 {
+        execution::Status::Ready => ExecutionStatus::Ready,
+        execution::Status::Running => ExecutionStatus::Running,
+        execution::Status::Waiting => ExecutionStatus::Waiting,
+        execution::Status::Completed => ExecutionStatus::Completed,
+        execution::Status::Failed => ExecutionStatus::Failed,
+        execution::Status::Cancelled => ExecutionStatus::Cancelled,
+    }
+}
+
+pub fn columns_to_status(
+    status: execution::Status,
+    wait_kind: Option<Value>,
+) -> Result<Status, String> {
     match status {
-        "ready" => Ok(Status::Ready),
-        "running" => Ok(Status::Running),
-        "waiting" => {
+        execution::Status::Ready => Ok(Status::Ready),
+        execution::Status::Running => Ok(Status::Running),
+        execution::Status::Waiting => {
             let wait_kind =
                 wait_kind.ok_or_else(|| "waiting status with no wait_kind column".to_owned())?;
             let wait: WaitKind = serde_json::from_value(wait_kind).map_err(|e| e.to_string())?;
             Ok(Status::Waiting(wait))
         }
-        "completed" => Ok(Status::Completed),
-        "failed" => Ok(Status::Failed),
-        "cancelled" => Ok(Status::Cancelled),
-        other => Err(format!("unknown execution status column value: {other}")),
+        execution::Status::Completed => Ok(Status::Completed),
+        execution::Status::Failed => Ok(Status::Failed),
+        execution::Status::Cancelled => Ok(Status::Cancelled),
     }
 }
 
@@ -108,19 +127,12 @@ mod tests {
             Status::Cancelled,
         ] {
             let (column, wait_kind) = status_to_columns(&status);
-            assert_eq!(
-                columns_to_status(&column, wait_kind).expect("valid"),
-                status
-            );
+            assert_eq!(columns_to_status(column, wait_kind).expect("valid"), status);
         }
     }
 
     #[test]
     fn checkpoint_round_trips_through_the_active_model() {
-        // Builds the Model by hand rather than reading it back out of the ActiveModel Step 1
-        // produces — Task 12's CheckpointStore is what actually round-trips through a real
-        // INSERT/SELECT against Postgres; this test only proves checkpoint_from_model correctly
-        // inverts the *shape* checkpoint_to_active_model writes, using values it already knows.
         let checkpoint = Checkpoint {
             schema_version: engine_core::CHECKPOINT_SCHEMA_VERSION,
             execution_id: ExecutionId(uuid::Uuid::new_v4()),
@@ -128,7 +140,7 @@ mod tests {
             state: serde_json::json!({"messages": ["hi"]}),
             current_nodes: vec![ActiveNode::plain(NodeId("llm".into()))],
         };
-        let _active = checkpoint_to_active_model(&checkpoint); // exercised for its own sake below
+        let _active = checkpoint_to_active_model(&checkpoint);
         let model = checkpoint::Model {
             id: 1,
             execution_id: checkpoint.execution_id.0,
@@ -157,11 +169,6 @@ mod tests {
 
     #[test]
     fn event_to_active_model_does_not_panic_on_every_payload_variant() {
-        // Real round-trip coverage (INSERT, read back, compare) is Task 23's integration test —
-        // this only proves every ExecutionPayload variant serializes through Set(...) without
-        // panicking, since a `Value` that can't serialize would panic inside the function, not
-        // return a Result (event_to_active_model is infallible by construction: every field of
-        // ExecutionPayload is plain, already-`Serialize` data).
         let base = |payload: ExecutionPayload| Event {
             id: uuid::Uuid::new_v4(),
             version: 1,
@@ -178,10 +185,11 @@ mod tests {
             }),
             base(ExecutionPayload::ExecutionCompleted {
                 final_state: serde_json::json!({}),
+                result: None,
             }),
         ] {
             let _active = event_to_active_model(&event);
         }
-        let _ = Duration::ZERO; // keeps the Duration import used
+        let _ = Duration::ZERO;
     }
 }

@@ -1,9 +1,13 @@
+// Gateway's Knowledge Base passthrough: what it forwards and what it refuses.
+
 use std::sync::Arc;
 
+use buffa::EnumValue;
 use common::proto::chat::v1::ChatServiceClient;
 use common::proto::knowledge_base::v1::{
     DocumentRef, IngestRequest, IngestResponse, KnowledgeBaseService, KnowledgeBaseServiceClient,
-    ReadDocumentRequest, ReadDocumentResponse, SearchRequest, SearchResponse, SearchResult,
+    PageType, ReadDocumentRequest, ReadDocumentResponse, SearchRequest, SearchResponse,
+    SearchResult,
 };
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{
@@ -54,7 +58,7 @@ impl KnowledgeBaseService for FakeKnowledgeBase {
                 source_id: "https://example.com/a".to_owned(),
                 title: "Title".to_owned(),
                 summary: "Summary".to_owned(),
-                page_type: "documentation".to_owned(),
+                page_type: EnumValue::Known(PageType::Documentation),
                 score: 0.75,
                 keywords: vec!["docs".to_owned()],
                 snippet: "Matching passage".to_owned(),
@@ -150,7 +154,7 @@ async fn search_forwards_the_complete_request_and_response_through_gateway() {
     let client = knowledge_base_client_to(&gateway_url);
     let search = SearchRequest {
         query: "complete query".to_owned(),
-        page_types: vec!["documentation".to_owned()],
+        page_types: vec![EnumValue::Known(PageType::Documentation)],
         limit: 7,
         ..Default::default()
     };

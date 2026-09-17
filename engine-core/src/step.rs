@@ -1,6 +1,4 @@
-// step(): the one place graph semantics live. Pure and synchronous — given what each active
-// node produced this super-step, decide what state changed, which edges fire, and what the
-// execution's next position and status are. See the spec's "step()" section.
+// Advances an execution by one super-step: the one place graph semantics live.
 
 use chrono::{DateTime, Utc};
 
@@ -10,6 +8,10 @@ use crate::event::{ExecutionEvent, ExecutionPayload};
 use crate::execution::{ActiveNode, Execution, Status};
 use crate::graph::{Condition, Graph, Node, evaluate_condition};
 use crate::state::apply_reducer;
+
+const FAN_IN_TABLE: &str = "__fan_in";
+const ONE_TOOL_CALL: u32 = 1;
+const UNMEASURED_WALL_TIME: std::time::Duration = std::time::Duration::ZERO;
 
 pub struct NodeOutput {
     pub node: ActiveNode,
@@ -32,7 +34,7 @@ pub fn step(
 
     for output in &outputs {
         apply_output(graph, &mut execution, &mut events, output);
-        if handle_fan(graph, &mut execution, output, &mut next) {
+        if fan_handled_output(graph, &mut execution, output, &mut next) {
             continue;
         }
         record_edges(graph, &execution, output, &mut next, &mut hard_failure);
@@ -59,10 +61,6 @@ pub fn step(
         return (execution, events);
     }
 
-    // A `FanIn` node completed its barrier this tick and was pushed into `next` directly (it
-    // never goes through a `TaskExecutor`, so it can't wait for a future output the way a `Task`
-    // does) — expand it into its own outgoing edges' targets immediately, in the same tick,
-    // rather than parking it as an active node waiting to be "run".
     next = expand_completed_fan_ins(graph, &execution, next);
 
     next.dedup_by(|a, b| a == b);
@@ -75,6 +73,7 @@ pub fn step(
         execution.current_nodes = Vec::new();
         execution.status = Status::Completed;
         events.push(execution.event(ExecutionPayload::ExecutionCompleted {
+            result: graph.answer(&execution.state),
             final_state: execution.state.clone(),
         }));
         return (execution, events);
@@ -91,10 +90,6 @@ pub fn step(
     park_next(graph, execution, events, next)
 }
 
-/// Decides the execution's final status/position for this tick from `next`: `Status::Waiting`
-/// on a `Wait` or not-yet-started `Subgraph` node found in it (a `Subgraph` waits on its own id
-/// as an `ExternalEvent` key, so a `StreamEvents` watcher sees "blocked on something" uniformly
-/// either way), or plain `Status::Ready` otherwise. Either way `next` becomes `current_nodes`.
 fn park_next(
     graph: &Graph,
     mut execution: Execution,
@@ -122,9 +117,6 @@ fn park_next(
     (execution, events)
 }
 
-/// The pure half of resuming a `Wait::UserInput`-parked execution: records the new input under
-/// a reserved state key and flips status back to `Ready`. Writing this to Postgres and sending
-/// `NOTIFY` is the service's job (Task 12) — this function only computes what changes.
 pub fn interrupt(
     mut execution: Execution,
     input: serde_json::Value,
@@ -139,15 +131,7 @@ pub fn interrupt(
     (execution, event)
 }
 
-/// Handles `FanOut`/`FanIn` semantics for one output, if applicable. Returns `true` when the
-/// caller should `continue` past ordinary edge evaluation for this output (a `FanOut` spawning
-/// its branches, or a *successful* branch recording itself into a `FanIn` barrier — complete or
-/// not); returns `false` for every other node, including a `FanIn` itself once reached as an
-/// active node (its outgoing `Always` edges go through the normal edge-evaluation path) and a
-/// *failed* branch (a failed branch is an ordinary failed `Task`: only its `Condition::Failed`
-/// edges may fire, and with none the whole execution hard-fails — folding an `Err` into the
-/// barrier's `results` would be indistinguishable from "not reported yet" and stall it forever).
-fn handle_fan(
+fn fan_handled_output(
     graph: &Graph,
     execution: &mut Execution,
     output: &NodeOutput,
@@ -166,17 +150,10 @@ fn handle_fan(
                     branch: Some(u32::try_from(index).unwrap_or(u32::MAX)),
                 });
             }
-            // The barrier's expected size is fixed here, at spawn time, and never recomputed:
-            // re-reading `source` when the first branch happens to complete would see whatever
-            // state another output in the same batch left behind (e.g. a `Replace` shrinking the
-            // very array we fanned out over), sizing `results` too small for the branches that
-            // were actually spawned.
             open_fan_in_barrier(graph, execution, target, branch_count);
-            return true; // FanOut has no ordinary outgoing edges to evaluate
+            return true;
         }
         Some(Node::FanIn { .. }) => {
-            // Reached only once its bookkeeping says every branch is in — ordinary edge
-            // evaluation after this match handles its outgoing edges.
             return false;
         }
         _ => {}
@@ -184,7 +161,7 @@ fn handle_fan(
 
     if let Some(fan_in_node) = fan_in_consuming(graph, &output.node.node) {
         if output.result.is_err() {
-            return false; // ordinary failed-Task handling: Failed edge, or hard-fail
+            return false;
         }
         record_fan_in_branch(execution, output, fan_in_node, next);
         return true;
@@ -193,37 +170,30 @@ fn handle_fan(
     false
 }
 
-/// Sizes (or resizes, on a second pass through the same `FanOut`) the `FanIn` barrier that
-/// `branch_target`'s branches feed, storing `expected` `Null` slots into
-/// `state["__fan_in"][fan_in_id]["results"]` the moment the branches are spawned.
 fn open_fan_in_barrier(
     graph: &Graph,
     execution: &mut Execution,
     branch_target: &crate::ids::NodeId,
-    expected: usize,
+    spawned_branches: usize,
 ) {
     let Some(Node::FanIn { id, .. }) = fan_in_consuming(graph, branch_target) else {
-        return; // a FanOut whose target doesn't lead to a FanIn — Graph::validate rejects it
+        return;
     };
     let fan_in_id = id.0.clone();
     execution
         .state
         .as_object_mut()
         .expect("state is an object")
-        .entry("__fan_in")
+        .entry(FAN_IN_TABLE)
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .expect("__fan_in is an object")
         .insert(
             fan_in_id,
-            json!({"results": vec![serde_json::Value::Null; expected]}),
+            json!({"results": vec![serde_json::Value::Null; spawned_branches]}),
         );
 }
 
-/// Records one successful branch's result into its `FanIn`'s barrier bookkeeping
-/// (`state["__fan_in"][id]`, already sized by `open_fan_in_barrier` when the `FanOut` fired) and,
-/// once every branch is in, folds the collected results into `state[key]` via `reducer` and
-/// pushes the `FanIn` node itself into `next`.
 fn record_fan_in_branch(
     execution: &mut Execution,
     output: &NodeOutput,
@@ -250,16 +220,13 @@ fn record_fan_in_branch(
         .state
         .as_object_mut()
         .expect("state is an object")
-        .entry("__fan_in")
+        .entry(FAN_IN_TABLE)
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .expect("__fan_in is an object");
     let slot = fan_in_table
         .entry(fan_in_id.0.clone())
         .or_insert_with(|| json!({"results": []}));
-    // The barrier was sized at spawn time, so `branch_index` is normally already in range; the
-    // grow-if-short guard only covers a barrier restored from a checkpoint written before that
-    // sizing existed, and replaces what used to be an index-out-of-bounds panic.
     let results = slot["results"].as_array_mut().expect("results is an array");
     if branch_index >= results.len() {
         results.resize(branch_index + 1, serde_json::Value::Null);
@@ -272,7 +239,7 @@ fn record_fan_in_branch(
         .iter()
         .all(|value| !value.is_null());
     if !all_in {
-        return; // this branch is recorded; the barrier isn't complete yet
+        return;
     }
     let folded: Vec<serde_json::Value> = slot["results"]
         .as_array()
@@ -284,10 +251,6 @@ fn record_fan_in_branch(
     next.push(ActiveNode::plain(fan_in_id));
 }
 
-/// Replaces any completed `FanIn` node in `next` with the targets of its own outgoing edges,
-/// evaluated against `execution.state` right now. A `FanIn` has no `TaskExecutor` of its own —
-/// once its barrier is satisfied it behaves like an ordinary node whose output already landed in
-/// state, so its edges fire in the same tick rather than parking it for a future output.
 fn expand_completed_fan_ins(
     graph: &Graph,
     execution: &Execution,
@@ -310,10 +273,6 @@ fn expand_completed_fan_ins(
     expanded
 }
 
-/// The `FanIn` node whose sole predecessor edge is `node` — i.e. `node` is a `FanOut`'s `target`
-/// and this returns that `FanOut`'s paired `FanIn`. `Graph::validate` (Task 9) rejects graphs
-/// where a `FanOut` target's outgoing edges don't lead to exactly one `FanIn`, so `step()` can
-/// assume this shape rather than re-checking it every tick.
 fn fan_in_consuming<'a>(graph: &'a Graph, node: &crate::ids::NodeId) -> Option<&'a Node> {
     graph
         .edges_from(node)
@@ -321,9 +280,6 @@ fn fan_in_consuming<'a>(graph: &'a Graph, node: &crate::ids::NodeId) -> Option<&
         .filter(|candidate| matches!(candidate, Node::FanIn { .. }))
 }
 
-/// Records the `NodeCompleted`/`NodeFailed` event for one output, charges the execution's budget
-/// for a completed `Task` (see `charge_budget`), and, for a successful `Task` output that
-/// declares a `state_key`, writes it into `execution.state` via its reducer.
 fn apply_output(
     graph: &Graph,
     execution: &mut Execution,
@@ -352,9 +308,6 @@ fn apply_output(
     }
 }
 
-/// Evaluates every outgoing edge from `output`'s node and pushes the ones that fire into `next`.
-/// A failed output only fires `Condition::Failed` edges; if none fire, records `hard_failure` so
-/// the caller can fail the whole execution.
 fn record_edges(
     graph: &Graph,
     execution: &Execution,
@@ -385,13 +338,6 @@ fn record_edges(
     }
 }
 
-/// Charges one completed `Task` against the execution's `Budget`: its token usage (from the
-/// output's own `{"usage": {"tokens_in", "tokens_out"}}` object, which `LlmTaskExecutor` fills in
-/// from llm-router's `CompleteResponse`; a `Task` kind that reports no usage charges 0 tokens)
-/// plus exactly one tool call, since a completed `Task` node is one action whatever its kind.
-/// Wall time isn't charged here — `step()` is pure and synchronous and has no elapsed-time
-/// signal for the work that produced these outputs; charging it needs the runtime to time the
-/// `TaskExecutor` call and report it alongside the output, which no port does today.
 fn charge_budget(execution: &mut Execution, value: &serde_json::Value) {
     let tokens = value.get("usage").map_or(0, |usage| {
         let field = |name: &str| {
@@ -404,22 +350,17 @@ fn charge_budget(execution: &mut Execution, value: &serde_json::Value) {
     });
     execution
         .budget
-        .charge(tokens, 1, std::time::Duration::ZERO);
+        .charge(tokens, ONE_TOOL_CALL, UNMEASURED_WALL_TIME);
 }
 
-/// `Task.config["state_key"]` names the state key this node's output is written to; absent
-/// means the output only drives edge conditions via `Failed`/`Always`, not `state`. Node kinds
-/// besides `Task` don't take this path — Task 5/6 add their own state-writing rules.
 fn state_key(config: &serde_json::Value) -> Option<&str> {
     config.get("state_key").and_then(serde_json::Value::as_str)
 }
 
 fn reducer_of(config: &serde_json::Value) -> Option<crate::graph::Reducer> {
-    match config.get("reducer").and_then(serde_json::Value::as_str) {
-        Some("Replace") | None => Some(crate::graph::Reducer::Replace),
-        Some("Append") => Some(crate::graph::Reducer::Append),
-        Some("Merge") => Some(crate::graph::Reducer::Merge),
-        Some(_) => None,
+    match config.get("reducer") {
+        None => Some(crate::graph::Reducer::Replace),
+        Some(declared) => serde_json::from_value(declared.clone()).ok(),
     }
 }
 
@@ -440,6 +381,7 @@ mod tests {
             nodes,
             edges,
             entry: NodeId(entry.to_owned()),
+            answer_pointer: None,
         }
     }
 
@@ -495,6 +437,83 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e.payload, ExecutionPayload::ExecutionCompleted { .. }))
+        );
+    }
+
+    fn answering_graph(answer_pointer: Option<&str>) -> Graph {
+        let mut g = graph(
+            vec![
+                Node::Task {
+                    id: NodeId("llm".into()),
+                    kind: "llm".into(),
+                    config: json!({"state_key": "llm", "reducer": "Replace"}),
+                },
+                Node::End {
+                    id: NodeId("end".into()),
+                },
+            ],
+            vec![Edge {
+                from: NodeId("llm".into()),
+                to: NodeId("end".into()),
+                condition: Condition::Always,
+            }],
+            "llm",
+        );
+        g.answer_pointer = answer_pointer.map(str::to_owned);
+        g
+    }
+
+    fn completion_result(events: &[ExecutionEvent]) -> Option<serde_json::Value> {
+        events.iter().find_map(|event| match &event.payload {
+            ExecutionPayload::ExecutionCompleted { result, .. } => result.clone(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_completed_event_carries_the_answer_the_graph_declares() {
+        let g = answering_graph(Some("/llm/reply"));
+        let (_, events) = step(
+            &g,
+            execution("llm"),
+            vec![ok("llm", json!({"reply": "62F and foggy"}))],
+            Utc::now(),
+        );
+
+        assert_eq!(completion_result(&events), Some(json!("62F and foggy")));
+    }
+
+    #[test]
+    fn a_graph_declaring_no_answer_completes_with_no_result_and_no_error() {
+        let g = answering_graph(None);
+        let (exec, events) = step(
+            &g,
+            execution("llm"),
+            vec![ok("llm", json!({"reply": "62F and foggy"}))],
+            Utc::now(),
+        );
+
+        assert_eq!(exec.status, Status::Completed);
+        assert_eq!(completion_result(&events), None);
+    }
+
+    #[test]
+    fn the_completed_event_still_carries_the_whole_final_state() {
+        let g = answering_graph(Some("/llm/reply"));
+        let (_, events) = step(
+            &g,
+            execution("llm"),
+            vec![ok("llm", json!({"reply": "62F and foggy"}))],
+            Utc::now(),
+        );
+
+        let final_state = events.iter().find_map(|event| match &event.payload {
+            ExecutionPayload::ExecutionCompleted { final_state, .. } => Some(final_state.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            final_state,
+            Some(json!({"llm": {"reply": "62F and foggy"}}))
         );
     }
 
@@ -559,8 +578,6 @@ mod tests {
 
     #[test]
     fn a_node_output_is_merged_into_state_before_conditions_are_evaluated() {
-        // The node's own output has nowhere to land in state unless a reducer key is declared
-        // for it — that's `Task.config["state_key"]`/`Task.config["reducer"]`, wired in Step 3.
         let g = graph(
             vec![
                 Node::Task {
@@ -811,8 +828,6 @@ mod tests {
         );
         assert_eq!(exec.current_nodes.len(), 2, "both branches spawned");
 
-        // First branch finishes: FanIn isn't ready yet, execution stays Ready with only the
-        // second branch outstanding — nothing to do for the runtime but wait for it.
         let branch0 = exec
             .current_nodes
             .iter()
@@ -833,7 +848,6 @@ mod tests {
             "waiting on the second branch, nothing active"
         );
 
-        // Second branch finishes: FanIn now has both results and fires into End.
         let branch1 = ActiveNode {
             node: NodeId("work".into()),
             branch: Some(1),
@@ -853,9 +867,6 @@ mod tests {
 
     #[test]
     fn a_failed_fan_out_branch_without_a_failed_edge_fails_the_whole_execution() {
-        // Regression: a branch's Err used to be folded into the barrier as `null`, which is
-        // exactly what an unreported branch looks like — the barrier never filled and the
-        // execution stalled silently instead of failing like any other Task with no Failed edge.
         let g = fan_out_join_graph();
         let mut exec = execution("spread");
         exec.state = json!({"items": ["a", "b"]});
@@ -892,10 +903,6 @@ mod tests {
 
     #[test]
     fn a_fan_in_barrier_keeps_its_spawn_time_size_when_the_source_array_is_rewritten() {
-        // Regression: the barrier's expected size used to be recomputed from live state at
-        // branch-completion time, so another output in the same batch replacing the fanned-out
-        // array shrank `results` below the number of branches actually spawned — an
-        // index-out-of-bounds panic on the branch whose index no longer fit.
         let mut g = fan_out_join_graph();
         g.nodes.push(Node::Task {
             id: NodeId("other".into()),
@@ -915,7 +922,6 @@ mod tests {
         );
         assert_eq!(exec.current_nodes.len(), 2, "both branches spawned");
 
-        // One batch: an unrelated node empties `/items` *before* either branch is processed.
         let (exec, _) = step(
             &g,
             exec,
@@ -1081,12 +1087,6 @@ mod tests {
         exec.state = json!({"question": "weather in SF?"});
         let (exec, events) = step(&g, exec, vec![], Utc::now());
 
-        // No output was supplied for the Subgraph node — step() alone can't start a child
-        // execution (that needs Postgres), so it can only ever be reached with an empty
-        // `outputs` the first time; the *service*'s tick loop is what notices an un-started
-        // Subgraph node in current_nodes and calls StartExecution before the next tick (Task
-        // 12). step() itself just parks it and emits the same Waiting event a Wait node would,
-        // so a StreamEvents watcher sees "blocked on something" uniformly either way.
         assert_eq!(
             exec.status,
             Status::Waiting(WaitKind::ExternalEvent {

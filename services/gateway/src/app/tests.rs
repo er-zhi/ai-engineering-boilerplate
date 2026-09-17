@@ -1,3 +1,5 @@
+// Checks which routes the app leaves public and which it puts behind a session.
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;

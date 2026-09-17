@@ -1,8 +1,4 @@
-// chat.topics: the tree of topics per session — reference data, grows with topic count, not
-// time, no partitioning needed. `status` is the durable source of truth for restart recovery
-// (spec: "темы восстанавливаются из лога" — here, from this row directly: Chat keeps no
-// append-only event log of its own, Engine's already-partitioned execution_events is the log
-// of record for a topic's execution detail).
+// chat.topics: the tree of topics per session, and the durable status restart recovery reads.
 
 use sea_orm::entity::prelude::*;
 
@@ -32,18 +28,10 @@ pub struct Model {
     #[sea_orm(column_type = "String(StringLen::N(128))")]
     pub title: String,
     pub status: Status,
-    /// Unset only while `Queued` — a queued topic has no Engine execution yet.
     pub execution_id: Option<Uuid>,
-    /// The caller's `CreateTopicRequest.input_json`, kept verbatim so a topic that starts out
-    /// `Queued` can be started with its original intent by `promote_next_queued` once a slot
-    /// frees — rather than the empty state an Engine execution would otherwise get.
-    /// Defaults to `{}`, never `""`: the default is what any row predating this column gets on
-    /// schema sync, and `promote_next_queued` hands this value straight to Engine, which rejects
-    /// anything that isn't a JSON object. A `Queued` row carrying `""` would fail to start on
-    /// every promotion attempt, and since it stays the oldest queued row, it would wedge the
-    /// session's queue permanently — `finish_topic`'s error is only logged, never surfaced.
-    #[sea_orm(column_type = "Text", default_value = "{}")]
-    pub input_json: String,
+    #[sea_orm(column_type = "JsonBinary", default_value = "{}")]
+    pub input_json: Json,
+    #[sea_orm(column_type = "Text")]
     pub result_summary: Option<String>,
     #[sea_orm(column_type = "JsonBinary")]
     pub artifact_ids: Json,
@@ -52,3 +40,8 @@ pub struct Model {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+pub const INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC: [&str; 1] = [
+    "CREATE INDEX IF NOT EXISTS topics_session_status_created_idx \
+     ON chat.topics (session_id, status, created_at)",
+];

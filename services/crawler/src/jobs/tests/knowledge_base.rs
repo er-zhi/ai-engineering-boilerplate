@@ -2,13 +2,6 @@
 
 use super::*;
 
-fn only_docs() -> Scope {
-    Scope::new(&CrawlScope {
-        include_patterns: vec!["/docs/*".into()],
-        ..Default::default()
-    })
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changed_page_is_handed_to_knowledge_base() {
     let site = TestSite::start([("/", "/docs/a"), ("/docs/a", "")]).await;

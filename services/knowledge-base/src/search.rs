@@ -1,6 +1,11 @@
-// Turns a raw query into what the retrievers take, and page-type names into the entity enum and back.
+// Turns a raw query into what the retrievers take, and the published page type into the entity enum and back.
+
+use buffa::Enumeration;
+use common::proto::knowledge_base::v1::PageType as PageTypeProto;
 
 use crate::entity::document::PageType;
+
+const PAGE_TYPE_NAME_PREFIX: &str = "PAGE_TYPE_";
 
 pub fn normalize(query: &str) -> String {
     query
@@ -18,27 +23,49 @@ pub fn any_word_lexical_query(query: &str) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" | "))
 }
 
-pub fn page_type_named(name: &str) -> Option<PageType> {
-    match name {
-        "product" => Some(PageType::Product),
-        "knowledge" => Some(PageType::Knowledge),
-        "instruction" => Some(PageType::Instruction),
-        "documentation" => Some(PageType::Documentation),
-        "blog" => Some(PageType::Blog),
-        "other" => Some(PageType::Other),
-        _ => None,
+pub fn page_type_of(declared: PageTypeProto) -> Option<PageType> {
+    match declared {
+        PageTypeProto::Unspecified => None,
+        PageTypeProto::Other => Some(PageType::Other),
+        PageTypeProto::Product => Some(PageType::Product),
+        PageTypeProto::Knowledge => Some(PageType::Knowledge),
+        PageTypeProto::Instruction => Some(PageType::Instruction),
+        PageTypeProto::Documentation => Some(PageType::Documentation),
+        PageTypeProto::Blog => Some(PageType::Blog),
     }
 }
 
-pub fn page_type_name(page_type: PageType) -> &'static str {
+pub fn page_type_proto(page_type: PageType) -> PageTypeProto {
     match page_type {
-        PageType::Other => "other",
-        PageType::Product => "product",
-        PageType::Knowledge => "knowledge",
-        PageType::Instruction => "instruction",
-        PageType::Documentation => "documentation",
-        PageType::Blog => "blog",
+        PageType::Other => PageTypeProto::Other,
+        PageType::Product => PageTypeProto::Product,
+        PageType::Knowledge => PageTypeProto::Knowledge,
+        PageType::Instruction => PageTypeProto::Instruction,
+        PageType::Documentation => PageTypeProto::Documentation,
+        PageType::Blog => PageTypeProto::Blog,
     }
+}
+
+pub fn page_type_word(declared: PageTypeProto) -> String {
+    declared
+        .proto_name()
+        .trim_start_matches(PAGE_TYPE_NAME_PREFIX)
+        .to_lowercase()
+}
+
+pub fn page_type_of_word(word: &str) -> Option<PageTypeProto> {
+    PageTypeProto::from_proto_name(&format!(
+        "{PAGE_TYPE_NAME_PREFIX}{}",
+        word.trim().to_uppercase()
+    ))
+}
+
+pub fn classifiable_page_types() -> Vec<PageTypeProto> {
+    PageTypeProto::values()
+        .iter()
+        .copied()
+        .filter(|declared| *declared != PageTypeProto::Unspecified)
+        .collect()
 }
 
 #[cfg(test)]
@@ -72,16 +99,10 @@ mod tests {
     }
 
     #[test]
-    fn page_type_names_round_trip() {
-        for page_type in [
-            PageType::Other,
-            PageType::Product,
-            PageType::Knowledge,
-            PageType::Instruction,
-            PageType::Documentation,
-            PageType::Blog,
-        ] {
-            assert_eq!(page_type_named(page_type_name(page_type)), Some(page_type));
+    fn the_word_a_classifier_answers_with_names_the_page_type_it_came_from() {
+        for declared in classifiable_page_types() {
+            assert_eq!(page_type_of_word(&page_type_word(declared)), Some(declared));
         }
+        assert_eq!(page_type_of_word("faq"), None);
     }
 }

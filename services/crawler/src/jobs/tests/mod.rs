@@ -25,6 +25,13 @@ mod storage;
 
 use fixtures::*;
 
+fn only_docs() -> Scope {
+    Scope::new(&CrawlScope {
+        include_patterns: vec!["/docs/*".into()],
+        ..Default::default()
+    })
+}
+
 const LIMITS: Limits = Limits {
     max_pages: 50,
     request_timeout: Duration::from_secs(5),

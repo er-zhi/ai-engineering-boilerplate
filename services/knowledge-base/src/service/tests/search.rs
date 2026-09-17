@@ -2,6 +2,9 @@
 
 use super::super::*;
 use super::support::*;
+use common::proto::knowledge_base::v1::PageType as PageTypeProto;
+
+const UNKNOWN_PAGE_TYPE: i32 = 99;
 
 #[tokio::test]
 async fn a_search_fuses_passages_and_returns_each_document_once_with_its_best_passage() {
@@ -16,7 +19,7 @@ async fn a_search_fuses_passages_and_returns_each_document_once_with_its_best_pa
     let response = knowledge_base
         .search(search_request(
             "  Wireless   PRODUCT? ",
-            &["product", "blog"],
+            &[PageTypeProto::Product, PageTypeProto::Blog],
         ))
         .await
         .unwrap();
@@ -27,7 +30,10 @@ async fn a_search_fuses_passages_and_returns_each_document_once_with_its_best_pa
         .map(|result| (result.source_id.as_str(), result.snippet.as_str()))
         .collect();
     assert_eq!(results, [("b", "passage 2"), ("a", "passage 3")]);
-    assert_eq!(response.results[0].page_type, "product");
+    assert_eq!(
+        response.results[0].page_type,
+        EnumValue::Known(PageTypeProto::Product)
+    );
     assert_eq!(response.results[0].keywords, ["wireless", "headphones"]);
     assert_eq!(response.results[0].updated_at, "2026-09-10T00:26:40+00:00");
     assert_eq!(response.results[0].document.source_id, "b");
@@ -97,7 +103,7 @@ async fn a_limit_above_the_maximum_is_refused() {
 #[tokio::test]
 async fn too_many_page_types_are_refused() {
     let knowledge_base = KnowledgeBase::new(MemoryDocuments::default(), FakeLlm::default());
-    let names = ["product"; MAX_PAGE_TYPES + 1];
+    let names = [PageTypeProto::Product; MAX_PAGE_TYPES + 1];
 
     let error = knowledge_base
         .search(search_request("headphones", &names))
@@ -113,11 +119,17 @@ async fn an_unknown_page_type_is_refused_before_anything_runs() {
     let knowledge_base = KnowledgeBase::new(documents.clone(), FakeLlm::default());
 
     let error = knowledge_base
-        .search(search_request("headphones", &["faq"]))
+        .search(SearchRequest {
+            page_types: vec![EnumValue::Unknown(UNKNOWN_PAGE_TYPE)],
+            ..search_request("headphones", &[])
+        })
         .await
         .unwrap_err();
 
-    assert!(format!("{error:?}").contains("faq"), "{error:?}");
+    assert!(
+        format!("{error:?}").contains(&UNKNOWN_PAGE_TYPE.to_string()),
+        "{error:?}"
+    );
     assert!(documents.nearest_with.lock().unwrap().is_empty());
 }
 

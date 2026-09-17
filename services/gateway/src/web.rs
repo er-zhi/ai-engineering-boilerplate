@@ -6,7 +6,6 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response as HttpResponse};
-use common::cache::CacheStore;
 
 use crate::auth::{COOKIE_NAME, cookie_value, generate_token, hash_token, passwords_match};
 use crate::sessions::PgCacheStore;

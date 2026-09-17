@@ -1,7 +1,4 @@
-// engine-core: the pure graph-execution logic — Graph, Node, Edge, State, Execution,
-// Checkpoint, Event, and the one function (step) that ties them together. No async, no I/O, no
-// database: everything here is deterministic and unit-testable without a running Postgres or a
-// running engine service. See docs/superpowers/specs/2026-09-15-engine-design.md.
+// Pure, deterministic graph-execution logic with no async, I/O, or database.
 
 pub mod budget;
 pub mod builder;
@@ -12,6 +9,7 @@ pub mod execution;
 pub mod fakes;
 pub mod graph;
 pub mod ids;
+pub mod llm_output;
 pub mod ports;
 #[cfg(test)]
 mod replay;
@@ -25,6 +23,10 @@ pub use event::{Event, ExecutionEvent, ExecutionPayload};
 pub use execution::{ActiveNode, Execution, Status};
 pub use graph::{Condition, Edge, Graph, Node, Reducer, WaitKind, evaluate_condition};
 pub use ids::{ExecutionId, GraphId, NodeId, UserId};
-pub use ports::{CheckpointStore, EventSink, TaskError, TaskExecutor};
+pub use llm_output::{
+    LLM_STATE_KEY, LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, ToolCall,
+    llm_reply_pointer, llm_tool_call_pointer,
+};
+pub use ports::{CheckpointStore, TaskError, TaskExecutor};
 pub use state::apply_reducer;
 pub use step::{NodeOutput, interrupt, step};

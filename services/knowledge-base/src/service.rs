@@ -1,5 +1,6 @@
 // Checks each request at the boundary, then runs ingest or hybrid retrieval over passages.
 
+use buffa::{EnumValue, Enumeration};
 use common::proto::knowledge_base::v1::{
     DocumentRef, IngestRequest, IngestResponse, ReadDocumentRequest, ReadDocumentResponse,
     SearchRequest, SearchResponse, SearchResult,
@@ -143,7 +144,7 @@ fn search_result(ranked: Ranked) -> Result<SearchResult, ConnectError> {
         source_id: passage.source_id,
         title: passage.title,
         summary: passage.summary,
-        page_type: search::page_type_name(passage.page_type).to_owned(),
+        page_type: EnumValue::Known(search::page_type_proto(passage.page_type)),
         keywords: passage.keywords,
         snippet: passage.content,
         updated_at: passage.updated_at.to_rfc3339(),
@@ -176,10 +177,13 @@ fn parse_query(request: &SearchRequest) -> Result<Vec<PageType>, ConnectError> {
     request
         .page_types
         .iter()
-        .map(|name| {
-            search::page_type_named(name).ok_or_else(|| {
-                ConnectError::invalid_argument(format!("unknown page type {name:?}"))
-            })
+        .map(|declared| match declared {
+            EnumValue::Known(known) => search::page_type_of(*known).ok_or_else(|| {
+                ConnectError::invalid_argument(format!("unknown page type {}", known.proto_name()))
+            }),
+            EnumValue::Unknown(value) => Err(ConnectError::invalid_argument(format!(
+                "unknown page type {value}"
+            ))),
         })
         .collect()
 }

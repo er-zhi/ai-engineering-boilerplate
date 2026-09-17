@@ -1,6 +1,4 @@
-// Budget: how much of the execution's token/tool-call/wall-time allowance is left. Fields are
-// remaining capacity, not configured limits — charge() saturates at zero rather than
-// underflowing, exhausted() is the single check step() needs before starting another iteration.
+// Tracks how much of an execution's token, tool-call and wall-time allowance is left.
 
 use std::time::Duration;
 

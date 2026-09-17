@@ -1,7 +1,4 @@
-// A checkpoint: the execution's state and position after one super-step, written alongside its
-// events in the same database transaction (see the engine service's tick loop). schema_version
-// is a plain constant today — nothing to upgrade from yet, so a generic Versioned<T> wrapper
-// would be premature; see the spec's "Что реально переиспользуется" table.
+// Holds an execution's state and position after one super-step.
 
 use serde::{Deserialize, Serialize};
 

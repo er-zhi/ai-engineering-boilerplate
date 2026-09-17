@@ -1,6 +1,7 @@
-// engine as a library: everything main.rs assembles, exposed so it can be unit- and
-// integration-tested directly (main.rs stays a thin binary entry point).
+// Everything main.rs assembles, exposed as a library so it can be tested directly.
 
+pub mod builtin_graphs;
+pub mod control;
 pub mod cron_next;
 pub mod dispatch;
 pub mod entity;

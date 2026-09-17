@@ -1,7 +1,4 @@
-// chat.sessions: one row per user — reference data, grows with users, not time, no
-// partitioning needed (gate-database "Growth"). One session per user for this scope (see this
-// plan's Task 3 design note); focus_topic_id is a pointer, not a topic's own property (spec:
-// "Фокус — указатель, не свойство темы"), so it lives here.
+// chat.sessions: one row per user, holding that user's focus pointer.
 
 use sea_orm::entity::prelude::*;
 

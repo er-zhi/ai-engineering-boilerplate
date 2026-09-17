@@ -73,6 +73,8 @@ Detailed host-mode commands, database access, tests, and troubleshooting are in 
 - [Knowledge Base](services/knowledge-base/README.md)
 - [LLM Router](services/llm-router/README.md)
 - [Gateway](services/gateway/README.md)
+- [Engine](services/engine/README.md)
+- [Tool Service](services/tool/README.md)
 - [Frontend](services/frontend/README.md)
 - [Native Apple Neural Engine embedder](native/embedder-ane/README.md)
 - [Shared contracts and utilities](common/README.md)

@@ -1,6 +1,4 @@
-// Turns fetched HTML into a title, the main text, and a hash of that text. Shared by the
-// crawler (a fetched page) and Tool Service's web_fetch (a tool call's fetched page) — the
-// second real consumer this moved for.
+// Turns fetched HTML into a title, the main text, and a hash of that text.
 
 use dom_smoothie::Readability;
 use sha2::{Digest, Sha256};

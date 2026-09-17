@@ -1,14 +1,11 @@
-// web_search: You.com Search API behind SearchProvider — an alternative to Brave, selected at
-// startup by which of YOU_SEARCH_API_KEY / BRAVE_SEARCH_API_KEY is set (main.rs). Docs verified
-// against the live API: GET https://ydc-index.io/v1/search?query=<q> with header
-// X-API-Key: <key> -> 200 JSON {"results":{"web":[{"url","title","description"}, ...]}}.
-// (The older api.ydc-index.io host returns 403 — do not use it.) The API has no documented
-// result-count parameter, so `limit` is enforced client-side by truncating.
+// web_search backed by the You.com Search API, behind SearchProvider.
 
 use serde::Deserialize;
 use url::Url;
 
-use crate::providers::brave::{SearchProvider, SearchResult};
+use crate::providers::{SearchProvider, SearchResult};
+
+const SEARCH_URL: &str = "https://ydc-index.io/v1/search";
 
 pub struct YouSearchProvider {
     api_key: String,
@@ -18,11 +15,11 @@ pub struct YouSearchProvider {
 
 impl YouSearchProvider {
     #[must_use]
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, client: reqwest::Client) -> Self {
         Self {
             api_key,
-            base_url: "https://ydc-index.io/v1/search".to_owned(),
-            client: reqwest::Client::new(),
+            base_url: SEARCH_URL.to_owned(),
+            client,
         }
     }
 
@@ -32,7 +29,7 @@ impl YouSearchProvider {
         Self {
             api_key,
             base_url,
-            client: reqwest::Client::new(),
+            client: crate::service::bounded_http_client().expect("client"),
         }
     }
 }
@@ -81,9 +78,13 @@ impl SearchProvider for YouSearchProvider {
                 snippet: r.description,
             })
             .collect();
-        results.truncate(limit as usize);
+        enforce_limit_client_side(&mut results, limit);
         Ok(results)
     }
+}
+
+fn enforce_limit_client_side(results: &mut Vec<SearchResult>, limit: u8) {
+    results.truncate(limit as usize);
 }
 
 #[cfg(test)]

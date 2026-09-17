@@ -331,12 +331,11 @@ fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
-// crawl::crawl_into's spider callback uses block_in_place + blocking_send to apply real
-// backpressure into a bounded channel; block_in_place converts the current worker thread into a
-// blocking one until a replacement spins up, so it needs headroom in the worker pool rather than
-// depending on how many CPUs the host happens to expose (a Docker `cpus:` quota doesn't reduce
-// that count). Fixed above jobs::MAX_CONCURRENT_CRAWLS * crawl::FETCH_CONCURRENCY (2 * 2 = 4 at
-// most concurrently blocked) so the runtime can't stall other async work on this pool.
+const WORKER_THREADS_BLOCKED_ON_PAGE_BACKPRESSURE: usize =
+    MAX_CONCURRENT_CRAWLS * crawl::FETCH_CONCURRENCY;
+const FIXED_WORKER_THREADS: usize = 8;
+const _: () = assert!(FIXED_WORKER_THREADS > WORKER_THREADS_BLOCKED_ON_PAGE_BACKPRESSURE);
+
 #[tokio::main(worker_threads = 8)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     common::logging::init();

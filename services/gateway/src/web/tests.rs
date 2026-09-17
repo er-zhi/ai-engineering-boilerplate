@@ -1,10 +1,11 @@
+// Checks the login, logout, session rejection and expiry sweep behaviour.
+
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware;
 use axum::routing::get;
-use common::cache::CacheStore;
 use tower::ServiceExt;
 
 use super::*;

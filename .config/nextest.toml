@@ -6,11 +6,11 @@ command = ["sh", ".config/nextest-postgres.sh"]
 slow-timeout = { period = "10s", terminate-after = 6 }
 
 [[profile.default.scripts]]
-filter = "package(crawler) + package(gateway) + package(knowledge-base) + package(llm-router)"
+filter = "package(crawler) + package(gateway) + package(knowledge-base) + package(llm-router) + package(engine) + package(tool) + package(chat)"
 setup = "postgres"
 
 [[profile.ci.scripts]]
-filter = "package(crawler) + package(gateway) + package(knowledge-base) + package(llm-router)"
+filter = "package(crawler) + package(gateway) + package(knowledge-base) + package(llm-router) + package(engine) + package(tool) + package(chat)"
 setup = "postgres"
 
 [profile.default]

@@ -1,6 +1,4 @@
-// Risk policy: deterministic Rust, never an LLM call. ReadOnly runs; Write/Destructive need an
-// approval flow Engine doesn't have yet (see the spec's "Три развилки", #2) — Execute reports
-// that plainly rather than running the tool or hanging.
+// Decides from a tool's risk alone, without an LLM call, whether Execute may run it.
 
 use crate::entity::tool::Risk;
 

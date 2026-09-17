@@ -1,60 +1,46 @@
-// TaskExecutor for kind="tool": calls Tool Service's Execute. Two graphs give it the call two
-// different ways: agent_graph's tool node has empty config and an LLM decides the call, so it
-// lands at state["llm"]["tool_call"] (see engine-core/src/builder.rs's doc comment on that
-// node); rag_graph's tool node IS the entry point — no llm node has run yet, so there is no
-// state["llm"] to read — and instead fixes its slug in config["tool_slug"], searching
-// state["question"] (StartExecution's own initial state). A config-given tool_slug wins when
-// present; otherwise this falls back to the state["llm"]["tool_call"] convention.
-//
-// Errors split two ways. A tool that *ran* and said no (invalid_argument, a site that blocks
-// bots, a timeout) is an observation, returned as Ok({"error": msg}) so the graph's tool → llm
-// edge carries it back to the model, which can retry with fixed arguments or pick another tool;
-// MAX_CONSECUTIVE_TOOL_ERRORS in a row ends that as a real failure. A tool that could not be
-// *asked* (Tool Service unreachable / RPC transport error) or whose answer needs an approval
-// Engine can't give stays a hard TaskError::Failed.
+// Runs a tool node by calling Tool Service.
 
-use common::proto::tools::v1::{ExecuteRequest, ListToolsRequest, Tool, ToolServiceClient};
-use connectrpc::Protocol;
-use connectrpc::client::{ClientConfig, HttpClient};
-use engine_core::{TaskError, TaskExecutor};
+use buffa::EnumValue;
+use common::execution_input::ExecutionInput;
+use common::proto::tools::v1::{
+    ExecuteRequest, ExecuteStatus, ListToolsRequest, Tool, ToolServiceClient,
+};
+use connectrpc::client::HttpClient;
+use engine_core::{
+    LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
+    llm_tool_call_pointer,
+};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use serde_json::Value;
 use std::time::Duration;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How many tool calls in a row may come back as errors before the execution gives up. A tool
-/// error is an observation the model can recover from (retry with fixed arguments, pick another
-/// tool, answer with what it has), but an agent that keeps hitting the same wall must not loop
-/// until `max_iterations`/budget — it fails here, with the last error in the message.
 pub const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 3;
+pub const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 
-/// How many of the most recent `state["tool_result"]` entries are error observations. The array
-/// is agent_graph's Append-reduced tool log (see `engine-core/src/builder.rs`), so its tail *is*
-/// the consecutive-error run: a successful call appends a plain result and resets the count.
 fn consecutive_tool_errors(state: &Value) -> usize {
     state
-        .get("tool_result")
+        .get(TOOL_RESULT_STATE_KEY)
         .and_then(Value::as_array)
         .map(|results| {
             results
                 .iter()
                 .rev()
-                .take_while(|result| result.get("error").is_some())
+                .take_while(|result| result.get(TOOL_RESULT_ERROR_KEY).is_some())
                 .count()
         })
         .unwrap_or(0)
 }
 
-/// One recoverable tool error as this executor's output: `{"error": msg}`, which the tool node's
-/// Append reducer lands in `state["tool_result"]` and `build_prompt` renders back to the model —
-/// unless this is the `MAX_CONSECUTIVE_TOOL_ERRORS`'th in a row, which fails the execution.
 fn recoverable_error(state: &Value, message: &str) -> Result<Value, TaskError> {
     if consecutive_tool_errors(state) + 1 >= MAX_CONSECUTIVE_TOOL_ERRORS {
         return Err(TaskError::Failed(format!(
             "{MAX_CONSECUTIVE_TOOL_ERRORS} consecutive tool errors, giving up; last error: {message}"
         )));
     }
-    Ok(serde_json::json!({ "error": message }))
+    Ok(serde_json::json!({ TOOL_RESULT_ERROR_KEY: message }))
 }
 
 pub struct ToolTaskExecutor {
@@ -63,22 +49,16 @@ pub struct ToolTaskExecutor {
 
 impl ToolTaskExecutor {
     pub fn new(tool_service_url: &str) -> Result<Self, String> {
-        let target = tool_service_url
-            .parse()
-            .map_err(|e| format!("could not parse TOOL_SERVICE_URL {tool_service_url:?}: {e}"))?;
         Ok(Self {
-            client: ToolServiceClient::new(
-                HttpClient::plaintext_http2_only(),
-                ClientConfig::new(target)
-                    .with_protocol(Protocol::Grpc)
-                    .with_default_timeout(CALL_TIMEOUT)
-                    .proto(),
-            ),
+            client: crate::executors::grpc_client(
+                "TOOL_SERVICE_URL",
+                tool_service_url,
+                CALL_TIMEOUT,
+                ToolServiceClient::new,
+            )?,
         })
     }
 
-    /// The catalog `Dispatcher` (Task 14) injects into an LLM node's `config` before a
-    /// tool-calling turn — a plain RPC, not part of the `TaskExecutor` port.
     pub async fn list_tools(&self) -> Result<Vec<Tool>, String> {
         let response = self
             .client
@@ -98,14 +78,69 @@ impl TaskExecutor for ToolTaskExecutor {
         state: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TaskError> {
-        debug_assert_eq!(kind, "tool");
-        let (slug, args) = tool_call(config, state)?;
+        debug_assert_eq!(
+            crate::dispatch::NodeKind::parse(kind),
+            Ok(crate::dispatch::NodeKind::Tool)
+        );
+        let calls = requested_calls(config, state)?;
+        if calls.len() > MAX_PARALLEL_TOOL_CALLS {
+            return recoverable_error(
+                state,
+                &format!(
+                    "one turn may call at most {MAX_PARALLEL_TOOL_CALLS} tools at once, got {}",
+                    calls.len()
+                ),
+            );
+        }
 
+        let outcomes = self.run_all(&calls, idempotency_key).await?;
+
+        match outcomes.as_slice() {
+            [CallOutcome::Output(output)] => Ok(output.clone()),
+            [CallOutcome::Error(message)] => recoverable_error(state, message),
+            many if many.iter().all(CallOutcome::is_error) => {
+                recoverable_error(state, &joined_errors(&calls, many))
+            }
+            many => Ok(results_by_call(&calls, many)),
+        }
+    }
+}
+
+impl ToolTaskExecutor {
+    async fn run_all(
+        &self,
+        calls: &[ToolCall],
+        idempotency_key: &str,
+    ) -> Result<Vec<CallOutcome>, TaskError> {
+        let mut running: FuturesUnordered<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| async move {
+                (
+                    index,
+                    self.call_tool(call, &format!("{idempotency_key}:{index}"))
+                        .await,
+                )
+            })
+            .collect();
+        let mut finished = Vec::with_capacity(calls.len());
+        while let Some((index, outcome)) = running.next().await {
+            finished.push((index, outcome?));
+        }
+        finished.sort_by_key(|(index, _)| *index);
+        Ok(finished.into_iter().map(|(_, outcome)| outcome).collect())
+    }
+
+    async fn call_tool(
+        &self,
+        call: &ToolCall,
+        idempotency_key: &str,
+    ) -> Result<CallOutcome, TaskError> {
         let response = self
             .client
             .execute(ExecuteRequest {
-                slug,
-                input_json: args.to_string(),
+                slug: call.name.clone(),
+                input_json: call.args.to_string(),
                 idempotency_key: idempotency_key.to_owned(),
                 ..Default::default()
             })
@@ -113,45 +148,89 @@ impl TaskExecutor for ToolTaskExecutor {
             .map_err(|e| TaskError::Failed(e.to_string()))?
             .into_owned();
 
-        match response.status.as_str() {
-            "ok" => serde_json::from_str(&response.output_json)
+        match response.status {
+            EnumValue::Known(ExecuteStatus::Ok) => serde_json::from_str(&response.output_json)
+                .map(CallOutcome::Output)
                 .map_err(|e| TaskError::Failed(e.to_string())),
-            // Not recoverable: nothing the model can say makes an unapproved tool run, so this
-            // stays a hard failure, as does an unreachable Tool Service (the `?` above).
-            "requires_approval" => Err(TaskError::Failed(
+            EnumValue::Known(ExecuteStatus::RequiresApproval) => Err(TaskError::Failed(
                 "tool requires approval — not yet wired in Engine".to_owned(),
             )),
-            // Recoverable: the tool itself said no (bad arguments, a site that blocks bots, a
-            // timeout). Hand that back to the model as an observation instead of crashing.
-            _ => recoverable_error(state, &response.error_message),
+            EnumValue::Known(
+                ExecuteStatus::Error | ExecuteStatus::NotExecutable | ExecuteStatus::Unspecified,
+            )
+            | EnumValue::Unknown(_) => Ok(CallOutcome::Error(response.error_message)),
         }
     }
 }
 
-/// `(slug, args)` for this call, resolved per the two conventions documented at the top of this
-/// file: a config-fixed `tool_slug` (rag_graph) wins; otherwise the LLM-decided
-/// `state["llm"]["tool_call"]` (agent_graph).
-fn tool_call(config: &Value, state: &Value) -> Result<(String, Value), TaskError> {
-    if let Some(slug) = config.get("tool_slug").and_then(Value::as_str) {
-        let query = state
-            .get("question")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        return Ok((slug.to_owned(), serde_json::json!({"query": query})));
+enum CallOutcome {
+    Output(Value),
+    Error(String),
+}
+
+impl CallOutcome {
+    fn is_error(&self) -> bool {
+        matches!(self, Self::Error(_))
     }
-    let call = state.pointer("/llm/tool_call").ok_or_else(|| {
-        TaskError::Failed("no tool_call at state[\"llm\"][\"tool_call\"]".to_owned())
-    })?;
-    let slug = call
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| TaskError::Failed("tool_call.name is missing".to_owned()))?
-        .to_owned();
-    let args = call
-        .get("args")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    Ok((slug, args))
+}
+
+fn requested_calls(config: &Value, state: &Value) -> Result<Vec<ToolCall>, TaskError> {
+    if let Some(slug) = config.get("tool_slug").and_then(Value::as_str) {
+        return Ok(vec![ToolCall {
+            name: slug.to_owned(),
+            args: serde_json::json!({"query": ExecutionInput::in_state(state).question}),
+        }]);
+    }
+    let requested = LlmOutput::in_state(state).tool_call;
+    if requested.is_null() {
+        return Err(TaskError::Failed(format!(
+            "no tool call at {}",
+            llm_tool_call_pointer()
+        )));
+    }
+    let one_or_many = match requested {
+        Value::Array(calls) => calls,
+        single => vec![single],
+    };
+    if one_or_many.is_empty() {
+        return Err(TaskError::Failed("tool_call is an empty list".to_owned()));
+    }
+    one_or_many.into_iter().map(parsed_call).collect()
+}
+
+fn parsed_call(call: Value) -> Result<ToolCall, TaskError> {
+    serde_json::from_value(call)
+        .map_err(|error| TaskError::Failed(format!("tool_call is not usable: {error}")))
+}
+
+fn results_by_call(calls: &[ToolCall], outcomes: &[CallOutcome]) -> Value {
+    let entries: Vec<Value> = calls
+        .iter()
+        .zip(outcomes)
+        .map(|(call, outcome)| {
+            let mut entry = serde_json::json!({"name": call.name, "args": call.args});
+            match outcome {
+                CallOutcome::Output(output) => entry["result"] = output.clone(),
+                CallOutcome::Error(message) => {
+                    entry[TOOL_RESULT_ERROR_KEY] = Value::String(message.clone());
+                }
+            }
+            entry
+        })
+        .collect();
+    serde_json::json!({"calls": entries})
+}
+
+fn joined_errors(calls: &[ToolCall], outcomes: &[CallOutcome]) -> String {
+    let reasons: Vec<String> = calls
+        .iter()
+        .zip(outcomes)
+        .filter_map(|(call, outcome)| match outcome {
+            CallOutcome::Error(message) => Some(format!("{}: {message}", call.name)),
+            CallOutcome::Output(_) => None,
+        })
+        .collect();
+    format!("every tool call failed — {}", reasons.join("; "))
 }
 
 #[cfg(test)]
@@ -168,7 +247,7 @@ mod tests {
 
     struct FakeToolService {
         received: Mutex<Vec<ExecuteRequest>>,
-        status: String,
+        status: ExecuteStatus,
         output_json: String,
         error_message: String,
     }
@@ -177,16 +256,16 @@ mod tests {
         fn ok(output_json: &str) -> Self {
             Self {
                 received: Mutex::new(Vec::new()),
-                status: "ok".to_owned(),
+                status: ExecuteStatus::Ok,
                 output_json: output_json.to_owned(),
                 error_message: String::new(),
             }
         }
 
-        fn failing(status: &str, error_message: &str) -> Self {
+        fn failing(status: ExecuteStatus, error_message: &str) -> Self {
             Self {
                 received: Mutex::new(Vec::new()),
-                status: status.to_owned(),
+                status,
                 output_json: String::new(),
                 error_message: error_message.to_owned(),
             }
@@ -205,7 +284,7 @@ mod tests {
                 .expect("lock")
                 .push(request.to_owned_message());
             Response::ok(ExecuteResponse {
-                status: self.status.clone(),
+                status: EnumValue::Known(self.status),
                 output_json: self.output_json.clone(),
                 error_message: self.error_message.clone(),
                 ..Default::default()
@@ -299,8 +378,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_list_of_tool_calls_runs_every_one_and_labels_each_result() {
+        let fake = Arc::new(FakeToolService::ok(r#"{"title": "page"}"#));
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = ToolTaskExecutor::new(&url).expect("client");
+        let state = serde_json::json!({"llm": {"tool_call": [
+            {"name": "web_fetch", "args": {"url": "https://first.example/a"}},
+            {"name": "web_fetch", "args": {"url": "https://second.example/b"}},
+        ]}});
+
+        let output = executor
+            .execute("tool", &serde_json::json!({}), &state, "e:tool:0")
+            .await
+            .expect("a list of calls is not a failure");
+
+        let calls = output["calls"].as_array().expect("one entry per call");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["name"], serde_json::json!("web_fetch"));
+        assert_eq!(
+            calls[0]["args"]["url"],
+            serde_json::json!("https://first.example/a")
+        );
+        assert_eq!(calls[0]["result"], serde_json::json!({"title": "page"}));
+        assert_eq!(
+            calls[1]["args"]["url"],
+            serde_json::json!("https://second.example/b")
+        );
+        assert_eq!(fake.received.lock().expect("lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_list_holding_one_call_keeps_the_plain_single_result_shape() {
+        let fake = Arc::new(FakeToolService::ok(r#"{"results": []}"#));
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = ToolTaskExecutor::new(&url).expect("client");
+        let state = serde_json::json!({"llm": {"tool_call": [{"name": "web_search", "args": {"query": "rust"}}]}});
+
+        let output = executor
+            .execute("tool", &serde_json::json!({}), &state, "e:tool:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output, serde_json::json!({"results": []}));
+    }
+
+    #[tokio::test]
+    async fn a_list_whose_calls_all_failed_is_one_recoverable_error_naming_each() {
+        let fake = Arc::new(FakeToolService::failing(
+            ExecuteStatus::Error,
+            "invalid_argument: url is required",
+        ));
+        let url = serve(fake).await;
+        let executor = ToolTaskExecutor::new(&url).expect("client");
+        let state = serde_json::json!({"llm": {"tool_call": [
+            {"name": "web_fetch", "args": {}},
+            {"name": "web_search", "args": {}},
+        ]}});
+
+        let output = executor
+            .execute("tool", &serde_json::json!({}), &state, "e:tool:0")
+            .await
+            .expect("a failed batch must not fail the node");
+
+        let error = output["error"].as_str().expect("one joined error");
+        assert!(error.contains("web_fetch"), "{error}");
+        assert!(error.contains("web_search"), "{error}");
+        assert!(error.contains("url is required"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_list_longer_than_the_parallel_limit_is_rejected_by_naming_it() {
+        let fake = Arc::new(FakeToolService::ok("{}"));
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = ToolTaskExecutor::new(&url).expect("client");
+        let calls: Vec<Value> = (0..=MAX_PARALLEL_TOOL_CALLS)
+            .map(|index| serde_json::json!({"name": "web_fetch", "args": {"url": index}}))
+            .collect();
+        let state = serde_json::json!({"llm": {"tool_call": calls}});
+
+        let output = executor
+            .execute("tool", &serde_json::json!({}), &state, "e:tool:0")
+            .await
+            .expect("over the limit is an observation, not a crash");
+
+        let error = output["error"].as_str().expect("an error naming the limit");
+        assert!(
+            error.contains(&MAX_PARALLEL_TOOL_CALLS.to_string()),
+            "{error}"
+        );
+        assert!(fake.received.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
     async fn execute_maps_requires_approval_to_a_clear_error() {
-        let fake = Arc::new(FakeToolService::failing("requires_approval", ""));
+        let fake = Arc::new(FakeToolService::failing(
+            ExecuteStatus::RequiresApproval,
+            "",
+        ));
         let url = serve(fake).await;
         let executor = ToolTaskExecutor::new(&url).expect("client");
         let state = serde_json::json!({"llm": {"tool_call": {"name": "send_email", "args": {}}}});
@@ -313,13 +487,10 @@ mod tests {
         assert!(matches!(error, TaskError::Failed(msg) if msg.contains("requires approval")));
     }
 
-    /// A tool that ran and said no is an observation, not a crash: the output the graph appends
-    /// to state["tool_result"] is {"error": ...}, which the next llm node renders back to the
-    /// model — the accuweather/kb_search symptoms that used to fail the whole execution.
     #[tokio::test]
     async fn a_tool_error_status_becomes_a_recoverable_error_observation() {
         let fake = Arc::new(FakeToolService::failing(
-            "error",
+            ExecuteStatus::Error,
             "invalid_argument: query is required",
         ));
         let url = serve(fake).await;
@@ -340,12 +511,11 @@ mod tests {
     #[tokio::test]
     async fn the_third_consecutive_tool_error_fails_the_node_with_the_last_error() {
         let fake = Arc::new(FakeToolService::failing(
-            "error",
+            ExecuteStatus::Error,
             "error sending request for url (https://www.accuweather.com/)",
         ));
         let url = serve(fake).await;
         let executor = ToolTaskExecutor::new(&url).expect("client");
-        // Two error observations already in the log — this call is the third in a row.
         let state = serde_json::json!({
             "llm": {"tool_call": {"name": "web_fetch", "args": {"url": "https://www.accuweather.com/"}}},
             "tool_result": [{"error": "first"}, {"error": "second"}],
@@ -363,7 +533,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_call_in_between_resets_the_consecutive_error_run() {
-        let fake = Arc::new(FakeToolService::failing("error", "still broken"));
+        let fake = Arc::new(FakeToolService::failing(
+            ExecuteStatus::Error,
+            "still broken",
+        ));
         let url = serve(fake).await;
         let executor = ToolTaskExecutor::new(&url).expect("client");
         let state = serde_json::json!({

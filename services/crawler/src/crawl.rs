@@ -111,10 +111,10 @@ pub async fn crawl_into(
                     forward_page(page, scope, limits.max_pages, &mut progress, &counted, &fetched)
                         .await;
                 }
-                // page_sender lives inside the closure `website` owns for as long as `crawling`
-                // is unresolved, so the channel's last sender cannot drop — and thus this arm
-                // cannot run — before the `crawling` arm above already broke the loop.
-                None => unreachable!("page_sender outlives crawling by construction"),
+                None => unreachable!(
+                    "page_sender lives in the closure `website` owns until `crawling` resolves, \
+                     and that arm breaks the loop first"
+                ),
             },
         }
     }

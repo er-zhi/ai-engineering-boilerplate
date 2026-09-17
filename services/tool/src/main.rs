@@ -1,14 +1,14 @@
-// tool: the tool registry + executor service. Connects to Postgres, syncs its schema, applies
-// the manual uniqueness index, seeds the four system tools if they don't already exist, serves
-// Connect RPC.
+// tool: the tool registry and executor service — schema, system-tool seeding and Connect RPC.
 
 use std::sync::Arc;
 
 use axum::routing::get;
+use buffa::EnumValue;
 use common::proto::tools::v1::{
     ActivateToolRequest, ActivateToolResponse, CreateToolRequest, CreateToolResponse,
-    ExecuteRequest, ExecuteResponse, ListToolsRequest, ListToolsResponse, Tool as ToolProto,
-    ToolService, ValidateToolRequest, ValidateToolResponse,
+    ExecuteRequest, ExecuteResponse, ExecuteStatus, ListToolsRequest, ListToolsResponse,
+    Tool as ToolProto, ToolRisk, ToolService, ToolStatus, ValidateToolRequest,
+    ValidateToolResponse,
 };
 use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
@@ -18,40 +18,43 @@ use sea_orm::{
     QueryFilter,
 };
 
-use tool::entity::tool::{Entity, INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC, Risk, Status};
-use tool::service::{ExecuteOutcome, Service};
+use tool::entity::tool::{
+    Entity, INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC, MANUAL_UNIQUE_INDEX_NAME, Risk, Status,
+};
+use tool::service::{ExecuteOutcome, NewTool, Service};
 use tool::slugs;
 
 const TOOL_PORT: &str = "0.0.0.0:8087";
+const SYSTEM_TOOL_TIMEOUT_SECONDS: i32 = 30;
 
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
 }
 
-fn risk_from_str(value: &str) -> Result<Risk, ConnectError> {
-    match value {
-        "read_only" => Ok(Risk::ReadOnly),
-        "write" => Ok(Risk::Write),
-        "destructive" => Ok(Risk::Destructive),
+fn risk_from_proto(risk: EnumValue<ToolRisk>) -> Result<Risk, ConnectError> {
+    match risk {
+        EnumValue::Known(ToolRisk::ReadOnly) => Ok(Risk::ReadOnly),
+        EnumValue::Known(ToolRisk::Write) => Ok(Risk::Write),
+        EnumValue::Known(ToolRisk::Destructive) => Ok(Risk::Destructive),
         other => Err(ConnectError::invalid_argument(format!(
-            "unknown risk {other:?}"
+            "risk must be one of READ_ONLY, WRITE, DESTRUCTIVE, got {other:?}"
         ))),
     }
 }
 
-fn risk_to_str(risk: Risk) -> &'static str {
+fn risk_to_proto(risk: Risk) -> ToolRisk {
     match risk {
-        Risk::ReadOnly => "read_only",
-        Risk::Write => "write",
-        Risk::Destructive => "destructive",
+        Risk::ReadOnly => ToolRisk::ReadOnly,
+        Risk::Write => ToolRisk::Write,
+        Risk::Destructive => ToolRisk::Destructive,
     }
 }
 
-fn status_to_str(status: Status) -> &'static str {
+fn status_to_proto(status: Status) -> ToolStatus {
     match status {
-        Status::Draft => "draft",
-        Status::Validated => "validated",
-        Status::Active => "active",
+        Status::Draft => ToolStatus::Draft,
+        Status::Validated => ToolStatus::Validated,
+        Status::Active => ToolStatus::Active,
     }
 }
 
@@ -76,19 +79,18 @@ impl ToolService for ToolServiceImpl {
             .map_err(|e| ConnectError::invalid_argument(e.to_string()))?;
         let output_schema = serde_json::from_str(&msg.output_schema_json)
             .map_err(|e| ConnectError::invalid_argument(e.to_string()))?;
-        let risk = risk_from_str(&msg.risk)?;
+        let new_tool = NewTool::checked(
+            msg.slug,
+            msg.name,
+            msg.description,
+            input_schema,
+            output_schema,
+            risk_from_proto(msg.risk)?,
+            msg.timeout_seconds,
+        )?;
         let tool_id = self
             .service
-            .create_tool(
-                Some(principal.user_id),
-                msg.slug,
-                msg.name,
-                msg.description,
-                input_schema,
-                output_schema,
-                risk,
-                msg.timeout_seconds,
-            )
+            .create_tool(Some(principal.user_id), new_tool)
             .await?;
         Response::ok(CreateToolResponse {
             tool_id: tool_id.to_string(),
@@ -159,8 +161,8 @@ impl ToolService for ToolServiceImpl {
                     name: t.name,
                     description: t.description,
                     input_schema_json: t.input_schema.to_string(),
-                    risk: risk_to_str(t.risk).to_owned(),
-                    status: status_to_str(t.status).to_owned(),
+                    risk: EnumValue::Known(risk_to_proto(t.risk)),
+                    status: EnumValue::Known(status_to_proto(t.status)),
                     ..Default::default()
                 })
                 .collect(),
@@ -181,21 +183,21 @@ impl ToolService for ToolServiceImpl {
             .await?;
         Response::ok(match outcome {
             ExecuteOutcome::Ok(value) => ExecuteResponse {
-                status: "ok".to_owned(),
+                status: EnumValue::Known(ExecuteStatus::Ok),
                 output_json: value.to_string(),
                 ..Default::default()
             },
             ExecuteOutcome::RequiresApproval => ExecuteResponse {
-                status: "requires_approval".to_owned(),
+                status: EnumValue::Known(ExecuteStatus::RequiresApproval),
                 ..Default::default()
             },
             ExecuteOutcome::NotExecutable(message) => ExecuteResponse {
-                status: "not_executable".to_owned(),
+                status: EnumValue::Known(ExecuteStatus::NotExecutable),
                 error_message: message,
                 ..Default::default()
             },
             ExecuteOutcome::Error(message) => ExecuteResponse {
-                status: "error".to_owned(),
+                status: EnumValue::Known(ExecuteStatus::Error),
                 error_message: message,
                 ..Default::default()
             },
@@ -203,69 +205,91 @@ impl ToolService for ToolServiceImpl {
     }
 }
 
+fn system_tool_definitions() -> [SystemTool; 4] {
+    [
+        SystemTool {
+            slug: slugs::WEB_SEARCH,
+            name: "Web search",
+            description: "Searches the public web and returns matching pages with a title, URL and snippet.",
+            risk: Risk::ReadOnly,
+            input_schema: tool::args::input_schema::<tool::args::Search>(),
+        },
+        SystemTool {
+            slug: slugs::WEB_FETCH,
+            name: "Fetch a web page",
+            description: "Fetches a page and returns its readable title and text. Pass several urls to fetch candidates at once and get whichever answers first — do that when several pages would each answer the question and you cannot tell which will respond.",
+            risk: Risk::ReadOnly,
+            input_schema: tool::args::input_schema::<tool::args::Fetch>(),
+        },
+        SystemTool {
+            slug: slugs::KB_SEARCH,
+            name: "Knowledge base search",
+            description: "Searches this project's knowledge base.",
+            risk: Risk::ReadOnly,
+            input_schema: tool::args::input_schema::<tool::args::Search>(),
+        },
+        SystemTool {
+            slug: slugs::KB_READ_DOCUMENT,
+            name: "Read a knowledge base document",
+            description: "Reads the full text of one knowledge base document, identified by the source and source_id a knowledge base search result carries.",
+            risk: Risk::ReadOnly,
+            input_schema: tool::args::input_schema::<tool::args::ReadDocument>(),
+        },
+    ]
+}
+
 async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) {
-    let system_tools = [
-        (
-            slugs::WEB_SEARCH,
-            "Web search",
-            "Searches the web via Brave Search and returns matching pages.",
-            Risk::ReadOnly,
-        ),
-        (
-            slugs::WEB_FETCH,
-            "Fetch a web page",
-            "Fetches a page and returns its readable title and text. Input: {\"url\": \"https://...\"}, or {\"urls\": [...]} (up to 5) to fetch candidates at once and get whichever answers first — use that when several pages would each answer the question and you cannot tell which will respond.",
-            Risk::ReadOnly,
-        ),
-        (
-            slugs::KB_SEARCH,
-            "Knowledge base search",
-            "Searches this project's knowledge base.",
-            Risk::ReadOnly,
-        ),
-        (
-            slugs::KB_READ_DOCUMENT,
-            "Read a knowledge base document",
-            "Reads the full text of one knowledge base document.",
-            Risk::ReadOnly,
-        ),
-    ];
-    for (slug, name, description, risk) in system_tools {
-        let existing = Entity::find()
+    for definition in system_tool_definitions() {
+        let slug = definition.slug;
+        let existing = match Entity::find()
             .filter(tool::entity::tool::Column::UserId.is_null())
             .filter(tool::entity::tool::Column::Slug.eq(slug))
             .one(db)
             .await
-            .unwrap_or(None);
-        // A row already at Active needs nothing further. One still stuck below Active — e.g.
-        // a prior boot's create succeeded but the process died before the activation update
-        // ran — is retried rather than skipped forever, so a one-time partial failure doesn't
-        // become a permanent one.
-        if existing
-            .as_ref()
-            .is_some_and(|row| row.status == Status::Active)
         {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(slug, %error, "could not look up a system tool, skipping seeding");
+                continue;
+            }
+        };
+        if seeding_already_finished(existing.as_ref(), &definition) {
             continue;
         }
-        seed_one_system_tool(service, db, slug, name, description, risk, existing).await;
+        seed_pre_vetted_system_tool(service, db, definition, existing).await;
     }
 }
 
-/// System tools are pre-vetted Rust implementations, not user-submitted schemas — they skip the
-/// Draft -> Validated LLM-review step and go straight to Active.
-#[allow(clippy::too_many_arguments)]
-async fn seed_one_system_tool(
+fn seeding_already_finished(
+    existing: Option<&tool::entity::tool::Model>,
+    definition: &SystemTool,
+) -> bool {
+    existing.is_some_and(|row| {
+        row.status == Status::Active
+            && row.name == definition.name
+            && row.description == definition.description
+            && row.input_schema == definition.input_schema
+    })
+}
+
+struct SystemTool {
+    slug: &'static str,
+    name: &'static str,
+    description: &'static str,
+    risk: Risk,
+    input_schema: serde_json::Value,
+}
+
+async fn seed_pre_vetted_system_tool(
     service: &Service,
     db: &sea_orm::DatabaseConnection,
-    slug: &str,
-    name: &str,
-    description: &str,
-    risk: Risk,
+    definition: SystemTool,
     existing: Option<tool::entity::tool::Model>,
 ) {
+    let slug = definition.slug;
     let result = match existing {
-        Some(row) => activate_system_tool(db, row).await,
-        None => create_and_activate_system_tool(service, db, slug, name, description, risk).await,
+        Some(stored) => activate_without_llm_review(db, stored, &definition).await,
+        None => create_and_activate_system_tool(service, db, &definition).await,
     };
     match result {
         Ok(()) => tracing::info!(slug, "seeded system tool"),
@@ -276,22 +300,20 @@ async fn seed_one_system_tool(
 async fn create_and_activate_system_tool(
     service: &Service,
     db: &sea_orm::DatabaseConnection,
-    slug: &str,
-    name: &str,
-    description: &str,
-    risk: Risk,
+    definition: &SystemTool,
 ) -> Result<(), String> {
+    let new_tool = NewTool::checked(
+        definition.slug.to_owned(),
+        definition.name.to_owned(),
+        definition.description.to_owned(),
+        definition.input_schema.clone(),
+        serde_json::json!({"type": "object"}),
+        definition.risk,
+        SYSTEM_TOOL_TIMEOUT_SECONDS,
+    )
+    .map_err(|error| error.to_string())?;
     let tool_id = service
-        .create_tool(
-            None,
-            slug.to_owned(),
-            name.to_owned(),
-            description.to_owned(),
-            serde_json::json!({"type": "object"}),
-            serde_json::json!({"type": "object"}),
-            risk,
-            30,
-        )
+        .create_tool(None, new_tool)
         .await
         .map_err(|error| error.to_string())?;
     let row = Entity::find_by_id(tool_id)
@@ -299,35 +321,33 @@ async fn create_and_activate_system_tool(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "row vanished before activation".to_owned())?;
-    activate_system_tool(db, row).await
+    activate_without_llm_review(db, row, definition).await
 }
 
-async fn activate_system_tool(
+async fn activate_without_llm_review(
     db: &sea_orm::DatabaseConnection,
     row: tool::entity::tool::Model,
+    definition: &SystemTool,
 ) -> Result<(), String> {
     let mut active: tool::entity::tool::ActiveModel = row.into();
     active.status = Set(Status::Active);
+    active.name = Set(definition.name.to_owned());
+    active.description = Set(definition.description.to_owned());
+    active.input_schema = Set(definition.input_schema.clone());
     active.update(db).await.map_err(|error| error.to_string())?;
     Ok(())
 }
 
-/// sea-orm's schema-sync (2.0.3) always drops an unmatched Postgres unique index via
-/// `ALTER TABLE ... DROP CONSTRAINT`, assuming it's constraint-owned — but `tools_owner_slug_idx`
-/// is a plain `CREATE UNIQUE INDEX` (the manual COALESCE-based escape hatch this entity's own
-/// header comment documents; SeaORM's `unique_key` can't express it). Postgres rejects DROP
-/// CONSTRAINT on a plain index (42704 "constraint ... does not exist"), which otherwise crashes
-/// this service on every restart after the index first exists. The index itself is untouched by
-/// the failed drop; the caller re-asserts it unconditionally right after this call, so it's safe
-/// to ignore specifically this known error and continue.
 async fn sync_schema(db: &sea_orm::DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
     match db.get_schema_registry("tool::entity::*").sync(db).await {
         Ok(()) => Ok(()),
-        Err(ref error) if is_known_drop_constraint_error(error) => {
+        Err(ref error) if is_missing_manual_unique_index(error) => {
             tracing::warn!(
                 %error,
-                "schema-sync tried to drop the manual unique index via DROP CONSTRAINT \
-                 (known sea-orm limitation, see sync_schema's doc comment) — ignoring"
+                "schema-sync tried to drop {MANUAL_UNIQUE_INDEX_NAME} with DROP CONSTRAINT, which \
+                 Postgres refuses because it is a plain unique index and not constraint-owned; \
+                 the index is untouched and INDEX_STATEMENTS_CREATED_AFTER_SCHEMA_SYNC re-asserts \
+                 it, so this is ignored instead of crashing every restart"
             );
             Ok(())
         }
@@ -335,11 +355,9 @@ async fn sync_schema(db: &sea_orm::DatabaseConnection) -> Result<(), Box<dyn std
     }
 }
 
-/// True only for Postgres SQLSTATE 42704 ("undefined object") against `tools_owner_slug_idx`
-/// specifically — narrower than a message substring, so a real unique-violation or permissions
-/// error that happens to mention the index name is never mistaken for the known, harmless
-/// DROP-CONSTRAINT-on-a-plain-index failure `sync_schema` swallows.
-fn is_known_drop_constraint_error(error: &sea_orm::DbErr) -> bool {
+const POSTGRES_UNDEFINED_OBJECT_SQLSTATE: &str = "42704";
+
+fn is_missing_manual_unique_index(error: &sea_orm::DbErr) -> bool {
     let (sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_error))
     | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_error))) = error
     else {
@@ -348,8 +366,8 @@ fn is_known_drop_constraint_error(error: &sea_orm::DbErr) -> bool {
     let Some(db_error) = sqlx_error.as_database_error() else {
         return false;
     };
-    db_error.code().as_deref() == Some("42704")
-        && db_error.message().contains("tools_owner_slug_idx")
+    db_error.code().as_deref() == Some(POSTGRES_UNDEFINED_OBJECT_SQLSTATE)
+        && db_error.message().contains(MANUAL_UNIQUE_INDEX_NAME)
 }
 
 #[tokio::main]

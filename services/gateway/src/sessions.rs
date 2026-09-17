@@ -1,11 +1,17 @@
-// CacheStore backed by gateway.sessions: an expired row is treated as absent everywhere, and a background sweep deletes rows nothing will read again.
+// A key-value store with expiry, backed by gateway.sessions: an expired row is treated as absent everywhere, and a background sweep deletes rows nothing will read again.
+
+use std::time::Duration;
 
 use chrono::Utc;
-use common::cache::{CacheError, CacheStore};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use crate::entity::cache_entry;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CacheError {
+    Unavailable(String),
+}
 
 #[derive(Clone)]
 pub struct PgCacheStore {
@@ -24,14 +30,8 @@ impl PgCacheStore {
             .await
             .map(|deleted| deleted.rows_affected)
     }
-}
 
-fn unavailable(error: impl std::fmt::Display) -> CacheError {
-    CacheError::Unavailable(error.to_string())
-}
-
-impl CacheStore for PgCacheStore {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
+    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
         let now = Utc::now();
         cache_entry::Entity::find_by_id(key.to_owned())
             .one(&self.db)
@@ -40,12 +40,7 @@ impl CacheStore for PgCacheStore {
             .map(|row| row.filter(|row| row.expires_at > now).map(|row| row.value))
     }
 
-    async fn set(
-        &self,
-        key: &str,
-        value: &[u8],
-        ttl: std::time::Duration,
-    ) -> Result<(), CacheError> {
+    pub async fn set(&self, key: &str, value: &[u8], ttl: Duration) -> Result<(), CacheError> {
         let expires_at = Utc::now()
             + chrono::Duration::from_std(ttl).map_err(|error| unavailable(error.to_string()))?;
         let row = cache_entry::ActiveModel {
@@ -66,7 +61,7 @@ impl CacheStore for PgCacheStore {
         Ok(())
     }
 
-    async fn delete(&self, key: &str) -> Result<(), CacheError> {
+    pub async fn delete(&self, key: &str) -> Result<(), CacheError> {
         cache_entry::Entity::delete_by_id(key.to_owned())
             .exec(&self.db)
             .await
@@ -75,10 +70,12 @@ impl CacheStore for PgCacheStore {
     }
 }
 
+fn unavailable(error: impl std::fmt::Display) -> CacheError {
+    CacheError::Unavailable(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::test_db;
 

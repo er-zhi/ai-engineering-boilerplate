@@ -13,7 +13,7 @@ Knowledge Base never trusts a caller's dedup claim. It hashes the `content` it r
 ## Pipeline per `Ingest` Call
 
 1. Hash `content`; if it matches the stored hash for `(source, source_id)`, stop here.
-2. `llm-router.Complete` (`low` tier, `response_format: json_object`) for `page_type`, `keywords`, and `summary`. Supported page types are `product`, `knowledge`, `instruction`, `documentation`, `blog`, and `other`; an unrecognized value becomes `other`.
+2. `llm-router.Complete` (`low` tier, `response_format: json_object`) for `page_type`, `keywords`, and `summary`. The page types are the `knowledge_base.v1.PageType` enum, and the words the classifier is asked for are generated from it (`PAGE_TYPE_PRODUCT` → `product`) rather than listed a second time in the prompt; an unrecognized value becomes `other`.
 3. Split `content` into passages of at most 1,200 characters (`chunk::split`), breaking on lines, then sentences, then words, with no overlap — in Chroma's chunking evaluation, overlap cost precision without improving recall.
 4. Embed each passage with a **contextual chunk header** prepended — the first 150 characters of the title and the first 300 of the summary — over loopback HTTP to the native `embedder-ane` process. The header is embedded, never stored, so a passage deep in a page still carries what the page is about, at no extra LLM cost. (It is not Anthropic's Contextual Retrieval, which has an LLM write per-chunk context; that is heavier and remains an option.) See [Embedding](#embedding-native-apple-silicon-only) below.
 5. Write the document and all its passages in one transaction, replacing any passages from a previous version. Either the whole call succeeds or nothing beyond what was already there is written.
@@ -26,9 +26,19 @@ This is the one place knowledge-base talks to something other than llm-router or
 
 Two endpoints, not one: `POST /embed/document` for passages written at ingest, `POST /embed/query` for a query — the model (`google/embeddinggemma-300m`) needs a different task prefix for each, per its own documented usage pattern, and getting that backwards would quietly hurt ranking rather than error. `EmbedKind::Document` / `EmbedKind::Query` on `LlmClient::embed` is what picks the route.
 
-The embedder's window is a fixed 128 tokens — deliberately small in exchange for Neural Engine speed (see [`native/embedder-ane`](../../native/embedder-ane/README.md)). Passage (`chunk::MAX_CHUNK_CHARS`) and header (`MAX_HEADER_TITLE_CHARS` + `MAX_HEADER_SUMMARY_CHARS`) sizes are set together so a typical English passage plus its header stays comfortably under that, verified against the real tokenizer; denser text such as non-Latin scripts, code, or URLs can still exceed it. In that case the embedder uses the first 128 tokens and `embedder_client` logs a warning. Passage sizing is character-based, not tokenizer-based. The embedder call has its own 10-second timeout, separate from LLM Router's 60-second timeout.
+The embedder's window is a fixed 128 tokens — deliberately small in exchange for Neural Engine speed (see [`native/embedder-ane`](../../native/embedder-ane/README.md)). Passage (`chunk::MAX_CHUNK_CHARS_IN_EMBEDDER_WINDOW`) and header (`MAX_HEADER_TITLE_CHARS` + `MAX_HEADER_SUMMARY_CHARS`) sizes are set together so a typical English passage plus its header stays comfortably under that, verified against the real tokenizer; denser text such as non-Latin scripts, code, or URLs can still exceed it. In that case the embedder uses the first 128 tokens and `embedder_client` logs a warning. Passage sizing is character-based, not tokenizer-based. The embedder call has its own 10-second timeout, separate from LLM Router's 60-second timeout.
 
 No request or payload logging is kept for these calls, unlike `llm-router`'s `requests` and `request_payloads` tables: the forward pass is local and unmetered. Model and runtime details are in the [`native/embedder-ane` README](../../native/embedder-ane/README.md).
+
+## A Breaking Contract Change
+
+`page_type` and `page_types` changed from free-form `string` to the `knowledge_base.v1.PageType`
+enum, at new field numbers with the old ones reserved. `buf breaking` reports this against any
+earlier commit, and that report is correct: it **is** a breaking change, made deliberately. The
+vocabulary previously existed only as a comment and was re-declared twice more in Rust, so an
+unknown value matched nothing instead of being refused. Every consumer lives in this repository and
+changed in the same commit; nothing outside it reads the field. The reserved numbers keep the old
+wire slots from ever being reused.
 
 ## Retrieval
 
@@ -44,7 +54,7 @@ No request or payload logging is kept for these calls, unlike `llm-router`'s `re
 
 pgvector's HNSW scan reads only `hnsw.ef_search` candidates (default 40) and applies a `WHERE` filter afterwards, which would silently return fewer than 50 passages — far fewer with a page-type filter. The `knowledge_base_user` role therefore defaults to `hnsw.ef_search = 100` and `hnsw.iterative_scan = strict_order`, set in Compose's Postgres bootstrap.
 
-An optional `page_types` filter restricts all retrievers. Page type is a facet the caller chooses, never something guessed from the query text and mixed into the score.
+An optional `page_types` filter restricts all retrievers. Page type is a facet the caller chooses, never something guessed from the query text and mixed into the score. It travels as the `PageType` enum, so an unknown value is refused at the boundary instead of silently matching nothing; the database column stays a smallint discriminant, converted in `search.rs`.
 
 **`Search`** keeps each document once, represented by its best passage (`store::best_per_document`), and returns the top `limit` (10 by default, at most 50) with that passage as `snippet`, its ordinal, a versioned `DocumentRef`, and the document's `updated_at`. An agent can judge freshness from the compact result and call `ReadDocument` only when it needs the complete source.
 

@@ -1,3 +1,5 @@
+// Starts a Gateway over a set of backend clients for the passthrough tests.
+
 use std::sync::Arc;
 
 use connectrpc::Router as ConnectRouter;

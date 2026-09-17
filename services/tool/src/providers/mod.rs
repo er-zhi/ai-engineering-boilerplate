@@ -1,12 +1,26 @@
+// The vendor-neutral web-search port; the vendor modules under it only implement it.
+
 pub mod brave;
 pub mod you;
 
-use brave::{BraveSearchProvider, SearchProvider, SearchResult};
+use brave::BraveSearchProvider;
 use you::YouSearchProvider;
 
-/// The web_search provider chosen at startup (main.rs), based on which API key is set —
-/// You.com preferred, then Brave, else `Unconfigured` so Execute returns a clear error instead
-/// of silently calling Brave with an empty key.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+pub trait SearchProvider: Send + Sync {
+    fn search(
+        &self,
+        query: &str,
+        limit: u8,
+    ) -> impl Future<Output = Result<Vec<SearchResult>, String>> + Send;
+}
+
 pub enum AnySearchProvider {
     You(YouSearchProvider),
     Brave(BraveSearchProvider),
@@ -27,16 +41,21 @@ impl SearchProvider for AnySearchProvider {
 }
 
 impl AnySearchProvider {
-    /// Picks You.com over Brave when both keys are set (env var wins over env var in place,
-    /// not merged), and logs the choice — never the key itself.
     #[must_use]
-    pub fn from_env(you_api_key: String, brave_api_key: String) -> Self {
+    pub fn from_api_keys(
+        you_api_key: String,
+        brave_api_key: String,
+        bounded_client: reqwest::Client,
+    ) -> Self {
         let (name, provider) = if !you_api_key.is_empty() {
-            ("you.com", Self::You(YouSearchProvider::new(you_api_key)))
+            (
+                "you.com",
+                Self::You(YouSearchProvider::new(you_api_key, bounded_client)),
+            )
         } else if !brave_api_key.is_empty() {
             (
                 "brave",
-                Self::Brave(BraveSearchProvider::new(brave_api_key)),
+                Self::Brave(BraveSearchProvider::new(brave_api_key, bounded_client)),
             )
         } else {
             ("none configured", Self::Unconfigured)

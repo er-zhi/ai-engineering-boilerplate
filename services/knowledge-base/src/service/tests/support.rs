@@ -6,6 +6,8 @@ use chrono::DateTime;
 use sea_orm::DbErr;
 
 use super::super::*;
+use common::proto::knowledge_base::v1::PageType as PageTypeProto;
+
 use crate::entity::document;
 use crate::llm_client::{Embedded, Enrichment};
 use crate::store::{DocumentWrite, LexicalCandidates, Passage};
@@ -133,10 +135,10 @@ pub(super) fn request(source: &str, source_id: &str, content: &str) -> IngestReq
     }
 }
 
-pub(super) fn search_request(query: &str, page_types: &[&str]) -> SearchRequest {
+pub(super) fn search_request(query: &str, page_types: &[PageTypeProto]) -> SearchRequest {
     SearchRequest {
         query: query.to_owned(),
-        page_types: page_types.iter().map(|name| (*name).to_owned()).collect(),
+        page_types: page_types.iter().copied().map(EnumValue::Known).collect(),
         ..Default::default()
     }
 }

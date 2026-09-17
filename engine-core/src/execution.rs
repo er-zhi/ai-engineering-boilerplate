@@ -1,7 +1,4 @@
-// One execution of one graph: current position (current_nodes), accumulated state, and the
-// bookkeeping (iteration/budget/deadline) step() checks before doing more work. ActiveNode
-// carries a branch index so a FanOut's spawned instances of the same node are distinguishable
-// without inventing synthetic NodeIds the graph never declared.
+// Holds one execution of one graph: its position, state and per-run bookkeeping.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

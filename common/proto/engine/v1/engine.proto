@@ -16,8 +16,9 @@ service EngineService {
 
 message RegisterGraphRequest {
   string graph_id = 1;
-  // The Graph as JSON — the same shape engine_core::Graph (de)serializes. Opaque text, not
-  // typed proto messages: see this file's header comment.
+  // The graph definition as JSON. Graphs are dynamic by design, so this stays opaque text rather
+  // than typed proto messages; its fields, their types and what registration validates are
+  // specified in services/engine/README.md under "The Graph JSON Contract".
   string definition_json = 2;
 }
 
@@ -29,7 +30,10 @@ message RegisterGraphResponse {
 message StartExecutionRequest {
   string graph_id = 1;
   optional int32 version = 2; // unset = latest registered version at call time
-  string input_json = 3; // merged into the fresh execution's initial state, e.g. {"question": "..."}
+  // Merged into the fresh execution's initial state. The fields the built-in graphs read are the
+  // `common::execution_input::ExecutionInput` type both sides build and parse; a graph of your own
+  // may read anything it likes.
+  string input_json = 3;
 }
 
 message StartExecutionResponse {
@@ -44,8 +48,12 @@ message InterruptRequest {
 message InterruptResponse {}
 
 message ResumeRequest {
+  // 2 was wait_key: the key a Wait node parks on, accepted from callers and never checked against
+  // the execution's actual WaitKind. Nothing sets it, and the only wait kinds a graph can reach
+  // today carry no key. It comes back with a new number when approvals and Subgraph are wired.
+  reserved 2;
+  reserved "wait_key";
   string execution_id = 1;
-  string wait_key = 2;
   string event_json = 3;
 }
 
@@ -61,16 +69,30 @@ message GetExecutionRequest {
   string execution_id = 1;
 }
 
+// Where an execution has got to. The engine maps its own run-time status onto this set at the
+// boundary, so a caller reads the state machine rather than a spelling it has to know by heart.
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0;
+  EXECUTION_STATUS_READY = 1;
+  EXECUTION_STATUS_RUNNING = 2;
+  EXECUTION_STATUS_WAITING = 3;
+  EXECUTION_STATUS_COMPLETED = 4;
+  EXECUTION_STATUS_FAILED = 5;
+  EXECUTION_STATUS_CANCELLED = 6;
+}
+
 message Execution {
+  // 5 was a status string whose vocabulary lived in a comment; 6..9 were wait_kind_json,
+  // current_nodes_json, iteration and state_json: the engine's private run-time representation
+  // shipped as opaque strings, which no client could read without linking the engine's own crate.
+  // What an execution is doing is declared by StreamEvents instead.
+  reserved 5 to 9;
+  reserved "current_nodes_json", "iteration", "state_json", "wait_kind_json";
   string execution_id = 1;
   string graph_id = 2;
   int32 graph_version = 3;
   optional string user_id = 4;
-  string status = 5; // ready|running|waiting|completed|failed|cancelled
-  optional string wait_kind_json = 6;
-  string current_nodes_json = 7;
-  int32 iteration = 8;
-  string state_json = 9;
+  ExecutionStatus status = 10;
 }
 
 message StreamEventsRequest {
@@ -80,6 +102,24 @@ message StreamEventsRequest {
   optional string user_id = 2;
 }
 
+// Everything that can happen to an execution. The engine projects its stored event log onto this
+// set; a stored event this engine no longer knows arrives as UNSPECIFIED rather than as a name
+// the client would have to guess at.
+enum ExecutionEventKind {
+  EXECUTION_EVENT_KIND_UNSPECIFIED = 0;
+  EXECUTION_EVENT_KIND_EXECUTION_STARTED = 1;
+  EXECUTION_EVENT_KIND_NODE_STARTED = 2;
+  EXECUTION_EVENT_KIND_NODE_COMPLETED = 3;
+  EXECUTION_EVENT_KIND_NODE_FAILED = 4;
+  EXECUTION_EVENT_KIND_TASK_OUTPUT = 5;
+  EXECUTION_EVENT_KIND_WAITING = 6;
+  EXECUTION_EVENT_KIND_RESUMED = 7;
+  EXECUTION_EVENT_KIND_INTERRUPTED = 8;
+  EXECUTION_EVENT_KIND_EXECUTION_COMPLETED = 9;
+  EXECUTION_EVENT_KIND_EXECUTION_FAILED = 10;
+  EXECUTION_EVENT_KIND_EXECUTION_CANCELLED = 11;
+}
+
 message ExecutionEvent {
   string id = 1;
   string execution_id = 2;
@@ -87,8 +127,17 @@ message ExecutionEvent {
   int32 version = 4;
   optional string causation_id = 5;
   string occurred_at = 6; // RFC 3339
-  string payload_kind = 7; // "NodeCompleted", "ExecutionCompleted", ... — engine_core::ExecutionPayload's variant name
+  ExecutionEventKind payload_kind = 7;
+  // The fields of this kind alone — `{"node": "llm", "output": {...}}` for NODE_COMPLETED,
+  // `{"final_state": {...}, "result": ...}` for EXECUTION_COMPLETED, `{}` for a kind with no
+  // fields. Never an envelope keyed by the kind.
   string payload_json = 8;
+  // The graph's answer, resolved by the engine from the pointer the graph declares (see
+  // services/engine/README.md). Set on EXECUTION_COMPLETED, and only when the graph declares
+  // where its answer lives and that pointer resolved.
+  optional string result = 9;
+  // Set on EXECUTION_FAILED and NODE_FAILED.
+  optional string error = 10;
 }
 
 // A standing instruction to start a fresh execution of `graph_id` on a cron schedule — a cron

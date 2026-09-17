@@ -1,11 +1,9 @@
 # Gateway image: compiles the gateway with cached dependencies and ships the static binary alone on Alpine.
-FROM rust:1.98-alpine3.24 AS build
-RUN apk add --no-cache protoc
+FROM rust:1.98.0-alpine3.24 AS build
+RUN apk add --no-cache protoc protobuf-dev
 WORKDIR /app
-# `dev` (fast, unoptimised) for the local stack; `release` for anything shipped. Cargo writes a
-# `dev` build to target/debug, every other profile to target/<profile>.
 ARG BUILD_PROFILE=release
-ENV CARGO_HOME=/var/cache/cargo CARGO_TARGET_DIR=/var/cache/target
+ENV RUSTUP_TOOLCHAIN=1.98.0 CARGO_HOME=/var/cache/cargo CARGO_TARGET_DIR=/var/cache/target
 RUN --mount=type=bind,target=. \
     --mount=type=cache,target=/var/cache/cargo \
     --mount=type=cache,target=/var/cache/target \

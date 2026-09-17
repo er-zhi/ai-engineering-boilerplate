@@ -1,6 +1,4 @@
-// Reads the two headers Gateway will stamp on every proxied request once it starts fronting
-// Engine/Tool Service — trusted, not the request body. Shared by every service that reads
-// Principal from Connect metadata (engine, tool — see each spec's "Principal и user_id").
+// Reads the trusted Principal headers Gateway stamps on every proxied request.
 
 use http::HeaderMap;
 use uuid::Uuid;
@@ -8,9 +6,6 @@ use uuid::Uuid;
 pub const USER_ID_HEADER: &str = "x-principal-user-id";
 pub const SESSION_ID_HEADER: &str = "x-principal-session-id";
 
-// Not Copy — session_id is a String, per the spec's `Principal { user_id, session_id }` (the
-// spec keeps session_id even though nothing reads it back out of Principal yet, since it's the
-// same value Gateway's future interceptor will correlate logs by).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Principal {
     pub user_id: Uuid,

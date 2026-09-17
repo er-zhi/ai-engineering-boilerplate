@@ -1,8 +1,6 @@
 // The public contract of every quality tier: what a caller may send, what it may ask back, and what to expect in return.
 
-use std::collections::BTreeMap;
-
-use crate::proto::llm_router::v1::{QualityTier, ReasoningMode, ResponseFormat};
+use common::proto::llm_router::v1::{QualityTier, ReasoningMode, ResponseFormat, Sampling};
 
 const CHARS_PER_TOKEN: usize = 4;
 const WIDE_CONTEXT_TOKENS: i32 = 131_072;
@@ -20,21 +18,6 @@ pub struct TierLimits {
     pub max_input_tokens: i32,
     pub max_output_tokens: i32,
     pub reasoning: ReasoningMode,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Sampling {
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub max_tokens: Option<i32>,
-    pub stop: Vec<String>,
-    pub frequency_penalty: Option<f64>,
-    pub presence_penalty: Option<f64>,
-    pub seed: Option<i32>,
-    pub logit_bias: BTreeMap<String, f64>,
-    pub logprobs: Option<bool>,
-    pub top_logprobs: Option<i32>,
-    pub response_format: Option<ResponseFormat>,
 }
 
 pub fn limits(tier: QualityTier) -> Option<TierLimits> {

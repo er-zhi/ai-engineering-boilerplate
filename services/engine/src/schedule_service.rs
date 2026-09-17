@@ -1,7 +1,4 @@
-// The CreateSchedule/ListSchedules half of `Service` — the same type as service.rs's, split into
-// its own file so one file doesn't carry two subsystems. Everything here is request handling:
-// validate, insert, read back. Firing a schedule is scheduler.rs's job, and what it fires is the
-// ordinary `start_execution` below it, not a private path.
+// The CreateSchedule and ListSchedules half of Service.
 
 use chrono::Utc;
 use sea_orm::{
@@ -16,9 +13,6 @@ use crate::error::EngineError;
 use crate::service::Service;
 
 impl Service {
-    /// Registers a cron schedule. `cron_expr` is validated by computing its first fire time,
-    /// which doubles as the row's initial `next_run_at` — an expression that can't produce one is
-    /// rejected here rather than becoming a row the scheduler can only log about.
     pub async fn create_schedule(
         &self,
         graph_id: String,
@@ -29,8 +23,6 @@ impl Service {
     ) -> Result<i64, EngineError> {
         let next_run_at =
             next_fire_after(cron_expr, Utc::now()).map_err(EngineError::InvalidRequest)?;
-        // Same rule as start_execution's: execution state is an object everywhere downstream, so
-        // a scalar or array input is rejected now instead of failing on every single fire.
         let input: Value = serde_json::from_str(input_json)
             .map_err(|e| EngineError::InvalidRequest(e.to_string()))?;
         if !input.is_object() {
@@ -57,9 +49,6 @@ impl Service {
         Ok(row.id)
     }
 
-    /// Every schedule belonging to `user_id` — and, for a caller with no Principal, the system
-    /// schedules (`user_id IS NULL`) rather than everybody's. The caller's identity comes from
-    /// request metadata in main.rs, never from a body field.
     pub async fn list_schedules(
         &self,
         user_id: Option<Uuid>,

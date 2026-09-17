@@ -1,8 +1,13 @@
-// LLM calls by quality tier: the only service holding the OpenRouter key.
+// LLM calls by quality tier and structured decisions on the same state: the only service holding either provider key.
 
 mod adapters;
-mod entity;
+mod audit;
+mod budget;
+mod decision;
+mod decisions;
+mod llm;
 mod log;
+mod partition;
 mod provider;
 mod router;
 mod service;
@@ -10,6 +15,8 @@ mod service;
 mod test_db;
 #[cfg(test)]
 mod test_provider;
+#[cfg(test)]
+mod test_system_one;
 mod tiers;
 mod wire;
 
@@ -18,25 +25,35 @@ use std::time::Duration;
 
 use axum::routing::get;
 use common::proto::llm_router::v1::{
-    CompleteRequest, CompleteResponse, DescribeTiersRequest, DescribeTiersResponse,
-    LlmRouterService,
+    CompleteRequest, CompleteResponse, DecideRequest, DecideResponse, DescribeModelsRequest,
+    DescribeModelsResponse, DescribeTiersRequest, DescribeTiersResponse, LlmRouterService,
+    SystemOneService,
 };
 use connectrpc::{
     RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
 };
 use sea_orm::Database;
 
-use crate::adapters::openai_compatible::{KeyCheck, OpenAiCompatible};
-use crate::log::{PgRequestLog, RequestLog};
+use crate::adapters::KeyCheck;
+use crate::adapters::openai_compatible::OpenAiCompatible;
+use crate::adapters::system_one::SystemOne;
+use crate::decisions::Decisions;
+use crate::log::{PartitionUpkeep, PgAuditLog};
 use crate::service::Router;
 use crate::tiers::Tiers;
 use crate::wire::tier_contracts;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const PAYLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
+const PARTITION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+const DEFAULT_SYSTEM_ONE_BASE_URL: &str = "https://api.typesafe.ai";
+const DEFAULT_SYSTEM_ONE_MODEL: &str = "jev-latest";
 
 struct LlmRouter {
-    inner: Router<OpenAiCompatible, PgRequestLog>,
+    inner: Router<OpenAiCompatible, PgAuditLog>,
+}
+
+struct SystemOneApi {
+    inner: Decisions<SystemOne, PgAuditLog>,
 }
 
 #[allow(refining_impl_trait)]
@@ -62,37 +79,116 @@ impl LlmRouterService for LlmRouter {
     }
 }
 
-fn env(name: &str) -> Result<String, String> {
-    std::env::var(name).map_err(|_| format!("{name} is not set"))
+#[allow(refining_impl_trait)]
+impl SystemOneService for SystemOneApi {
+    async fn decide(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, DecideRequest>,
+    ) -> ServiceResult<DecideResponse> {
+        let response = self.inner.decide(request.to_owned_message()).await?;
+        Response::ok(response)
+    }
+
+    async fn describe_models(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, DescribeModelsRequest>,
+    ) -> ServiceResult<DescribeModelsResponse> {
+        Response::ok(self.inner.describe_models().await?)
+    }
 }
 
-async fn prune_payloads_periodically(log: impl RequestLog) {
-    let mut interval = tokio::time::interval(PAYLOAD_CLEANUP_INTERVAL);
+// A variable set to blank is as good as unset: a blank model would send "model": "" on every call. What is
+// set comes back trimmed — a base URL with a stray space around it would otherwise break every call, and the
+// startup probe would report it as a provider we cannot reach rather than as the typo it is.
+fn env(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    lookup(name)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn required(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Result<String, String> {
+    env(lookup, name).ok_or_else(|| format!("{name} is not set"))
+}
+
+fn from_environment(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+async fn maintain_partitions_periodically(log: impl PartitionUpkeep) {
+    let mut interval = tokio::time::interval(PARTITION_MAINTENANCE_INTERVAL);
+    // The first tick is immediate, and prepare_schema has just done this pass; the second is an hour away.
+    interval.tick().await;
     loop {
         interval.tick().await;
-        prune_expired_payloads(&log).await;
+        maintain_partitions(&log).await;
     }
 }
 
-async fn prune_expired_payloads(log: &impl RequestLog) {
-    let removed = log
-        .drop_expired_payloads(chrono::Utc::now())
-        .await
-        .inspect_err(|error| {
-            tracing::error!("could not prune expired llm request payloads: {error}")
-        })
-        .unwrap_or_default();
-    if removed > 0 {
-        tracing::info!("pruned {removed} expired llm request payloads");
+async fn maintain_partitions(log: &impl PartitionUpkeep) {
+    match log.maintain_partitions(chrono::Utc::now()).await {
+        Ok(swept) if swept.is_empty() => {}
+        Ok(swept) => tracing::info!(
+            request_payloads = ?swept.request_payloads,
+            decision_payloads = ?swept.decision_payloads,
+            "dropped llm_router payload partitions past retention"
+        ),
+        Err(error) => tracing::error!("llm_router partition maintenance failed: {error}"),
     }
+}
+
+// TypeSafe AI is optional: without a key the router still serves completions, and System One says so plainly.
+// A key the provider rejects is a deployment mistake, and stops startup exactly as a rejected OpenRouter key does.
+async fn type_safe_ai(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<(SystemOne, String)>, String> {
+    let Some(api_key) = env(&lookup, "TYPESAFE_AI_API_KEY") else {
+        tracing::info!("TYPESAFE_AI_API_KEY is not set; System One is not served");
+        return Ok(None);
+    };
+    let base_url = env(&lookup, "TYPESAFE_AI_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_SYSTEM_ONE_BASE_URL.to_owned());
+    let model =
+        env(&lookup, "TYPESAFE_AI_MODEL").unwrap_or_else(|| DEFAULT_SYSTEM_ONE_MODEL.to_owned());
+
+    let provider = SystemOne::new(base_url, api_key, REQUEST_TIMEOUT)?;
+    match provider.verify_key().await {
+        Ok(()) => {}
+        Err(KeyCheck::Rejected) => {
+            return Err("the provider rejected TYPESAFE_AI_API_KEY".to_owned());
+        }
+        Err(KeyCheck::Unreachable(reason)) => {
+            tracing::warn!("could not verify TYPESAFE_AI_API_KEY at startup, continuing: {reason}");
+        }
+    }
+    Ok(Some((provider, model)))
+}
+
+async fn prepare_schema(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    partition::create_parents(db).await?;
+    let plain = partition::plain_parents(db).await?;
+    if !plain.is_empty() {
+        tracing::error!(
+            ?plain,
+            "these llm_router tables exist as plain tables from before partitioning, so the \
+             partitioned CREATE TABLE was a silent no-op and there is no DROP PARTITION retention \
+             path. Drop them — they hold statistics and payloads, not working state — and restart."
+        );
+        return Err(format!("{plain:?} are not partitioned by created_at").into());
+    }
+    partition::maintain(db, chrono::Utc::now()).await?;
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     common::logging::init();
-    let base_url = std::env::var("OPENROUTER_BASE_URL")
-        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_owned());
-    let api_key = env("OPENROUTER_API_KEY")?;
+    let base_url = env(&from_environment, "OPENROUTER_BASE_URL")
+        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_owned());
+    let api_key = required(&from_environment, "OPENROUTER_API_KEY")?;
     let provider = OpenAiCompatible::new(base_url, api_key, REQUEST_TIMEOUT)?;
     match provider.verify_key().await {
         Ok(()) => {}
@@ -102,22 +198,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let tiers = Tiers::from_vars(|name| std::env::var(name).ok())?;
+    let tiers = Tiers::from_vars(from_environment)?;
+    let system_one = type_safe_ai(from_environment).await?;
 
-    let database_url = env("DATABASE_URL")?;
+    let database_url = required(&from_environment, "DATABASE_URL")?;
     let db = Database::connect(&database_url).await?;
-    db.get_schema_registry("llm_router::entity::*")
-        .sync(&db)
-        .await?;
+    prepare_schema(&db).await?;
 
-    let log = PgRequestLog::new(db);
-    tokio::spawn(prune_payloads_periodically(log.clone()));
+    let log = PgAuditLog::new(db);
+    tokio::spawn(maintain_partitions_periodically(log.clone()));
 
     let llm_router = LlmRouter {
-        inner: Router::new(provider, log, tiers),
+        inner: Router::new(provider, log.clone(), tiers),
+    };
+    let system_one = SystemOneApi {
+        inner: Decisions::new(system_one, log),
     };
 
-    let connect = ConnectRouter::new().add_service(Arc::new(llm_router));
+    let connect = ConnectRouter::new()
+        .add_service(Arc::new(llm_router))
+        .add_service(Arc::new(system_one));
 
     let app = axum::Router::new()
         .route("/health", get(|| async { "OK" }))
@@ -128,4 +228,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    use super::*;
+    use crate::test_system_one::TestSystemOne;
+
+    async fn serving_models() -> TestSystemOne {
+        TestSystemOne::listing(StatusCode::OK, json!({"models": []})).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deployment_without_a_key_serves_no_decisions_and_still_starts() {
+        assert!(type_safe_ai(|_| None).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_of_nothing_but_whitespace_counts_as_unset() {
+        let blank = |name: &str| match name {
+            "TYPESAFE_AI_API_KEY" => Some("   ".to_owned()),
+            _ => None,
+        };
+
+        assert!(type_safe_ai(blank).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_deployment_serves_the_model_it_names() {
+        let stub = serving_models().await;
+        let configured = |name: &str| match name {
+            "TYPESAFE_AI_API_KEY" => Some("test-key".to_owned()),
+            "TYPESAFE_AI_BASE_URL" => Some(stub.base_url()),
+            "TYPESAFE_AI_MODEL" => Some("jev-1.13.0".to_owned()),
+            _ => None,
+        };
+
+        let (_provider, model) = type_safe_ai(configured).await.unwrap().unwrap();
+
+        assert_eq!(model, "jev-1.13.0");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_base_url_or_model_set_to_blank_falls_back_to_the_default() {
+        let stub = serving_models().await;
+        let blank = |name: &str| match name {
+            "TYPESAFE_AI_API_KEY" => Some("test-key".to_owned()),
+            "TYPESAFE_AI_BASE_URL" => Some(stub.base_url()),
+            "TYPESAFE_AI_MODEL" => Some("  ".to_owned()),
+            _ => None,
+        };
+
+        let (_provider, model) = type_safe_ai(blank).await.unwrap().unwrap();
+
+        assert_eq!(model, DEFAULT_SYSTEM_ONE_MODEL);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_value_with_whitespace_around_it_is_trimmed_before_it_is_used() {
+        let stub = serving_models().await;
+        let padded = |name: &str| match name {
+            "TYPESAFE_AI_API_KEY" => Some(" test-key ".to_owned()),
+            "TYPESAFE_AI_BASE_URL" => Some(format!("  {}  ", stub.base_url())),
+            "TYPESAFE_AI_MODEL" => Some("  jev-1.13.0\n".to_owned()),
+            _ => None,
+        };
+
+        let (_provider, model) = type_safe_ai(padded).await.unwrap().unwrap();
+
+        assert_eq!(model, "jev-1.13.0");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_the_provider_rejects_stops_the_service_from_starting() {
+        let stub = TestSystemOne::listing(StatusCode::UNAUTHORIZED, json!({})).await;
+        let wrong = |name: &str| match name {
+            "TYPESAFE_AI_API_KEY" => Some("wrong-key".to_owned()),
+            "TYPESAFE_AI_BASE_URL" => Some(stub.base_url()),
+            _ => None,
+        };
+
+        let Err(error) = type_safe_ai(wrong).await else {
+            panic!("a key the provider rejects is a deployment mistake worth failing loudly");
+        };
+
+        assert!(error.contains("TYPESAFE_AI_API_KEY"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_we_cannot_reach_at_startup_does_not_stop_the_service() {
+        let unreachable = |name: &str| match name {
+            "TYPESAFE_AI_API_KEY" => Some("test-key".to_owned()),
+            "TYPESAFE_AI_BASE_URL" => Some("http://127.0.0.1:1".to_owned()),
+            _ => None,
+        };
+
+        assert!(type_safe_ai(unreachable).await.unwrap().is_some());
+    }
 }

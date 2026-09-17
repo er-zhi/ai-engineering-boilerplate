@@ -1,6 +1,4 @@
-// Property: replaying an execution's ExecutionEvent log reconstructs the same status and state
-// step() itself produced — proof that "everything is in the log" (the spec's premise for
-// crash recovery and for Chat reading Engine's history) actually holds, not just an assertion.
+// Proves by property test that replaying an event log reconstructs what step() produced.
 
 #[cfg(test)]
 mod tests {
@@ -15,12 +13,9 @@ mod tests {
     use crate::ids::{ExecutionId, GraphId, NodeId};
     use crate::step::{NodeOutput, step};
 
-    /// Applies one event's effect to `execution` — the minimal projection needed for this
-    /// property, not a general-purpose event sourcing API: only the payload variants `step()`
-    /// actually emits for the fixed test graph below are handled.
-    fn apply_event(execution: &mut Execution, event: &crate::event::ExecutionEvent) {
+    fn apply_terminal_event(execution: &mut Execution, event: &crate::event::ExecutionEvent) {
         match &event.payload {
-            ExecutionPayload::ExecutionCompleted { final_state } => {
+            ExecutionPayload::ExecutionCompleted { final_state, .. } => {
                 execution.state = final_state.clone();
                 execution.status = Status::Completed;
                 execution.current_nodes = vec![];
@@ -66,7 +61,7 @@ mod tests {
 
             let mut replayed = exec;
             for event in &events {
-                apply_event(&mut replayed, event);
+                apply_terminal_event(&mut replayed, event);
             }
 
             prop_assert_eq!(replayed.status, final_exec.status);

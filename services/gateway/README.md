@@ -8,7 +8,7 @@ The only public application service. Gateway authenticates browser sessions, ser
 
 Every page and RPC is checked against PostgreSQL on each request. `/health`, `/login`, and `/logout` are the only unauthenticated routes. Unauthenticated page requests redirect to `/login`; RPC requests receive a Connect-shaped `unauthenticated` response.
 
-Gateway uses `common::cache::CacheStore` for session storage. PostgreSQL is the current and only backend.
+Session storage is `PgCacheStore` in [`src/sessions.rs`](src/sessions.rs) — a key/value store with expiry over one Postgres table, with `CacheError` as the boundary type so a `DbErr` never reaches a handler.
 
 ## Public Surface
 
@@ -19,11 +19,26 @@ Gateway uses `common::cache::CacheStore` for session storage. PostgreSQL is the 
 | Crawler `StartCrawl`, `GetCrawlJob`, `GetPageNeighbors` | Proxy to Crawler. |
 | Knowledge Base `Search` | Proxy to Knowledge Base. |
 | Knowledge Base `Ingest` | Rejected as unimplemented; ingestion is an internal Crawler-to-Knowledge-Base operation. |
+| Chat `SendTurn`, `GetSession`, `SetFocus`, `ResetSession`, `StreamEvents` | Proxy to Chat, with a Principal stamped on every call. |
 | `GET /health` | Plain liveness response. |
 
 Public RPC paths and JSON fields come directly from the proto contracts in [`common/proto/`](../../common/proto/). The browser sends `content-type: application/json` and `connect-protocol-version: 1` and uses protobuf JSON field names.
 
 Gateway gives upstream calls a 10-second deadline. Read-only Crawler calls (`GetCrawlJob` and `GetPageNeighbors`) retry transient unavailable/deadline failures up to three attempts; `StartCrawl` is not retried because it triggers work. Knowledge Base search is not retried.
+
+Chat's calls are the exceptions, for two reasons that both cost a production outage to learn:
+
+- `SendTurn` runs an LLM classification before it answers, so a 10-second bound cut it off. Its
+  budget is twice that classification's own budget.
+- `StreamEvents` is a server stream, and connectrpc's `CallOptions` deadline applies to the **whole
+  call**, not to each frame — so the unary 10 seconds ended the browser's event feed after ten
+  seconds. `CallOptions` cannot express "no deadline", so the stream gets a long, finite one.
+
+Gateway also stamps a Principal on every Chat call. Forgetting it is not a degraded mode: Chat
+rejects a call with no Principal as `invalid_argument`, so **every** real request failed until the
+headers were added. The user id is a constant — Gateway authenticates one shared password and stores
+nothing user-identifying on a session — and the `session_id` forwarded is the caller's raw session
+token, not the hash stored in the database.
 
 ## Static Files and Configuration
 
