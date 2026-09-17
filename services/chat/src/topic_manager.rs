@@ -38,11 +38,22 @@ async fn lock_session<C: sea_orm::ConnectionTrait>(
         .ok_or_else(|| ChatError::InvalidRequest("session vanished".to_owned()))
 }
 
+/// `watch_topic`'s starting backoff between reconnect attempts — doubled each retry, capped at
+/// `RECONNECT_MAX_DELAY`. 1s keeps a genuinely brief blip (Engine's own restart, typically a few
+/// seconds) from stalling the topic noticeably, while the cap keeps a prolonged outage from
+/// hammering Engine every reconnect.
+const RECONNECT_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct TopicManager {
     pub session: SessionManager,
     pub(crate) engine: EngineClient,
     pub events: EventBus,
     pub(crate) classifier: TopicClassifier,
+    /// `watch_topic`'s reconnect backoff — real values in production, shrunk by tests so a
+    /// reconnect test doesn't have to wait out a real 1s sleep.
+    reconnect_base_delay: std::time::Duration,
+    reconnect_max_delay: std::time::Duration,
 }
 
 impl TopicManager {
@@ -56,7 +67,22 @@ impl TopicManager {
             engine: EngineClient::new(engine_url)?,
             events: EventBus::default(),
             classifier: TopicClassifier::new(llm_router_url)?,
+            reconnect_base_delay: RECONNECT_BASE_DELAY,
+            reconnect_max_delay: RECONNECT_MAX_DELAY,
         })
+    }
+
+    /// Test-only: shrinks the reconnect backoff so a test exercising `watch_topic`'s reconnect
+    /// loop doesn't have to wait out the real 1s..30s delays.
+    #[cfg(feature = "test-support")]
+    pub fn with_reconnect_delays(
+        mut self,
+        base: std::time::Duration,
+        max: std::time::Duration,
+    ) -> Self {
+        self.reconnect_base_delay = base;
+        self.reconnect_max_delay = max;
+        self
     }
 
     /// Every lifecycle event goes through here: appended to `chat.events` **and** broadcast to
@@ -488,19 +514,95 @@ impl TopicManager {
     /// Consumes one topic's Engine event stream to completion, updating `chat.topics` and
     /// publishing to the `EventBus` as it goes. Spawned as a background task whenever a topic
     /// starts Running — from `create_topic`, from `promote_next_queued` below, or from
-    /// `recover` at startup. Never returns an error to a caller: a stream failure is logged and
-    /// the topic is left as-is (recoverable by `recover` on the next restart).
+    /// `recover` at startup.
+    ///
+    /// A stream that ends or errors *without* a terminal event (Engine restarted mid-execution,
+    /// or the 3600s `StreamEvents` deadline was hit) used to strand the topic at `Running`
+    /// forever — the mpsc sender in `EngineClient::stream_events`'s relay task dropped, this
+    /// loop's `recv()` returned `None`, and nothing here ever called `finish_topic`. Only a chat
+    /// restart's `recover()` re-attached. Now it reconnects instead: wait with backoff, call
+    /// `stream_events` again — Engine's `StreamEvents` replays the whole history from version 1,
+    /// so `last_seen_version` skips events this loop already handled — and keep going until a
+    /// terminal event lands or the topic is no longer `Running` in the DB (reset, deleted, or
+    /// finished by a `finish_topic` call this same loop already made).
     pub async fn watch_topic(self: &std::sync::Arc<Self>, topic_id: i64, execution_id: Uuid) {
-        let mut events = match self.engine.stream_events(execution_id).await {
-            Ok(events) => events,
-            Err(error) => {
-                tracing::error!(topic_id, %error, "failed to open Engine event stream");
+        // Dedup by event id, not `version`: engine-core's `Execution::event()` currently stamps
+        // every event of an execution with `version: 1` (see engine-core/src/execution.rs), so a
+        // `version`-based high-water mark treats the *first* event received as having already
+        // covered every later one — including the terminal event — and a reconnect (or even the
+        // very first pass) would silently drop it, leaving `saw_terminal` false forever and the
+        // topic stuck `Running` while Engine had long since completed it. `event.id` is a fresh
+        // UUID per real event and stays stable across a replay (same DB row, same id), so it's
+        // the dedup key that actually works given `version`'s current behavior — and it degrades
+        // gracefully once `version` is fixed upstream, since ids stay unique either way.
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut attempt: u32 = 0;
+        loop {
+            let mut events = match self.engine.stream_events(execution_id).await {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::error!(topic_id, %error, "failed to open Engine event stream");
+                    if !self.wait_before_reconnect(topic_id, &mut attempt).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            let mut saw_terminal = false;
+            while let Some(event) = events.recv().await {
+                if !seen_ids.insert(event.id.clone()) {
+                    continue; // already handled — a replayed event from before the reconnect
+                }
+                if matches!(
+                    event.payload_kind.as_str(),
+                    "ExecutionCompleted" | "ExecutionFailed"
+                ) {
+                    saw_terminal = true;
+                }
+                self.handle_engine_event_logged(topic_id, &event).await;
+            }
+
+            if saw_terminal {
+                return; // finish_topic ran — the topic is terminal, nothing left to watch
+            }
+            if !self.wait_before_reconnect(topic_id, &mut attempt).await {
                 return;
             }
-        };
-        while let Some(event) = events.recv().await {
-            self.handle_engine_event_logged(topic_id, &event).await;
         }
+    }
+
+    /// Between one `stream_events` attempt and the next: exits quietly (returns `false`) once the
+    /// topic is no longer `Running` — a reset or delete out from under this watcher, or a status
+    /// this same call already moved off `Running` some other way — so a dead topic doesn't get
+    /// reconnected to forever. Otherwise sleeps out an exponential backoff (capped at
+    /// `reconnect_max_delay`, doubling from `reconnect_base_delay`) and returns `true`.
+    async fn wait_before_reconnect(&self, topic_id: i64, attempt: &mut u32) -> bool {
+        match topic::Entity::find_by_id(topic_id)
+            .one(&self.session.db)
+            .await
+        {
+            Ok(Some(row)) if row.status == Status::Running => {}
+            Ok(_) => return false, // no longer Running (or gone) — stop watching quietly
+            Err(error) => {
+                tracing::error!(topic_id, %error, "failed to check topic status before reconnecting");
+                return false;
+            }
+        }
+
+        *attempt += 1;
+        let delay = self
+            .reconnect_base_delay
+            .saturating_mul(1u32.checked_shl(*attempt - 1).unwrap_or(u32::MAX))
+            .min(self.reconnect_max_delay);
+        tracing::warn!(
+            topic_id,
+            attempt = *attempt,
+            delay_ms = delay.as_millis() as u64,
+            "Engine event stream ended without a terminal event; reconnecting"
+        );
+        tokio::time::sleep(delay).await;
+        true
     }
 
     /// `watch_topic`'s per-event step. Split out of the loop body so a failed event doesn't
@@ -896,6 +998,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct FakeEngine {
@@ -908,6 +1011,36 @@ mod tests {
         /// execution_id (string) -> the one event `stream_events` replays for it. Registered by
         /// tests after a topic's execution_id is known (it's chosen by `start_execution` below).
         completions: Mutex<HashMap<String, ExecutionEvent>>,
+        /// execution_id (string) -> per-call scripts, one `Vec<ExecutionEvent>` per
+        /// `stream_events` call in order — the Nth call to `stream_events` for that execution_id
+        /// gets `scripts[N]` (clamped to the last entry once exhausted). Lets a test make the
+        /// *first* call end without a terminal event (reproducing a dropped Engine connection)
+        /// and a *later* call deliver the terminal event, the way Engine's real replay-from-
+        /// version-1 behavior would. Takes priority over `completions` when both are armed.
+        scripted_streams: Mutex<HashMap<String, Vec<Vec<ExecutionEvent>>>>,
+        /// execution_id (string) -> how many times `stream_events` has been called for it —
+        /// what the reconnect tests assert on.
+        stream_calls: Mutex<HashMap<String, u32>>,
+    }
+
+    impl FakeEngine {
+        /// Registers the sequence of per-call event scripts `stream_events` replays for
+        /// `execution_id` — see `scripted_streams`' doc.
+        fn arm_scripted_stream(&self, execution_id: Uuid, calls: Vec<Vec<ExecutionEvent>>) {
+            self.scripted_streams
+                .lock()
+                .expect("lock")
+                .insert(execution_id.to_string(), calls);
+        }
+
+        fn stream_call_count(&self, execution_id: Uuid) -> u32 {
+            self.stream_calls
+                .lock()
+                .expect("lock")
+                .get(&execution_id.to_string())
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
     #[allow(refining_impl_trait)]
@@ -982,9 +1115,37 @@ mod tests {
             request: ServiceRequest<'_, EngineStreamEventsRequest>,
         ) -> ServiceResult<ServiceStream<ExecutionEvent>> {
             let owned = request.to_owned_message();
-            let event = owned
-                .execution_id
-                .and_then(|id| self.completions.lock().expect("lock").get(&id).cloned());
+            let Some(execution_id) = owned.execution_id else {
+                return Response::stream_ok(futures::stream::empty());
+            };
+
+            let call_index = {
+                let mut calls = self.stream_calls.lock().expect("lock");
+                let entry = calls.entry(execution_id.clone()).or_insert(0);
+                let index = *entry;
+                *entry += 1;
+                index
+            };
+
+            if let Some(scripts) = self
+                .scripted_streams
+                .lock()
+                .expect("lock")
+                .get(&execution_id)
+            {
+                let index = (call_index as usize).min(scripts.len().saturating_sub(1));
+                let events = scripts.get(index).cloned().unwrap_or_default();
+                return Response::stream_ok(futures::stream::iter(
+                    events.into_iter().map(Ok).collect::<Vec<_>>(),
+                ));
+            }
+
+            let event = self
+                .completions
+                .lock()
+                .expect("lock")
+                .get(&execution_id)
+                .cloned();
             match event {
                 Some(event) => Response::stream_ok(futures::stream::iter([Ok(event)])),
                 None => Response::stream_ok(futures::stream::empty()),
@@ -1077,7 +1238,10 @@ mod tests {
         let engine_url = serve(ConnectRouter::new().add_service(Arc::clone(&fake))).await;
         let router_url = serve(ConnectRouter::new().add_service(Arc::clone(&router))).await;
         let manager = Arc::new(
-            TopicManager::new(test.db.clone(), &engine_url, &router_url).expect("manager"),
+            TopicManager::new(test.db.clone(), &engine_url, &router_url)
+                .expect("manager")
+                // A reconnect test would otherwise wait out a real 1s..30s backoff.
+                .with_reconnect_delays(Duration::from_millis(1), Duration::from_millis(20)),
         );
         (test, manager, fake, router)
     }
@@ -2078,17 +2242,19 @@ mod tests {
         router.answer_with(
             r#"{"actions":[{"kind":"new","title":"Claude Code","question":"What is Claude Code?"}]}"#,
         );
+        let first_turn_id = Uuid::new_v4();
         let topic_id = one_topic(
             manager
-                .send_turn(user_id, Uuid::new_v4(), "What is Claude Code?".into())
+                .send_turn(user_id, first_turn_id, "What is Claude Code?".into())
                 .await
                 .expect("send_turn"),
         );
         router.answer_with(&format!(
             r#"{{"actions":[{{"kind":"continue","topic_id":{topic_id}}}]}}"#
         ));
+        let second_turn_id = Uuid::new_v4();
         manager
-            .send_turn(user_id, Uuid::new_v4(), "and which IDEs?".into())
+            .send_turn(user_id, second_turn_id, "and which IDEs?".into())
             .await
             .expect("send_turn");
 
@@ -2108,6 +2274,10 @@ mod tests {
             .map(|m| m.content.as_str())
             .collect();
         assert_eq!(contents, vec!["What is Claude Code?", "and which IDEs?"]);
+        // The client needs `turn_id` back on each message to collapse the same turn's rows
+        // across every topic the classifier routed it to (see chat.proto's Message.turn_id).
+        let turn_ids: Vec<Uuid> = messages[&topic_id].iter().map(|m| m.turn_id).collect();
+        assert_eq!(turn_ids, vec![first_turn_id, second_turn_id]);
     }
 
     /// The debug panel is session-wide *and* survives a reload, which it can only do if every
@@ -2211,6 +2381,223 @@ mod tests {
         assert_eq!(
             finished.result_summary,
             Some("brave search returned 422".to_owned())
+        );
+    }
+
+    /// A `NodeCompleted` event at a given version — the reconnect tests' stand-in for
+    /// in-progress `topic_progress` events.
+    fn node_completed_event(execution_id: Uuid, version: i32) -> ExecutionEvent {
+        ExecutionEvent {
+            id: format!("e{version}"),
+            execution_id: execution_id.to_string(),
+            version,
+            payload_kind: "NodeCompleted".to_owned(),
+            payload_json: r#"{"node":"search"}"#.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// An `ExecutionCompleted` event at a given version, carrying `reply` as the final answer —
+    /// the real Engine envelope shape (see `arm_terminal_event`'s doc).
+    fn execution_completed_event(execution_id: Uuid, version: i32, reply: &str) -> ExecutionEvent {
+        ExecutionEvent {
+            id: format!("e{version}"),
+            execution_id: execution_id.to_string(),
+            version,
+            payload_kind: "ExecutionCompleted".to_owned(),
+            payload_json: format!(
+                r#"{{"ExecutionCompleted":{{"final_state":{{"llm":{{"reply":"{reply}"}}}}}}}}"#
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// Inserts a `Running` topic row directly — session, title, a freshly-minted `execution_id`
+    /// — without going through `create_topic`. The reconnect tests need exactly *one*
+    /// `watch_topic` consumer racing `stream_events`: `create_topic` would call `start_execution`
+    /// and `spawn_watch` a second, background watcher for the same topic, which would also start
+    /// reconnect-polling the fake and make the `stream_call_count` assertions non-deterministic.
+    async fn insert_running_topic(manager: &Arc<TopicManager>, user_id: Uuid) -> (i64, Uuid) {
+        let session = manager
+            .session
+            .get_or_create_session(user_id)
+            .await
+            .expect("session");
+        let execution_id = Uuid::new_v4();
+        let now = Utc::now();
+        let row = topic::ActiveModel {
+            session_id: Set(session.id),
+            parent_id: Set(None),
+            title: Set("First".to_owned()),
+            status: Set(Status::Running),
+            execution_id: Set(Some(execution_id)),
+            input_json: Set("{}".to_owned()),
+            result_summary: Set(None),
+            artifact_ids: Set(serde_json::json!([])),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&manager.session.db)
+        .await
+        .expect("insert topic");
+        (row.id, execution_id)
+    }
+
+    /// The live bug this change fixes: Engine restarted mid-execution, the event stream ended
+    /// (no `ExecutionCompleted`/`ExecutionFailed`), and `watch_topic` used to just return —
+    /// stranding the topic at `Running` forever. Now it reconnects: the fake's first
+    /// `stream_events` call for this execution ends the stream early (an empty script, standing
+    /// in for the dropped connection), and its second call delivers the terminal event, exactly
+    /// as Engine's real `StreamEvents` would on a fresh subscribe after a restart (it replays
+    /// from version 1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watch_topic_reconnects_after_a_stream_that_ends_without_a_terminal_event() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, execution_id) = insert_running_topic(&manager, user_id).await;
+
+        fake.arm_scripted_stream(
+            execution_id,
+            vec![
+                vec![], // first call: stream ends immediately, no terminal event
+                vec![execution_completed_event(execution_id, 1, "done")], // the reconnect
+            ],
+        );
+
+        manager.watch_topic(topic_id, execution_id).await;
+
+        let finished = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic");
+        assert_eq!(
+            finished.status,
+            Status::Completed,
+            "the reconnect must let the topic reach its terminal status"
+        );
+        assert_eq!(
+            fake.stream_call_count(execution_id),
+            2,
+            "stream_events must be called again after the first stream ended without a terminal event"
+        );
+    }
+
+    /// The live regression this change fixes: engine-core's real `Execution::event()` stamps
+    /// *every* event of an execution with `version: 1` (see engine-core/src/execution.rs), unlike
+    /// this test file's other fixtures which increment `version` per event. With a
+    /// `version`-based high-water mark, the first event received (version 1) makes every
+    /// following event — including the terminal one, also version 1 — look "already handled" and
+    /// get skipped, so `saw_terminal` never becomes true and `watch_topic` reconnects forever
+    /// while the topic stays `Running` even though Engine's execution completed. Dedup must be by
+    /// event id instead, so a terminal event at the same `version` as an earlier progress event
+    /// still gets processed and `finish_topic` runs on the very first pass — no reconnect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_event_sharing_its_version_with_an_earlier_event_still_finishes_the_topic()
+     {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, execution_id) = insert_running_topic(&manager, user_id).await;
+
+        // Every event at version 1, matching engine-core's real (buggy) `Execution::event()` —
+        // only the ids differ, exactly as real Uuid-per-event ids would.
+        fake.arm_scripted_stream(
+            execution_id,
+            vec![vec![
+                ExecutionEvent {
+                    id: "e-progress".to_owned(),
+                    execution_id: execution_id.to_string(),
+                    version: 1,
+                    payload_kind: "NodeCompleted".to_owned(),
+                    payload_json: r#"{"node":"search"}"#.to_owned(),
+                    ..Default::default()
+                },
+                ExecutionEvent {
+                    id: "e-terminal".to_owned(),
+                    execution_id: execution_id.to_string(),
+                    version: 1,
+                    payload_kind: "ExecutionCompleted".to_owned(),
+                    payload_json: r#"{"ExecutionCompleted":{"final_state":{"llm":{"reply":"done"}}}}"#
+                        .to_owned(),
+                    ..Default::default()
+                },
+            ]],
+        );
+
+        manager.watch_topic(topic_id, execution_id).await;
+
+        let finished = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic");
+        assert_eq!(
+            finished.status,
+            Status::Completed,
+            "a terminal event must finish the topic even when it shares its version with an \
+             earlier event"
+        );
+        assert_eq!(
+            fake.stream_call_count(execution_id),
+            1,
+            "the terminal event was in the first stream — there must be no reconnect"
+        );
+    }
+
+    /// Engine's `StreamEvents` replays the whole history from version 1 on every subscribe, so a
+    /// reconnect re-delivers events `watch_topic` already handled before the stream broke. Those
+    /// must be skipped by version, not re-applied — otherwise a reconnect would double-publish
+    /// every `topic_progress` event the topic had already emitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replayed_events_are_not_double_handled_after_a_reconnect() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, execution_id) = insert_running_topic(&manager, user_id).await;
+        let session_id = manager
+            .session
+            .get_or_create_session(user_id)
+            .await
+            .expect("session")
+            .id;
+
+        fake.arm_scripted_stream(
+            execution_id,
+            vec![
+                // First call: two progress events, then the stream ends (no terminal event).
+                vec![
+                    node_completed_event(execution_id, 1),
+                    node_completed_event(execution_id, 2),
+                ],
+                // Reconnect: Engine's full replay from version 1 — versions 1 and 2 again, plus
+                // the completion this time.
+                vec![
+                    node_completed_event(execution_id, 1),
+                    node_completed_event(execution_id, 2),
+                    execution_completed_event(execution_id, 3, "done"),
+                ],
+            ],
+        );
+
+        manager.watch_topic(topic_id, execution_id).await;
+
+        assert_eq!(
+            fake.stream_call_count(execution_id),
+            2,
+            "the broken first stream must trigger exactly one reconnect"
+        );
+        let finished = topic::Entity::find_by_id(topic_id)
+            .one(&manager.session.db)
+            .await
+            .expect("query")
+            .expect("topic");
+        assert_eq!(finished.status, Status::Completed);
+
+        let replay = manager.stored_events(session_id).await.expect("replay");
+        let progress_count = replay.iter().filter(|e| e.kind == "topic_progress").count();
+        assert_eq!(
+            progress_count, 2,
+            "versions 1 and 2 replayed by the reconnect must not be published a second time"
         );
     }
 }

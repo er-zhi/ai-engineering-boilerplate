@@ -138,6 +138,7 @@ impl ChatService for ChatServiceImpl {
                             id: m.id.to_string(),
                             content: m.content,
                             created_at: m.created_at.to_rfc3339(),
+                            turn_id: m.turn_id.to_string(),
                             ..Default::default()
                         })
                         .collect(),

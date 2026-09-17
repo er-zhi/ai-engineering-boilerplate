@@ -28,6 +28,7 @@
   #transcript { flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; padding: .75rem; margin-bottom: .75rem; }
   .msg { padding: .4rem 0; border-bottom: 1px solid #f4f4f4; }
   .msg.notification { color: #444; font-style: italic; }
+  .msg.ack { color: #444; font-style: italic; }
   .msg .kind { color: #999; font-size: .75em; }
   .msg code { background: #f4f4f4; border-radius: 3px; padding: .1em .3em; font: 12px/1.4 ui-monospace, monospace; }
   .msg strong { font-weight: 600; }
@@ -278,7 +279,7 @@
   // The label tag always names the root conversation, never a child's own (possibly synthesized)
   // title — a child topic is just more turns in the same thread, so its tag must not "flip" to
   // whatever the classifier called the follow-up.
-  function rootTitleOf(topicId) {
+  function rootTitleOf(topics, topicId) {
     const byId = new Map(topics.map((t) => [t.id, t]));
     let cur = byId.get(topicId);
     if (!cur) return topicId;
@@ -290,52 +291,104 @@
     return cur.title;
   }
 
+  // Two messages are "the same turn" if they share a turn_id, or — for rows a server predating
+  // turn_id might still hand back — if they carry identical content within 2 seconds of each
+  // other. Either way this collapses the one `chat.messages` row persisted per topic a turn
+  // touched down to a single user line.
+  const DEDUP_WINDOW_MS = 2000;
+  function sameTurn(a, b) {
+    if (a.turnId && b.turnId) return a.turnId === b.turnId;
+    if (a.content !== b.content) return false;
+    return Math.abs(new Date(a.createdAt) - new Date(b.createdAt)) <= DEDUP_WINDOW_MS;
+  }
+
   // Rebuilt from GetSession alone, so it is idempotent: a reload, a topic switch and a lifecycle
   // event all produce the same transcript for the same server state.
   //
-  // `Topic.question` is never trusted as something the user said: it is synthesized by the
-  // backend for child topics ("Earlier answer: … Follow-up: …") and may be rephrased by the
-  // classifier even for a root topic. The user's real turns live only in `messages`. So: a topic
-  // with at least one message contributes only those messages as user lines; a topic with zero
-  // messages (a root topic the classifier split out of a multi-topic first message, whose message
-  // row lives on a sibling topic) contributes its `title` instead, once. Everything is then
-  // sorted by timestamp, which is what interleaves parallel topics into one readable thread.
-  function transcriptEntries() {
+  // Required shape (the live bug this fixes: one multi-topic message rendered once per topic,
+  // ahead of the classifier's rewritten questions instead of behind them):
+  //   1. The user's real message, exactly once — never a topic's synthesized `question`/`title`.
+  //   2. One assistant "looking into" line per topic that turn touched, tagged with that topic's
+  //      own title (not the root), showing running/queued state.
+  //   3. Each topic's answer once it resolves, directly under its own ack line.
+  function transcriptEntries(topics) {
     const entries = [];
+
+    // Step 1: every message across every topic, deduped down to one line per real turn. The
+    // topic tag is the root of the *first* topic that turn touched — unless the turn fanned out
+    // to more than one topic, in which case no single topic owns it, so no tag is shown.
+    const all = [];
     topics.forEach((topic) => {
-      const messages = topic.messages || [];
-      const tag = rootTitleOf(topic.id);
-      if (messages.length) {
-        messages.forEach((message) => {
-          entries.push({ at: message.createdAt, who: "you", text: message.content, topic: tag });
-        });
-      } else if (topic.title) {
-        entries.push({ at: topic.createdAt, who: "you", text: topic.title, topic: tag });
+      (topic.messages || []).forEach((message) => {
+        all.push({ topicId: topic.id, ...message });
+      });
+    });
+    all.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+    const used = new Array(all.length).fill(false);
+    for (let i = 0; i < all.length; i++) {
+      if (used[i]) continue;
+      const group = [all[i]];
+      used[i] = true;
+      for (let j = i + 1; j < all.length; j++) {
+        if (!used[j] && sameTurn(all[i], all[j])) {
+          group.push(all[j]);
+          used[j] = true;
+        }
       }
-      if (topic.resultSummary && (topic.status === "completed" || topic.status === "failed")) {
+      const topicIds = new Set(group.map((m) => m.topicId));
+      const tag = topicIds.size === 1 ? rootTitleOf(topics, group[0].topicId) : undefined;
+      entries.push({ at: group[0].createdAt, who: "you", text: group[0].content, topic: tag });
+    }
+
+    // Step 2 & 3: one ack per topic, tagged with that topic's own title, plus its answer once
+    // resolved. The ack sorts at the topic's own created_at, nudged 1ms later than an
+    // exactly-simultaneous user turn so it always renders below the message that started it.
+    const userAts = new Set(entries.map((e) => e.at));
+    topics.forEach((topic) => {
+      let ackAt = topic.createdAt;
+      if (userAts.has(ackAt)) {
+        ackAt = new Date(new Date(ackAt).getTime() + 1).toISOString();
+      }
+      const resolved = topic.status === "completed" || topic.status === "failed";
+      const ackText = resolved
+        ? `🔎 Looking into: ${topic.question}`
+        : topic.status === "queued"
+          ? `⏳ Queued: ${topic.question}`
+          : `🔎 Looking into: ${topic.question} (running…)`;
+      entries.push({ at: ackAt, who: "assistant", className: "ack", text: ackText, topic: topic.title });
+
+      if (resolved && topic.resultSummary) {
+        const answerAt = new Date(new Date(ackAt).getTime() + 1).toISOString();
         entries.push({
-          at: topic.updatedAt,
+          at: answerAt,
           who: "assistant",
           text: topic.resultSummary,
           className: topic.status === "failed" ? "error" : "",
-          topic: tag,
-        });
-      } else if (topic.status === "running" || topic.status === "queued") {
-        entries.push({
-          at: topic.updatedAt,
-          who: "assistant",
-          text: `(${topic.status}…)`,
-          className: "notification",
-          topic: tag,
+          topic: topic.title,
         });
       }
     });
-    return entries.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+
+    // Final ordering: a topic's row is inserted (and gets its `created_at`) inside
+    // `apply_actions`, *before* `send_turn` writes the turn's `chat.messages` row — so a topic's
+    // ack can carry an earlier timestamp than the very user message that spawned it. A plain
+    // timestamp sort would then put the ack above the user's line. Within `DEDUP_WINDOW_MS` of
+    // each other (the same window `sameTurn` already uses to treat rows as one turn), a "you"
+    // entry always sorts ahead of an assistant one, regardless of which timestamp is earlier;
+    // outside that window, timestamp order stands.
+    return entries.sort((a, b) => {
+      const ta = new Date(a.at).getTime();
+      const tb = new Date(b.at).getTime();
+      if (a.who !== b.who && Math.abs(ta - tb) <= DEDUP_WINDOW_MS) {
+        return a.who === "you" ? -1 : b.who === "you" ? 1 : 0;
+      }
+      return ta < tb ? -1 : ta > tb ? 1 : 0;
+    });
   }
 
   function renderTranscript() {
     transcript.textContent = "";
-    transcriptEntries().forEach((entry) => {
+    transcriptEntries(topics).forEach((entry) => {
       appendMessage(entry.who, entry.text, entry.className, entry.topic);
     });
   }
@@ -367,11 +420,11 @@
       let payload = {};
       try { payload = JSON.parse(event.payloadJson || "{}"); } catch { /* not JSON — ignore */ }
       if (event.kind === "notification") {
-        appendMessage("·", payload.text || payload.kind || "", "notification", rootTitleOf(event.topicId));
+        appendMessage("·", payload.text || payload.kind || "", "notification", rootTitleOf(topics, event.topicId));
         return;
       }
       if (event.kind === "topic_progress") {
-        appendMessage("·", progressText(event.payloadJson), "notification", rootTitleOf(event.topicId));
+        appendMessage("·", progressText(event.payloadJson), "notification", rootTitleOf(topics, event.topicId));
       }
     } catch (err) {
       debugLine("err", `render ${event.kind}`, err.message);
