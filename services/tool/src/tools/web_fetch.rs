@@ -10,6 +10,8 @@
 
 use std::net::IpAddr;
 
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use http::Uri;
 
 const MAX_FETCH_BYTES: usize = 5 * 1024 * 1024;
@@ -157,6 +159,27 @@ pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<FetchedPage, S
     })
 }
 
+/// Fetches every URL concurrently and returns the first page that comes back, dropping the rest.
+/// Public pages carrying the same fact are individually unreliable — one 403s a datacentre IP,
+/// another answers with a JavaScript shell, a third is just slow — so an agent handed a single
+/// URL spends a whole turn per failure. Racing the candidates it already has costs one turn
+/// whatever any single source does. All of them failing is one error listing every reason, so the
+/// model can tell "try other pages" from "this question needs a different search".
+pub async fn fetch_first(client: &reqwest::Client, urls: &[String]) -> Result<FetchedPage, String> {
+    let mut running: FuturesUnordered<_> = urls
+        .iter()
+        .map(|url| async move { (url, fetch(client, url).await) })
+        .collect();
+    let mut errors = Vec::new();
+    while let Some((url, result)) = running.next().await {
+        match result {
+            Ok(page) => return Ok(page),
+            Err(error) => errors.push(format!("{url}: {error}")),
+        }
+    }
+    Err(format!("every url failed — {}", errors.join("; ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +239,42 @@ mod tests {
         let page = fetch(&client, &url).await.expect("fetch");
 
         assert!(page.text.contains("Borrowing lets code use a value"));
+    }
+
+    /// The point of racing: the caller hands over candidates without knowing which host will
+    /// actually answer, and a dead one costs latency rather than the answer.
+    #[tokio::test]
+    async fn fetch_first_returns_the_page_from_whichever_url_answers() {
+        let working = serve(
+            "<html><head><title>Hi</title></head><body><article><p>Borrowing lets code use a value without taking ownership of it, which the borrow checker enforces.</p></article></body></html>",
+        )
+        .await;
+        let dead = "http://127.0.0.1:1/nothing".to_owned();
+        let client = reqwest::Client::new();
+
+        let page = fetch_first(&client, &[dead.clone(), working])
+            .await
+            .expect("one url answered");
+
+        assert!(page.text.contains("Borrowing lets code use a value"));
+    }
+
+    #[tokio::test]
+    async fn fetch_first_reports_every_url_when_none_answer() {
+        let client = reqwest::Client::new();
+
+        let error = fetch_first(
+            &client,
+            &[
+                "http://127.0.0.1:1/a".to_owned(),
+                "http://127.0.0.1:2/b".to_owned(),
+            ],
+        )
+        .await
+        .expect_err("both urls are dead");
+
+        assert!(error.contains("127.0.0.1:1/a"), "{error}");
+        assert!(error.contains("127.0.0.1:2/b"), "{error}");
     }
 
     #[tokio::test]

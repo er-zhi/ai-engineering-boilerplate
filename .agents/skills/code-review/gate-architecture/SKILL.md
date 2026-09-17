@@ -35,6 +35,23 @@ Services are isolated so that several people or agents can each own one and neve
 
 A service's own folder holds everything else it needs: source, entities, Dockerfile, README, tests. A branch that touches one service builds and tests alone — `cargo nextest run -p <service>` and `docker compose up <service>` are the whole loop — so branches merge without conflicts.
 
+## Capabilities, Not Topics
+
+This is an agent platform: the code supplies general capabilities and the model decides what to
+use them for. Encoding a subject area in the code is a defect — it answers one question and
+leaves every neighbouring one unanswered, and the list only ever grows.
+
+- Tools are verbs, not subjects: `web_fetch`, `web_search`, `kb_search`. A `weather`,
+  `stock_quote` or `fx_rate` tool is the same `web_fetch` with a topic glued on
+- No subject in a prompt: no "for weather questions, prefer…", no per-domain source lists, no
+  branch on what the user is asking about. Policy is about behaviour — call a tool before
+  answering, be terse, retry a failed source — and holds whatever the question is
+- No keyword matching on user text to pick a route, tool, or endpoint
+- A specific need becomes a general capability: "try several sources, take the first that
+  answers" is a racing, retrying fetch — not a table of weather sites
+- Example inputs are examples. A request that names weather and stock prices is asking for live
+  external data to work, not for those two subjects to be special-cased
+
 ## Contracts
 
 - Stable request/response shapes at the public boundary
@@ -71,3 +88,6 @@ A service's own folder holds everything else it needs: source, entities, Dockerf
 | A dependency's type or error in a shared signature (`sea_orm::DbErr`, `spider::Page`) | Own type at the boundary, converted where it crosses |
 | Caller branching on the backend behind a trait | One API; the trait picks the backend |
 | Shell script wrapping `docker` or `cargo` | The tool's documented command, or a Compose service |
+| Tool named after a subject (`weather`, `stock_quote`) | One capability tool the model aims itself (`web_fetch` over the sources it picks) |
+| Prompt paragraph about one topic, or a per-domain source list | Behavioural policy that holds for every question |
+| `if question.contains("weather")` picking a route or endpoint | Let the model choose; give it the capability, not the branch |

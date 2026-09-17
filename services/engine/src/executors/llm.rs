@@ -42,9 +42,9 @@ the user to go look somewhere else. Call it — if it fails you will be shown th
 Only answer directly when the question needs no outside information, or when the tools have
 already given you what you need.
 Keep going until you have the actual value. If the search snippets do not already contain the
-concrete answer, call web_fetch on the most relevant result — prefer plain, official, text-first
-pages (for example weather.gov or a plain-text weather endpoint) over JavaScript-heavy consumer
-sites, and if one fetch fails, try the next result instead of giving up.
+concrete answer, call web_fetch on the most relevant results — prefer plain, official, text-first
+pages over JavaScript-heavy ones, and when several results would each answer the question, pass
+them together so whichever responds first wins instead of spending a turn per failure.
 Then answer the question itself, with the real data in it — the numbers, dates and names you
 found — and cite the source URL. Never reply with a list of sites to check, a "you can find it
 at ..." pointer, or a "typically it is ..." guess when a tool can get the real value.
@@ -62,33 +62,19 @@ you truly cannot make that call, answer the question with what you already have 
 another plan and do not decline again.
 "#;
 /// Appended last, after the tool-use policy, so the final rule the model reads is about the shape
-/// of its answer, not just about calling tools. Answers here are read aloud by TTS, so length and
-/// narration matter as much as correctness.
+/// of its answer rather than about calling tools. Replies here are read aloud, where a paragraph
+/// of process narration is unusable however accurate it is.
 const FINAL_ANSWER_STYLE: &str = r#"
-Final answer style — this overrides every other instinct about being thorough or helpful: your
-"reply" is spoken aloud by text-to-speech, so it must be TERSE — one or two short sentences, under
-40 words total, and no more. No exceptions.
-Never narrate your process — no "Based on the search results...", "I searched...", "attempts to
-fetch ... returned errors...", no play-by-play of what worked or failed. Never use markdown,
-bullet points, headers, or bold. Never include a list of sources; at most one short source mention
-in plain prose if genuinely useful. State only the answer itself — the number, fact, or status —
-plainly, as if a person asked you out loud and you had one breath to answer.
-If, after trying, you truly could not get the data, say so in ONE sentence and nothing else, for
-example: "I couldn't get today's SF weather; try weather.gov."
+Final answer style, overriding any instinct to be thorough: your "reply" is read aloud, so it must
+be one or two short sentences, under 40 words.
+Never narrate your process — no "Based on the search results...", no "I searched...", no account
+of what worked or failed. No markdown, bullets, headers or bold. No list of sources; at most one
+short source mention in plain prose. State the answer itself — the number, the fact, the status —
+as if someone asked you out loud and you had one breath to reply.
+If you genuinely could not get the data, say that in one sentence and stop.
 Good: "Nasdaq Composite is at 26,108.46, up from 25,981.57 at the previous close."
-Good: "It's 66F and mostly cloudy in San Francisco right now."
-Bad: "Based on my search, I attempted to fetch several weather sites; some of them returned
-errors or marketing text instead of real data, but I was eventually able to determine from
-wttr.in that the current conditions in San Francisco are approximately 62F and foggy, similar to
-typical September weather in the city. Here are the details: Temperature: 62F. Conditions: Foggy."
-Structured live data has dedicated tools that already race several open APIs for you, so reach for
-them first and only fall back to web_search or web_fetch if they fail: `weather` for any weather
-question, `fx_rate` for currency and exchange rates, `stock_quote` for share and index prices.
-If you do fall back for weather, prefer https://wttr.in/<City>?format=3 (a plain-text one-line
-forecast) or an https://api.weather.gov endpoint via web_fetch, before JS-heavy consumer weather
-sites. If a fetch returns marketing or boilerplate text instead of real data, try the next source
-once, then answer with what you have — briefly, in one or two plain sentences, per the style rules
-above.
+Bad: "Based on my search I attempted several sources; some returned errors or marketing text, but
+I eventually determined the value. Here are the details: ..."
 "#;
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RETRY_ATTEMPTS: u32 = 3;
@@ -122,8 +108,8 @@ pub fn build_prompt(config: &Value, state: &Value) -> (String, String) {
     }
     if config.get("tool_calling").and_then(Value::as_bool) == Some(true) {
         system.push_str(TOOL_USE_POLICY);
-        system.push_str(FINAL_ANSWER_STYLE);
     }
+    system.push_str(FINAL_ANSWER_STYLE);
 
     let question = state
         .get("question")
@@ -330,7 +316,12 @@ mod tests {
     #[test]
     fn build_prompt_uses_the_default_system_prompt_when_config_has_none() {
         let (system, _) = build_prompt(&json!({}), &json!({}));
-        assert_eq!(system, DEFAULT_SYSTEM_PROMPT);
+        // Tool instructions are opt-in; the answer-style rule is not — every reply is spoken,
+        // including a graph that never calls a tool.
+        assert_eq!(
+            system,
+            format!("{DEFAULT_SYSTEM_PROMPT}{FINAL_ANSWER_STYLE}")
+        );
     }
 
     #[test]
@@ -377,6 +368,21 @@ mod tests {
         );
     }
 
+    /// Replies are read aloud, so the style rule is not decoration: without it the model answers
+    /// a one-line question with a paragraph recounting which fetches failed.
+    #[test]
+    fn build_prompt_demands_a_terse_spoken_answer() {
+        let (system, _) = build_prompt(&json!({"tool_calling": true}), &json!({}));
+
+        assert!(system.contains("read aloud"), "{system}");
+        assert!(system.contains("one or two short sentences"), "{system}");
+        assert!(system.contains("Never narrate your process"), "{system}");
+        // The style rule is the last thing the model reads, after the tool policy.
+        let policy_at = system.find("MUST use them").expect("policy rendered");
+        let style_at = system.find("Final answer style").expect("style rendered");
+        assert!(style_at > policy_at, "{system}");
+    }
+
     /// Searching isn't the goal — the answer is. The policy must push the model from snippets to
     /// web_fetch and then to a concrete, cited answer, never to "check one of these sites".
     #[test]
@@ -385,11 +391,11 @@ mod tests {
         let (system, _) = build_prompt(&config, &json!({}));
 
         assert!(
-            system.contains("call web_fetch on the most relevant result"),
+            system.contains("call web_fetch on the most relevant results"),
             "{system}"
         );
         assert!(
-            system.contains("if one fetch fails, try the next result"),
+            system.contains("pass\nthem together so whichever responds first wins"),
             "{system}"
         );
         assert!(system.contains("cite the source URL"), "{system}");
@@ -405,35 +411,6 @@ mod tests {
             system.contains("never decline because you are unsure a tool is available"),
             "{system}"
         );
-    }
-
-    /// TTS reads the reply aloud, so the system prompt must forbid narration and sourcy dumps and
-    /// steer the model toward plain-text weather endpoints before JS-heavy sites.
-    #[test]
-    fn build_prompt_requires_terse_final_answers_and_prefers_plain_text_weather_sources() {
-        let config = json!({"tool_calling": true});
-        let (system, _) = build_prompt(&config, &json!({}));
-
-        assert!(system.contains("TERSE"), "{system}");
-        assert!(system.contains("one or two short sentences"), "{system}");
-        assert!(system.contains("Never narrate your process"), "{system}");
-        assert!(
-            system.contains("Never include a list of sources"),
-            "{system}"
-        );
-        assert!(
-            system.contains("Nasdaq Composite is at 26,108.46"),
-            "{system}"
-        );
-        assert!(
-            system.contains("I couldn't get today's SF weather; try weather.gov."),
-            "{system}"
-        );
-        assert!(system.contains("wttr.in/<City>?format=3"), "{system}");
-        assert!(system.contains("api.weather.gov"), "{system}");
-        for tool in ["`weather`", "`fx_rate`", "`stock_quote`"] {
-            assert!(system.contains(tool), "{tool} missing from {system}");
-        }
     }
 
     #[test]
