@@ -338,6 +338,16 @@ fn record_edges(
     }
 }
 
+/// The old `llm` → `tool` → `llm` loop charges `ONE_TOOL_CALL` for the deciding `llm` node's own
+/// output and a second `ONE_TOOL_CALL` for the `tool` node's — two charges for one tool used. An
+/// `llm` node whose output carries `FAST_TOOL_CALL_FIELD` (see that constant's doc) dispatched a
+/// tool itself, outside the graph, so it never earns the `tool` node's own charge on its own —
+/// charge it here instead, so a fast-dispatched tool costs `tool_calls_remaining` exactly what the
+/// node-per-node loop would have charged it, not less.
+fn extra_tool_call_charge(value: &serde_json::Value) -> u32 {
+    u32::from(value.get(crate::llm_output::FAST_TOOL_CALL_FIELD).is_some())
+}
+
 fn charge_budget(execution: &mut Execution, value: &serde_json::Value) {
     let tokens = value.get("usage").map_or(0, |usage| {
         let field = |name: &str| {
@@ -348,9 +358,10 @@ fn charge_budget(execution: &mut Execution, value: &serde_json::Value) {
         };
         u32::try_from(field("tokens_in").saturating_add(field("tokens_out"))).unwrap_or(u32::MAX)
     });
+    let tool_calls = ONE_TOOL_CALL.saturating_add(extra_tool_call_charge(value));
     execution
         .budget
-        .charge(tokens, ONE_TOOL_CALL, UNMEASURED_WALL_TIME);
+        .charge(tokens, tool_calls, UNMEASURED_WALL_TIME);
 }
 
 fn state_key(config: &serde_json::Value) -> Option<&str> {
@@ -1015,6 +1026,48 @@ mod tests {
 
         assert_eq!(exec.budget.tokens_remaining, tokens_before);
         assert_eq!(exec.budget.tool_calls_remaining, calls_before - 1);
+    }
+
+    // An `llm` node output carrying `FAST_TOOL_CALL_FIELD` stood in for a whole `llm` + `tool`
+    // pair of node completions (see `extra_tool_call_charge`'s doc), so it must charge
+    // `tool_calls_remaining` by two, not the flat one every other task output charges.
+    #[test]
+    fn a_task_output_carrying_a_fast_dispatched_tool_call_charges_two_tool_calls() {
+        let g = graph(
+            vec![
+                Node::Task {
+                    id: NodeId("a".into()),
+                    kind: "llm".into(),
+                    config: json!({}),
+                },
+                Node::End {
+                    id: NodeId("end".into()),
+                },
+            ],
+            vec![Edge {
+                from: NodeId("a".into()),
+                to: NodeId("end".into()),
+                condition: Condition::Always,
+            }],
+            "a",
+        );
+        let exec = execution("a");
+        let calls_before = exec.budget.tool_calls_remaining;
+
+        let (exec, _) = step(
+            &g,
+            exec,
+            vec![ok(
+                "a",
+                json!({
+                    "reply": "68",
+                    crate::llm_output::FAST_TOOL_CALL_FIELD: {"name": "web_search", "args": {}, "result": {}},
+                }),
+            )],
+            Utc::now(),
+        );
+
+        assert_eq!(exec.budget.tool_calls_remaining, calls_before - 2);
     }
 
     #[test]

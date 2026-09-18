@@ -7,13 +7,14 @@ use buffa::EnumValue;
 use common::execution_input::ExecutionInput;
 use common::proto::llm_router::v1::{
     Answer, Choice, ChoiceAnswer, ChoiceOption, CompleteRequest, CompleteResponse, DecideRequest,
-    LlmRouterServiceClient, Noul, QualityTier, Question, ResponseFormat, Sampling,
+    DecideResponse, LlmRouterServiceClient, Noul, QualityTier, Question, ResponseFormat, Sampling,
     SystemOneServiceClient, answer::Answer as Given,
 };
 use common::proto::tools::v1::{ExecuteRequest, ExecuteResponse, ExecuteStatus, ToolServiceClient};
 use connectrpc::client::HttpClient;
 use engine_core::{
-    LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
+    FAST_TOOL_CALL_FIELD, LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError,
+    TaskExecutor, ToolCall,
 };
 use serde_json::{Value, json};
 
@@ -144,6 +145,15 @@ const NEEDS_EXTERNAL_INFO_CONFIDENT_FALSE_THRESHOLD: f64 = 0.3;
 /// A wrong tool pick on this path costs one tool call, not the turn — the normal loop continues
 /// after it — so this does not need the same certainty as skipping the nudge above.
 const TOOL_CHOICE_CONFIDENCE_THRESHOLD: f64 = 0.5;
+/// The question is sent to a fast-dispatched tool verbatim, as the whole value of its one string
+/// argument — never composed by a model first. That is only safe for something shaped like a
+/// question: `services/chat/src/topic_turn.rs` builds a follow-up's question as `"Earlier
+/// answer:\n{summary}\n\nFollow-up: {content}"`, multi-line and capable of embedding a previous
+/// answer's whole text. Sending that straight into a tool's query would both wreck the tool's own
+/// result quality and ship a prior answer into a third-party provider's request. A single line
+/// under this length is what "verbatim" was written for; anything longer or multi-line falls
+/// through to today's flow, where the model composes its own query instead.
+const MAX_FAST_DISPATCH_QUESTION_CHARS: usize = 200;
 
 fn shape_of(output: LlmOutput) -> String {
     serde_json::to_string(&output).expect("an LlmOutput always serializes")
@@ -348,15 +358,22 @@ fn complete_request(config: &LlmNodeConfig, state: &Value) -> CompleteRequest {
 }
 
 /// What one typed `Decide` call, sent before the first generative call of a turn, resolves to.
+/// `decide_usage` is `Decide`'s own token cost, shaped for `merge_usage` — see
+/// `decide_usage_value` — so `try_fast_path` can fold it into the budget the same way
+/// `merge_usage` already folds the nudge's second `Complete` in.
 enum FastPath {
-    /// `needs_external_information` came back confidently false: answer with one `Complete`, nudge
-    /// disabled.
-    NoToolNeeded,
-    /// `tool` came back confident, named a live catalog entry, and that entry's schema takes
-    /// exactly one required string field: call it with the question verbatim.
-    ToolCall(ToolCall),
-    /// No typed decision was reached (an error, a timeout, or neither answer was confident and
-    /// actionable) — today's flow, unchanged, nudge included.
+    /// `needs_external_information` came back confidently false, and `tool` named nothing
+    /// confidently: answer with one `Complete`, nudge disabled.
+    NoToolNeeded { decide_usage: Value },
+    /// `tool` came back confident, named a live catalog entry, that entry's schema takes exactly
+    /// one required string field, and the question is shaped like something safe to send
+    /// verbatim: call it with the question verbatim.
+    ToolCall { call: ToolCall, decide_usage: Value },
+    /// No typed decision was reached (an error or a timeout), or the decision reached is neither
+    /// of the above — including a confident tool pick that failed the schema or question-shape
+    /// gate, which vetoes `NoToolNeeded` too: the decider has said a tool is needed, and that
+    /// outranks a separate, independently-evaluated "no information needed". Today's flow,
+    /// unchanged, nudge included.
     Unavailable,
 }
 
@@ -380,24 +397,49 @@ impl LlmTaskExecutor {
         }
         let question = ExecutionInput::in_state(state).question;
         match self.decide_fast_path(config, &question).await {
-            FastPath::ToolCall(call) => {
-                let result = self.dispatch_tool_fast(&call, idempotency_key).await;
-                let state = state_with_extra_tool_result(state, result);
-                let request = complete_request(config, &state);
-                Some(self.complete_with_retries(&request).await)
-            }
-            FastPath::NoToolNeeded => {
+            FastPath::ToolCall { call, decide_usage } => Some(
+                self.run_fast_tool_call(config, state, &call, &decide_usage, idempotency_key)
+                    .await,
+            ),
+            FastPath::NoToolNeeded { decide_usage } => {
                 let request = complete_request(config, state);
-                Some(self.complete_with_retries(&request).await)
+                let outcome = self
+                    .complete_with_retries(&request)
+                    .await
+                    .map(|output| merge_usage(&decide_usage, output));
+                Some(outcome)
             }
             FastPath::Unavailable => None,
         }
     }
 
+    /// Dispatches the fast-chosen tool, folds its result into the prompt for one `Complete` call,
+    /// merges in both spent calls' token usage, and records the call on the node's own output
+    /// under `FAST_TOOL_CALL_FIELD` — see that constant's doc for why that alone makes the call
+    /// event-logged, checkpointed and budget-charged by the ordinary per-node machinery.
+    async fn run_fast_tool_call(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        call: &ToolCall,
+        decide_usage: &Value,
+        idempotency_key: &str,
+    ) -> Result<Value, TaskError> {
+        let result = self.dispatch_tool_fast(call, idempotency_key).await;
+        let state_with_result = state_with_extra_tool_result(state, result.clone());
+        let request = complete_request(config, &state_with_result);
+        let output = self.complete_with_retries(&request).await?;
+        let output = merge_usage(decide_usage, output);
+        Ok(attach_fast_tool_call(output, call, result))
+    }
+
     /// Sends one `Decide` whose state is the question alone — not the whole execution state, per
-    /// the vendor's own guidance. Any error or timeout, or an answer that is neither a confident
-    /// tool pick nor a confident "no information needed", is `FastPath::Unavailable`: the fail-safe
-    /// that keeps a `Decide` outage from ever costing a turn.
+    /// the vendor's own guidance. Any error or timeout is `FastPath::Unavailable`, the fail-safe
+    /// that keeps a `Decide` outage from ever costing a turn. The vendor evaluates each question
+    /// independently (`llm_router.proto`'s `DecideRequest` doc), so a confident `tool` pick and a
+    /// confident "no information needed" can — and do — co-occur; `confident_tool_choice` is
+    /// checked first for exactly that reason, and a confident pick that fails the fast-dispatch
+    /// gate still returns `Unavailable`, never falling through to `NoToolNeeded`.
     async fn decide_fast_path(&self, config: &LlmNodeConfig, question: &str) -> FastPath {
         let Some(request) = decide_request(question, &config.available_tools) else {
             return FastPath::Unavailable;
@@ -412,16 +454,18 @@ impl LlmTaskExecutor {
                 return FastPath::Unavailable;
             }
         };
+        let decide_usage = decide_usage_value(&decided);
 
-        if let Some(call) =
-            confident_single_field_tool_call(&decided.answers, &config.available_tools, question)
-        {
-            return FastPath::ToolCall(call);
+        if let Some(choice) = confident_tool_choice(&decided.answers) {
+            return match fast_dispatchable_tool_call(choice, &config.available_tools, question) {
+                Some(call) => FastPath::ToolCall { call, decide_usage },
+                None => FastPath::Unavailable,
+            };
         }
         if find_noul(&decided.answers, NEEDS_EXTERNAL_INFO_ID)
             .is_some_and(|value| value < NEEDS_EXTERNAL_INFO_CONFIDENT_FALSE_THRESHOLD)
         {
-            return FastPath::NoToolNeeded;
+            return FastPath::NoToolNeeded { decide_usage };
         }
         FastPath::Unavailable
     }
@@ -443,6 +487,28 @@ impl LlmTaskExecutor {
             Err(error) => json!({ TOOL_RESULT_ERROR_KEY: error.to_string() }),
         }
     }
+}
+
+/// `Decide`'s own token cost, shaped like a node output's `usage` object so `merge_usage` — built
+/// to fold the nudge's second `Complete` into the first — folds this in the same way. Every
+/// fast-path turn spends this call and the budget must see it, same as any other.
+fn decide_usage_value(decided: &DecideResponse) -> Value {
+    json!({"usage": {"tokens_in": decided.tokens_in, "tokens_out": decided.tokens_out}})
+}
+
+/// Records the fast-dispatched call on the node's own output — name, args and result, under
+/// `FAST_TOOL_CALL_FIELD` — which `engine-core::step::apply_output` then records verbatim in this
+/// node's `NodeCompleted` event and writes into the checkpointed state through the node's own
+/// reducer, and `engine-core::step::charge_budget` reads to charge the extra `tool_calls_remaining`
+/// unit a `tool` node would otherwise have earned.
+fn attach_fast_tool_call(mut output: Value, call: &ToolCall, result: Value) -> Value {
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            FAST_TOOL_CALL_FIELD.to_owned(),
+            json!({"name": call.name, "args": call.args, "result": result}),
+        );
+    }
+    output
 }
 
 fn tool_result_value(response: &ExecuteResponse) -> Value {
@@ -537,16 +603,27 @@ fn tool_question(available_tools: &[CatalogEntry]) -> Option<Question> {
     Some(question)
 }
 
-/// A confident `tool` pick that names a live catalog entry whose `input_schema` takes exactly one
-/// required string field — decided by the schema, never by the tool's name. `question` becomes
-/// that field's value verbatim.
-fn confident_single_field_tool_call(
-    answers: &[Answer],
+/// The `tool` choice, if it names something other than `NO_TOOL_OPTION` at or above the
+/// confidence threshold — regardless of whether it goes on to qualify for fast dispatch. A
+/// confident pick here means the decider has judged a tool necessary, and callers must treat that
+/// as vetoing `FastPath::NoToolNeeded` even when the pick itself cannot be fast-dispatched — see
+/// `decide_fast_path`.
+fn confident_tool_choice(answers: &[Answer]) -> Option<&ChoiceAnswer> {
+    find_choice(answers, TOOL_QUESTION_ID).filter(|choice| {
+        choice.choice != NO_TOOL_OPTION && choice.confidence >= TOOL_CHOICE_CONFIDENCE_THRESHOLD
+    })
+}
+
+/// A confident `tool` pick additionally qualifies for the fast path only when it names a live
+/// catalog entry whose `input_schema` takes exactly one required string field — decided by the
+/// schema, never by the tool's name — and `question` is shaped like something safe to send
+/// verbatim (see `MAX_FAST_DISPATCH_QUESTION_CHARS`'s doc). `question` becomes that field's value.
+fn fast_dispatchable_tool_call(
+    choice: &ChoiceAnswer,
     available_tools: &[CatalogEntry],
     question: &str,
 ) -> Option<ToolCall> {
-    let choice = find_choice(answers, TOOL_QUESTION_ID)?;
-    if choice.choice == NO_TOOL_OPTION || choice.confidence < TOOL_CHOICE_CONFIDENCE_THRESHOLD {
+    if !fits_fast_dispatch(question) {
         return None;
     }
     let tool = available_tools
@@ -557,6 +634,16 @@ fn confident_single_field_tool_call(
         name: tool.name.clone(),
         args: json!({ field: question }),
     })
+}
+
+/// Whether `question` is short enough and shaped enough (one line) to hand a fast-dispatched tool
+/// verbatim as its whole one-string argument. See `MAX_FAST_DISPATCH_QUESTION_CHARS`'s doc for why
+/// this exists: a follow-up's question is not always a question.
+fn fits_fast_dispatch(question: &str) -> bool {
+    let trimmed = question.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('\n')
+        && trimmed.chars().count() <= MAX_FAST_DISPATCH_QUESTION_CHARS
 }
 
 /// `Some(field)` when `input_schema_json` is a JSON Schema object whose `required` names exactly
@@ -730,7 +817,11 @@ mod tests {
 
     #[test]
     fn the_tool_use_policy_names_no_subject_and_no_tool() {
-        let lowered = format!("{TOOL_USE_POLICY}{TOOL_NUDGE}{FINAL_ANSWER_STYLE}").to_lowercase();
+        let lowered = format!(
+            "{TOOL_USE_POLICY}{TOOL_NUDGE}{FINAL_ANSWER_STYLE}{NEEDS_EXTERNAL_INFO_INSTRUCTIONS}\
+             {NEEDS_EXTERNAL_INFO_WHEN_TRUE}{NEEDS_EXTERNAL_INFO_WHEN_FALSE}{TOOL_QUESTION_INSTRUCTIONS}"
+        )
+        .to_lowercase();
 
         for subject_or_tool in [
             "weather",
@@ -876,6 +967,8 @@ mod tests {
 
     const FAKE_TOKENS_IN: i32 = 17;
     const FAKE_TOKENS_OUT: i32 = 23;
+    const FAKE_DECIDE_TOKENS_IN: i32 = 5;
+    const FAKE_DECIDE_TOKENS_OUT: i32 = 2;
     /// Stands in for a tool service this test never expects to be called — any decide/dispatch
     /// path that did reach it would fail loudly, since nothing is listening here.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
@@ -1001,6 +1094,8 @@ mod tests {
                 .collect();
             Response::ok(DecideResponse {
                 answers,
+                tokens_in: FAKE_DECIDE_TOKENS_IN,
+                tokens_out: FAKE_DECIDE_TOKENS_OUT,
                 ..Default::default()
             })
         }
@@ -1358,6 +1453,27 @@ mod tests {
         );
     }
 
+    // The shape every tool that actually qualifies in production has: one required string field
+    // plus an optional sibling — e.g. web_search / kb_search's real `{"required": ["query"],
+    // "properties": {"query": {...}, "limit": {...}}}`. A bare one-field schema with no sibling,
+    // as the other tests here use, is not what a live catalog entry looks like.
+    #[test]
+    fn single_required_string_field_accepts_a_required_string_alongside_an_optional_sibling() {
+        let schema = json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": ["integer", "null"]},
+            },
+        })
+        .to_string();
+        assert_eq!(
+            single_required_string_field(&schema),
+            Some("query".to_owned())
+        );
+    }
+
     #[test]
     fn single_required_string_field_rejects_two_required_fields() {
         let schema = json!({
@@ -1419,10 +1535,19 @@ mod tests {
              call, with the nudge disabled — the reply above carries no tool_call, so a nudge \
              would otherwise have fired"
         );
+        assert_eq!(
+            output["usage"]["tokens_in"],
+            json!(i64::from(FAKE_TOKENS_IN + FAKE_DECIDE_TOKENS_IN)),
+            "the Decide call this path spends must be charged against the budget too, not just \
+             the Complete call — the nudge path already does this with merge_usage"
+        );
+        assert_eq!(
+            output["usage"]["tokens_out"],
+            json!(i64::from(FAKE_TOKENS_OUT + FAKE_DECIDE_TOKENS_OUT))
+        );
     }
 
-    #[tokio::test]
-    async fn a_confident_single_string_field_tool_is_dispatched_without_a_generative_turn_first() {
+    async fn dispatched_fast_tool_call() -> (Value, Arc<FakeLlmRouter>, Arc<FakeToolService>) {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": null, "reply": "sixty-eight"}"#,
         ));
@@ -1447,6 +1572,12 @@ mod tests {
             )
             .await
             .expect("execute");
+        (output, fake, tool)
+    }
+
+    #[tokio::test]
+    async fn a_confident_single_string_field_tool_is_dispatched_without_a_generative_turn_first() {
+        let (output, fake, tool) = dispatched_fast_tool_call().await;
 
         assert_eq!(output["reply"], json!("sixty-eight"));
         assert_eq!(
@@ -1472,6 +1603,31 @@ mod tests {
             received[0].user_prompt.contains("sixty-eight"),
             "the dispatched tool's result must be appended before the answering Complete: {}",
             received[0].user_prompt
+        );
+    }
+
+    // The evidence Critical finding 1 asked for: the fast-dispatched call must be durable, not
+    // just used to answer and then dropped.
+    #[tokio::test]
+    async fn a_fast_dispatched_tool_call_is_recorded_on_the_nodes_own_output() {
+        let (output, ..) = dispatched_fast_tool_call().await;
+
+        assert_eq!(
+            output["fast_tool_call"],
+            json!({
+                "name": "some_tool",
+                "args": {"query": "what is 17 times 4?"},
+                "result": {"answer": "sixty-eight"},
+            }),
+            "the fast-dispatched call must be recorded on the node's own output, so it is \
+             event-logged and checkpointed by the ordinary per-node machinery — otherwise the \
+             most common tool call in the system is invisible"
+        );
+        assert_eq!(
+            output["usage"]["tokens_in"],
+            json!(i64::from(FAKE_TOKENS_IN + FAKE_DECIDE_TOKENS_IN)),
+            "the Decide call this path spends must be charged too, the same as the nudge's \
+             second Complete call already is via merge_usage"
         );
     }
 
@@ -1503,6 +1659,205 @@ mod tests {
             0,
             "a tool whose schema needs two fields must never be dispatched on the fast path, \
              however confidently it was chosen"
+        );
+    }
+
+    // The vendor evaluates `tool` and `needs_external_information` independently, so a confident
+    // tool pick that the schema gate disqualifies and a confidently-false need-for-information can
+    // co-occur. A confident tool pick must veto NoToolNeeded too, not just block ToolCall.
+    #[tokio::test]
+    async fn a_confident_schema_disqualified_tool_pick_vetoes_no_tool_needed_too() {
+        let fake = Arc::new(FakeLlmRouter::then(
+            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
+            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
+        ));
+        fake.answer_decide_tool("two_field_tool", 0.95);
+        fake.answer_decide_needs_external_info(0.02); // confidently false — must not be enough
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![two_field_tool("two_field_tool")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["tool_call"]["name"], json!("some_search"));
+        assert_eq!(tool.calls(), 0, "schema-disqualified, so never dispatched");
+        assert_eq!(
+            fake.calls(),
+            2,
+            "a confident tool pick vetoes NoToolNeeded, so today's flow — nudge included — runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confident_pick_of_a_tool_not_in_the_live_catalog_vetoes_no_tool_needed_too() {
+        let fake = Arc::new(FakeLlmRouter::then(
+            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
+            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
+        ));
+        fake.answer_decide_tool("nonexistent_tool", 0.95);
+        fake.answer_decide_needs_external_info(0.02);
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["tool_call"]["name"], json!("some_search"));
+        assert_eq!(
+            fake.calls(),
+            2,
+            "a confident pick naming no tool in the live catalog still vetoes NoToolNeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_low_confidence_tool_pick_does_not_veto_no_tool_needed() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "68"}"#,
+        ));
+        fake.answer_decide_tool("some_tool", 0.2); // below TOOL_CHOICE_CONFIDENCE_THRESHOLD
+        fake.answer_decide_needs_external_info(0.02);
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute(
+                "llm",
+                &config,
+                &json!({"question": "what is 17 times 4?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!("68"));
+        assert_eq!(
+            fake.calls(),
+            1,
+            "a tool mentioned with low confidence must not block the no-tool-needed fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_tool_answer_does_not_veto_no_tool_needed() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "68"}"#,
+        ));
+        fake.answer_decide_needs_external_info(0.02); // tool left unarmed: no `tool` answer at all
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+
+        let output = executor
+            .execute(
+                "llm",
+                &json!({"tool_calling": true}),
+                &json!({"question": "what is 17 times 4?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!("68"));
+        assert_eq!(
+            fake.calls(),
+            1,
+            "no `tool` answer at all must not block the no-tool-needed fast path"
+        );
+    }
+
+    // A follow-up's question is not always a question — see MAX_FAST_DISPATCH_QUESTION_CHARS's
+    // doc. A confident, schema-eligible tool pick must still not be fast-dispatched when the
+    // question itself is multi-line, and must still veto NoToolNeeded (today's flow decides).
+    #[tokio::test]
+    async fn a_multi_line_question_is_not_fast_dispatched_even_when_the_tool_otherwise_qualifies() {
+        let fake = Arc::new(FakeLlmRouter::then(
+            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
+            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
+        ));
+        fake.answer_decide_tool("some_tool", 0.9);
+        fake.answer_decide_needs_external_info(0.02);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+        let question = "Earlier answer:\nParis\n\nFollow-up: what is its population?";
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": question}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["tool_call"]["name"], json!("some_search"));
+        assert_eq!(
+            tool.calls(),
+            0,
+            "a multi-line question must never be fast-dispatched verbatim into a tool's query"
+        );
+        assert_eq!(
+            fake.calls(),
+            2,
+            "a confident, schema-eligible tool pick still vetoes NoToolNeeded even when the \
+             question's own shape blocks fast dispatch — today's flow decides instead"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_longer_than_the_fast_dispatch_limit_is_not_fast_dispatched() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "ok"}"#,
+        ));
+        fake.answer_decide_tool("some_tool", 0.9);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+        let question = "x".repeat(MAX_FAST_DISPATCH_QUESTION_CHARS + 1);
+
+        executor
+            .execute("llm", &config, &json!({"question": question}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            tool.calls(),
+            0,
+            "a question over the fast-dispatch length limit must never be sent verbatim"
         );
     }
 

@@ -24,8 +24,8 @@ pub use execution::{ActiveNode, Execution, Status};
 pub use graph::{Condition, Edge, Graph, Node, Reducer, WaitKind, evaluate_condition};
 pub use ids::{ExecutionId, GraphId, NodeId, UserId};
 pub use llm_output::{
-    LLM_STATE_KEY, LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, ToolCall,
-    llm_reply_pointer, llm_tool_call_pointer,
+    FAST_TOOL_CALL_FIELD, LLM_STATE_KEY, LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY,
+    ToolCall, llm_reply_pointer, llm_tool_call_pointer,
 };
 pub use ports::{CheckpointStore, TaskError, TaskExecutor};
 pub use state::apply_reducer;
