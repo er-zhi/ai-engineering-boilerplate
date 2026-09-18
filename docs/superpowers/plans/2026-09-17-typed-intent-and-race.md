@@ -1032,6 +1032,12 @@ In `services/tool/src/tools/web_fetch.rs`'s `mod tests`, using the same loopback
     }
 ```
 
+**Every one of these tests must build its client with `.redirect(reqwest::redirect::Policy::none())`**,
+through one shared test helper. A bare `reqwest::Client::new()` follows and resolves the hop
+internally, so `get_guarded`'s own `redirect_target` / `resolve` / `ensure_public_url` path never
+runs and all four tests pass without testing anything. Prove each test depends on the guard by
+breaking the guard and watching that test fail.
+
 The loopback test servers pass `ensure_public_url` only because the test calls `get_guarded`
 directly; write `serve_redirect` / `serve_self_redirect` / `serve_relative_redirect` /
 `serve_body` as small `axum` routers in the same style as the file's existing helpers. The first
