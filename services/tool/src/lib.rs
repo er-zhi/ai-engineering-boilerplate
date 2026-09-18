@@ -5,6 +5,7 @@ pub mod entity;
 pub mod error;
 pub mod policy;
 pub mod providers;
+pub mod race;
 pub mod service;
 pub mod slugs;
 #[cfg(feature = "test-support")]
