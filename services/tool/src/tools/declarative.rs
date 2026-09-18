@@ -188,7 +188,7 @@ where
 }
 
 async fn ask(client: &reqwest::Client, url: &str, pick: &str) -> Result<Value, String> {
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
@@ -196,12 +196,19 @@ async fn ask(client: &reqwest::Client, url: &str, pick: &str) -> Result<Value, S
     if !response.status().is_success() {
         return Err(format!("returned {}", response.status()));
     }
-    let body = response
-        .bytes()
+    // Streamed rather than `response.bytes()`: checking the cap only after the whole body is
+    // already buffered would let an endless or oversized reply keep allocating for the entire
+    // per-source timeout before the bound ever fired.
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| format!("body could not be read: {error}"))?;
-    if body.len() > MAX_BODY_BYTES {
-        return Err(format!("replied with more than {MAX_BODY_BYTES} bytes"));
+        .map_err(|error| format!("body could not be read: {error}"))?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_BODY_BYTES {
+            return Err(format!("replied with more than {MAX_BODY_BYTES} bytes"));
+        }
     }
     let parsed: Value =
         serde_json::from_slice(&body).map_err(|error| format!("reply is not JSON: {error}"))?;
@@ -482,5 +489,35 @@ mod tests {
         .await
         .expect_err("both are unroutable");
         assert!(error.contains("one") && error.contains("two"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_endless_body_is_abandoned_once_it_passes_the_cap() {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async {
+                axum::body::Body::from_stream(futures::stream::repeat_with(|| {
+                    Ok::<_, std::io::Error>(vec![b'x'; 64 * 1024])
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            ask(&client, &format!("http://{address}/"), "t"),
+        )
+        .await
+        .expect("a body that never ends must not be buffered whole")
+        .unwrap_err();
+
+        assert!(error.contains(&MAX_BODY_BYTES.to_string()), "{error}");
     }
 }
