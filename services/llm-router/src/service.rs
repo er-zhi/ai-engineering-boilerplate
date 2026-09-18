@@ -51,6 +51,11 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
         let routed = router::complete(&self.provider, &self.tiers, &prompt).await;
         let latency_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
 
+        // `sent` is reconstructed here rather than captured off the wire, and this router knows
+        // only the `Provider` trait's tiers-and-fallback contract, not an adapter's own extra
+        // request fields — see the README's "One Adapter per Provider" — so a routing policy
+        // configured on the adapter does not appear in this audit copy. `received`, a few lines
+        // down, is the actual reply, and the provider that answered is read from there instead.
         match routed {
             Ok(answer) => {
                 self.record(Attempt {
@@ -62,7 +67,7 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
                     latency_ms,
                     outcome: Outcome::Answered,
                     finish_reason: answer.completion.finish_reason,
-                    sent: request_body(&answer.model_used, &prompt),
+                    sent: request_body(&answer.model_used, &prompt, None),
                     received: answer.completion.reply.clone(),
                 })
                 .await;
@@ -80,7 +85,7 @@ impl<P: Provider, L: RequestLog> Router<P, L> {
                     latency_ms,
                     outcome: Outcome::Failed,
                     finish_reason: FinishReason::Unspecified,
-                    sent: request_body(&failed.model_used, &prompt),
+                    sent: request_body(&failed.model_used, &prompt, None),
                     received: json!({"error": message}),
                 })
                 .await;

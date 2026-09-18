@@ -19,10 +19,19 @@ pub struct OpenAiCompatible {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    // The operator's own JSON, opaque to this service: forwarded verbatim as the request body's
+    // `provider` field and never inspected beyond "is it an object" at startup. See `main`'s
+    // `provider_routing` for why that is the only check made.
+    provider_routing: Option<Value>,
 }
 
 impl OpenAiCompatible {
-    pub fn new(base_url: String, api_key: String, timeout: Duration) -> Result<Self, String> {
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        timeout: Duration,
+        provider_routing: Option<Value>,
+    ) -> Result<Self, String> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -31,6 +40,7 @@ impl OpenAiCompatible {
             http,
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key,
+            provider_routing,
         })
     }
 
@@ -53,7 +63,7 @@ impl Provider for OpenAiCompatible {
             .http
             .post(format!("{}{COMPLETIONS_PATH}", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(&request_body(model, prompt))
+            .json(&request_body(model, prompt, self.provider_routing.as_ref()))
             .send()
             .await
             .map_err(unreachable_provider)?;
@@ -73,7 +83,7 @@ impl Provider for OpenAiCompatible {
     }
 }
 
-pub fn request_body(model: &str, prompt: &Prompt) -> Value {
+pub fn request_body(model: &str, prompt: &Prompt, provider_routing: Option<&Value>) -> Value {
     let mut messages = Vec::new();
     if !prompt.system.is_empty() {
         messages.push(json!({"role": "system", "content": prompt.system}));
@@ -84,6 +94,11 @@ pub fn request_body(model: &str, prompt: &Prompt) -> Value {
     apply_sampling(&mut body, &prompt.sampling);
     if !reasoning_enabled(prompt.tier) {
         body["reasoning"] = json!({"effort": "none"});
+    }
+    // Passed through exactly as the operator wrote it, unset leaves the body exactly as it was
+    // before this field existed — see the struct doc comment above for why this stays opaque.
+    if let Some(routing) = provider_routing {
+        body["provider"] = routing.clone();
     }
     body
 }
@@ -194,6 +209,7 @@ mod tests {
             format!("{}/", stub.base_url()),
             TEST_KEY.to_owned(),
             timeout,
+            None,
         )
         .unwrap()
     }
@@ -250,6 +266,7 @@ mod tests {
             "http://127.0.0.1:1".to_owned(),
             TEST_KEY.to_owned(),
             PATIENT_ENOUGH,
+            None,
         )
         .unwrap();
 
@@ -343,7 +360,11 @@ mod tests {
 
     #[test]
     fn cheap_tiers_turn_reasoning_off() {
-        let body = request_body("deepseek/deepseek-v4-flash", &prompt(QualityTier::Low));
+        let body = request_body(
+            "deepseek/deepseek-v4-flash",
+            &prompt(QualityTier::Low),
+            None,
+        );
 
         assert_eq!(body["reasoning"]["effort"], json!("none"));
         assert_eq!(body["model"], json!("deepseek/deepseek-v4-flash"));
@@ -353,7 +374,7 @@ mod tests {
 
     #[test]
     fn the_high_tier_keeps_reasoning() {
-        let body = request_body("z-ai/glm-5", &prompt(QualityTier::High));
+        let body = request_body("z-ai/glm-5", &prompt(QualityTier::High), None);
 
         assert_eq!(body.get("reasoning"), None);
     }
@@ -366,6 +387,7 @@ mod tests {
                 system: String::new(),
                 ..prompt(QualityTier::Low)
             },
+            None,
         );
 
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
@@ -374,7 +396,11 @@ mod tests {
 
     #[test]
     fn settings_the_caller_left_unset_are_not_sent_at_all() {
-        let body = request_body("deepseek/deepseek-v4-flash", &prompt(QualityTier::Low));
+        let body = request_body(
+            "deepseek/deepseek-v4-flash",
+            &prompt(QualityTier::Low),
+            None,
+        );
 
         for field in [
             "temperature",
@@ -416,6 +442,7 @@ mod tests {
                 sampling,
                 ..prompt(QualityTier::Low)
             },
+            None,
         );
 
         assert_eq!(body["temperature"], json!(0.2));
@@ -442,6 +469,7 @@ mod tests {
                 },
                 ..prompt(QualityTier::Low)
             },
+            None,
         );
 
         assert_eq!(body.get("response_format"), None);
@@ -458,6 +486,7 @@ mod tests {
                 },
                 ..prompt(QualityTier::Low)
             },
+            None,
         );
 
         assert_eq!(body.get("response_format"), None);
@@ -539,5 +568,69 @@ mod tests {
             matches!(adapter.verify_key().await, Err(KeyCheck::Unreachable(_))),
             "a rate limiter must not crash-loop the container"
         );
+    }
+
+    // The operator's routing policy is opaque JSON to this service: no field name of it is
+    // spelled out here, on purpose. These fixtures use a shape no real policy would, so the
+    // tests prove pass-through rather than encoding any provider's actual routing vocabulary.
+    fn opaque_operator_policy() -> Value {
+        json!({"an_operator_chosen_field": "an_operator_chosen_value", "nested": {"k": 1}})
+    }
+
+    #[test]
+    fn without_a_routing_policy_the_body_carries_no_provider_field() {
+        let body = request_body(
+            "deepseek/deepseek-v4-flash",
+            &prompt(QualityTier::Low),
+            None,
+        );
+
+        assert_eq!(body.get("provider"), None);
+    }
+
+    #[test]
+    fn a_configured_routing_policy_is_forwarded_as_the_provider_field_verbatim() {
+        let policy = opaque_operator_policy();
+
+        let body = request_body(
+            "deepseek/deepseek-v4-flash",
+            &prompt(QualityTier::Low),
+            Some(&policy),
+        );
+
+        assert_eq!(body["provider"], policy);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_routing_policy_the_wire_body_is_unchanged_from_today() {
+        let stub = TestProvider::answering(StatusCode::OK, answered_reply()).await;
+        let adapter = adapter_for(&stub, PATIENT_ENOUGH).await;
+
+        adapter
+            .complete("deepseek/deepseek-v4-flash", &prompt(QualityTier::Low))
+            .await
+            .unwrap();
+
+        assert_eq!(stub.seen()[0].body.get("provider"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_routing_policy_reaches_the_provider_byte_for_byte() {
+        let stub = TestProvider::answering(StatusCode::OK, answered_reply()).await;
+        let policy = opaque_operator_policy();
+        let adapter = OpenAiCompatible::new(
+            format!("{}/", stub.base_url()),
+            TEST_KEY.to_owned(),
+            PATIENT_ENOUGH,
+            Some(policy.clone()),
+        )
+        .unwrap();
+
+        adapter
+            .complete("deepseek/deepseek-v4-flash", &prompt(QualityTier::Low))
+            .await
+            .unwrap();
+
+        assert_eq!(stub.seen()[0].body["provider"], policy);
     }
 }

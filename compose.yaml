@@ -147,6 +147,9 @@ services:
       # The only service given the provider keys.
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set it in .env, see .env.example}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      # Optional: opaque JSON, forwarded verbatim as the provider field of every completion
+      # request. Malformed JSON, or JSON that is not an object, fails startup like a rejected key.
+      LLM_PROVIDER_ROUTING_JSON: ${LLM_PROVIDER_ROUTING_JSON:-}
       # Optional when empty: the service starts and only Decide is unavailable. A key the provider
       # rejects still fails startup, as a wrong OPENROUTER_API_KEY does.
       TYPESAFE_AI_API_KEY: ${TYPESAFE_AI_API_KEY:-}

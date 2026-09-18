@@ -33,6 +33,7 @@ use connectrpc::{
     RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
 };
 use sea_orm::Database;
+use serde_json::Value;
 
 use crate::adapters::KeyCheck;
 use crate::adapters::openai_compatible::OpenAiCompatible;
@@ -115,6 +116,25 @@ fn required(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Result<Stri
     env(lookup, name).ok_or_else(|| format!("{name} is not set"))
 }
 
+// The operator's own routing policy: opaque JSON, forwarded verbatim onto every completion
+// request. This service checks only that it parses and is an object — never its fields — so no
+// provider name or routing field name needs to live here; that vocabulary stays in `.env`, where
+// the operator writes it. Unset, completion is unaffected. Malformed, or valid JSON that is not
+// an object, stops the service from starting, exactly as a rejected OPENROUTER_API_KEY does — a
+// routing policy silently ignored would be worse than none.
+fn provider_routing(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<Value>, String> {
+    const VAR: &str = "LLM_PROVIDER_ROUTING_JSON";
+    let Some(raw) = env(lookup, VAR) else {
+        return Ok(None);
+    };
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("{VAR} is not valid JSON: {error}"))?;
+    if !parsed.is_object() {
+        return Err(format!("{VAR} must be a JSON object"));
+    }
+    Ok(Some(parsed))
+}
+
 fn from_environment(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
@@ -192,7 +212,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = env(&from_environment, "OPENROUTER_BASE_URL")
         .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_owned());
     let api_key = required(&from_environment, "OPENROUTER_API_KEY")?;
-    let provider = OpenAiCompatible::new(base_url, api_key, COMPLETION_REQUEST_TIMEOUT)?;
+    let provider_routing = provider_routing(&from_environment)?;
+    let provider = OpenAiCompatible::new(
+        base_url,
+        api_key,
+        COMPLETION_REQUEST_TIMEOUT,
+        provider_routing,
+    )?;
     match provider.verify_key().await {
         Ok(()) => {}
         Err(KeyCheck::Rejected) => return Err("the provider rejected OPENROUTER_API_KEY".into()),
@@ -340,5 +366,57 @@ mod tests {
         };
 
         assert!(type_safe_ai(unreachable).await.unwrap().is_some());
+    }
+
+    // These fixtures spell no provider name and no routing field name, on purpose: this service
+    // never reads the policy's shape, so a test proving pass-through must not either.
+    #[test]
+    fn no_routing_policy_set_leaves_completion_unaffected() {
+        assert_eq!(provider_routing(&|_| None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_routing_policy_that_is_a_json_object_is_read_through() {
+        let configured = |name: &str| match name {
+            "LLM_PROVIDER_ROUTING_JSON" => {
+                Some(r#"{"an_operator_chosen_field":"an_operator_chosen_value"}"#.to_owned())
+            }
+            _ => None,
+        };
+
+        let parsed = provider_routing(&configured).unwrap().unwrap();
+
+        assert_eq!(
+            parsed,
+            json!({"an_operator_chosen_field": "an_operator_chosen_value"})
+        );
+    }
+
+    #[test]
+    fn a_routing_policy_that_is_not_valid_json_stops_the_service_from_starting() {
+        let configured = |name: &str| match name {
+            "LLM_PROVIDER_ROUTING_JSON" => Some("not json".to_owned()),
+            _ => None,
+        };
+
+        let Err(error) = provider_routing(&configured) else {
+            panic!("malformed routing JSON is a deployment mistake worth failing loudly");
+        };
+        assert!(error.contains("LLM_PROVIDER_ROUTING_JSON"), "{error}");
+    }
+
+    #[test]
+    fn a_routing_policy_that_is_not_a_json_object_stops_the_service_from_starting() {
+        let configured = |name: &str| match name {
+            "LLM_PROVIDER_ROUTING_JSON" => Some("[1,2,3]".to_owned()),
+            _ => None,
+        };
+
+        let Err(error) = provider_routing(&configured) else {
+            panic!(
+                "a routing policy that is not an object is a deployment mistake worth failing loudly"
+            );
+        };
+        assert!(error.contains("LLM_PROVIDER_ROUTING_JSON"), "{error}");
     }
 }

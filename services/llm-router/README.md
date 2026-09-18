@@ -58,6 +58,8 @@ Completion: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, and `LLM_<TIER>_PRIMARY
 
 Decisions: `TYPESAFE_AI_API_KEY`, and optionally `TYPESAFE_AI_BASE_URL` (defaults to `https://api.typesafe.ai`) and `TYPESAFE_AI_MODEL` (defaults to `jev-latest`).
 
+Also optional, completion only: `LLM_PROVIDER_ROUTING_JSON`, a JSON object that is **opaque to this service** — it is read only far enough to confirm it parses as an object, then forwarded verbatim as the `provider` field of every completion request. Left unset, the request body is unaffected. Set to something that is not valid JSON, or valid JSON that is not an object, and the container fails at startup, exactly as a rejected `OPENROUTER_API_KEY` does — a routing policy silently ignored would be worse than none. See [`.env.example`](../../.env.example) for the exact shape.
+
 Values live in `.env` (gitignored); [`.env.example`](../../.env.example) holds the defaults.
 
 `TYPESAFE_AI_API_KEY` is optional in one specific sense: **leave it unset** and the service starts normally with completion unaffected, while `Decide` and `DescribeModels` answer a clear "not configured" error when called. **Set it to something the provider rejects** and the container fails at startup, exactly as a rejected `OPENROUTER_API_KEY` does — a wrong credential is a deployment mistake worth failing loudly, not a feature to silently drop. So leave it empty or make it right; do not leave a placeholder in it.
