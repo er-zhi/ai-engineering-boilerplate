@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give the platform a generic `race` primitive that starts a fan-out of operations, takes the first N successes and cancels the rest mid-flight; put weather / stocks / fx on it as registry rows rather than Rust modules; and make `SystemOneService.Decide` the first thing a user turn hits, so an unclear message is answered in one round trip instead of starting an agent.
+**Goal:** Give the platform a generic `race` primitive that starts a fan-out of operations, takes the first N successes and cancels the rest mid-flight; let one registry row describe several endpoints that answer the same question, loaded from a file an operator writes; and make `SystemOneService.Decide` the first thing a user turn hits, so an unclear message is answered in one round trip instead of starting an agent.
 
-**Architecture:** `race` is a generic combinator in `services/tool`, taking operation *factories* so a retry or a reserve start can build a fresh attempt. `web_fetch` is rewritten on top of it. A new nullable `sources` jsonb column on `tool.tools` turns one row into a declarative racing HTTP tool, and `weather` / `stock_quote` / `fx_rate` become seeded rows — no subject enters Rust or any prompt. In `services/chat`, `classifier.rs` becomes `intent.rs`: one `Decide` call carrying three questions (`actionable`, `route`, `separate_themes`), with `Complete` reached for only on the multi-theme branch, and a new session-level `CLARIFICATION_NEEDED` event when there is nothing to act on.
+**Architecture:** `race` is a generic combinator in `services/tool`, taking operation *factories* so a retry or a reserve start can build a fresh attempt. `web_fetch` is rewritten on top of it. A new nullable `sources` jsonb column on `tool.tools` turns one row into a declarative racing HTTP tool, run by one executor that knows no subject; the rows themselves are loaded at startup from an operator-provided file outside the repository, so **no subject name appears anywhere in this codebase**. In `services/chat`, `classifier.rs` becomes `intent.rs`: one `Decide` call carrying three questions (`actionable`, `route`, `separate_themes`), with `Complete` reached for only on the multi-theme branch, and a new session-level `CLARIFICATION_NEEDED` event when there is nothing to act on.
 
 **Tech Stack:** Rust 2024, SeaORM 2.0 (entity-first schema-sync), Connect RPC (`connectrpc` + `buffa`), `futures::stream::FuturesUnordered`, Postgres, testcontainers, `cargo-nextest`.
 
@@ -962,133 +962,203 @@ git commit -m "tool: one executor runs every declarative row, whatever it is abo
 
 ---
 
-### Task 5: Seed the three declarative rows
+### Task 5: Load declarative rows from an operator-provided file
 
 **Files:**
-- Modify: `services/tool/src/slugs.rs`
-- Modify: `services/tool/src/main.rs:208-240` (`system_tool_definitions`, `SystemTool`, `seeding_already_finished`, `create_and_activate_system_tool`, `activate_without_llm_review`)
-- Test: inline tests in `services/tool/src/main.rs`
+- Create: `services/tool/src/declarative_seed.rs`
+- Modify: `services/tool/src/main.rs` (call the loader beside `seed_system_tools`)
+- Modify: `services/tool/src/lib.rs`, `compose.yaml`, `.env.example`
+- Test: inline tests in `services/tool/src/declarative_seed.rs`
 
 **Interfaces:**
 - Consumes: `parse_sources` (Task 3).
-- Produces: `slugs::{WEATHER, STOCK_QUOTE, FX_RATE}` and `RESERVED_FOR_SYSTEM_TOOLS: [&str; 7]`; `SystemTool` gains `sources: Option<serde_json::Value>`.
+- Produces: `tool::declarative_seed::{DeclarativeRow, read_rows, load}` —
+  `pub fn read_rows(raw: &str) -> Result<Vec<DeclarativeRow>, String>`,
+  `pub async fn load(service: &Service, db: &DatabaseConnection, path: &str)`.
+- New env var `DECLARATIVE_TOOLS_PATH` (optional).
 
-- [ ] **Step 1: Recover the verified endpoints**
+> **Why this is not a list of seeds in `main.rs`.** The gate rule `gate-architecture`'s
+> "Capabilities, Not Topics" names `weather`, `stock_quote` and `fx_rate` as violations and calls a
+> table of weather sites the thing not to build. A JSON literal of weather endpoints inside
+> `main.rs` is that table in a string, and a grep-check that exempts `main.rs` is a check written to
+> find nothing. So the repository ships the **capability** — a loader that reads declarative rows an
+> operator wrote — and no subject at all. The three rows are an ops artifact: a gitignored file
+> mounted into the container. A fresh clone has the executor and no subjects, which is the point.
 
-```bash
-git show d5a8d00:services/tool/src/tools/weather.rs > /tmp/weather-reference.rs
-git show d5a8d00:services/tool/src/tools/fx.rs > /tmp/fx-reference.rs
-git show d5a8d00:services/tool/src/tools/stocks.rs > /tmp/stocks-reference.rs
-```
+- [ ] **Step 1: Write the failing tests**
 
-Read each for its keyless endpoints, the JSON path to the value, and the unit. Then **verify each endpoint with a live request** before putting it in the seed — these are free public APIs and they move:
-
-```bash
-curl -s 'https://api.open-meteo.com/v1/forecast?latitude=37.77&longitude=-122.42&current=temperature_2m' | head -c 400
-```
-
-- [ ] **Step 2: Write the failing test**
-
-Add to `mod tests` in `services/tool/src/main.rs`:
+Create `services/tool/src/declarative_seed.rs` with only this test module:
 
 ```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONE_ROW: &str = r#"[{
+        "slug": "example_reading",
+        "name": "Example reading",
+        "description": "Returns a reading from several independent providers at once.",
+        "timeout_seconds": 8,
+        "input_schema": {"type": "object", "required": ["place"],
+                         "properties": {"place": {"type": "string"}}},
+        "sources": {"fan_out": 2, "take": 1, "sources": [
+            {"name": "alpha", "url": "https://alpha.example.com/?q={place}", "pick": "reading.value"},
+            {"name": "beta",  "url": "https://beta.example.com/{place}",     "pick": "value"}
+        ]}
+    }]"#;
+
     #[test]
-    fn every_declarative_definition_parses_against_its_own_input_schema() {
-        for definition in system_tool_definitions() {
-            let Some(raw) = definition.sources.as_ref() else {
-                continue;
-            };
-            tool::tools::declarative::parse_sources(raw, &definition.input_schema)
-                .unwrap_or_else(|error| panic!("{}: {error}", definition.slug));
-        }
+    fn a_well_formed_file_is_read_in_full() {
+        let rows = read_rows(ONE_ROW).expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "example_reading");
+        assert_eq!(rows[0].timeout_seconds, 8);
     }
 
     #[test]
-    fn every_seeded_slug_is_reserved() {
-        for definition in system_tool_definitions() {
-            assert!(
-                tool::slugs::RESERVED_FOR_SYSTEM_TOOLS.contains(&definition.slug),
-                "{} is seeded but not reserved",
-                definition.slug
-            );
-        }
+    fn a_row_whose_sources_do_not_parse_is_refused_by_name() {
+        let broken = ONE_ROW.replace("{place}", "{elsewhere}");
+        let error = read_rows(&broken).expect_err("elsewhere is not an input field");
+        assert!(error.contains("example_reading"), "{error}");
+        assert!(error.contains("elsewhere"), "{error}");
     }
+
+    #[test]
+    fn a_row_claiming_a_reserved_slug_is_refused() {
+        let stolen = ONE_ROW.replace("example_reading", crate::slugs::WEB_FETCH);
+        let error = read_rows(&stolen).expect_err("a system slug may not be taken");
+        assert!(error.contains(crate::slugs::WEB_FETCH), "{error}");
+    }
+
+    #[test]
+    fn a_duplicate_slug_in_one_file_is_refused() {
+        let twice = format!("[{},{}]", &ONE_ROW[1..ONE_ROW.len() - 1], &ONE_ROW[1..ONE_ROW.len() - 1]);
+        assert!(read_rows(&twice).is_err());
+    }
+
+    #[test]
+    fn text_that_is_not_json_names_the_problem_rather_than_panicking() {
+        assert!(read_rows("not json").is_err());
+    }
+
+    #[test]
+    fn an_empty_list_is_fine_and_loads_nothing() {
+        assert_eq!(read_rows("[]").expect("read").len(), 0);
+    }
+}
 ```
 
-- [ ] **Step 3: Run it to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo nextest run -p tool --bin tool
+cargo nextest run -p tool declarative_seed::
 ```
-Expected: FAIL to compile — `SystemTool` has no `sources` field.
+Expected: FAIL to compile — `read_rows` and `DeclarativeRow` are not defined.
 
-- [ ] **Step 4: Implement**
-
-In `services/tool/src/slugs.rs`:
+- [ ] **Step 3: Write the implementation**
 
 ```rust
-pub const WEATHER: &str = "weather";
-pub const STOCK_QUOTE: &str = "stock_quote";
-pub const FX_RATE: &str = "fx_rate";
+// Declarative tool rows come from a file the operator writes, never from this repository. The code
+// here is the capability — read, validate, upsert — and it holds no subject, no endpoint and no
+// slug of its own. See gate-architecture, "Capabilities, Not Topics".
 
-pub const RESERVED_FOR_SYSTEM_TOOLS: [&str; 7] = [
-    WEB_SEARCH,
-    WEB_FETCH,
-    KB_SEARCH,
-    KB_READ_DOCUMENT,
-    WEATHER,
-    STOCK_QUOTE,
-    FX_RATE,
-];
+use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::entity::tool::{ActiveModel, Entity, Risk, Status};
+use crate::service::Service;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclarativeRow {
+    pub slug: String,
+    pub name: String,
+    /// What the model reads to decide whether this tool answers the question in front of it.
+    pub description: String,
+    pub timeout_seconds: i32,
+    pub input_schema: Value,
+    pub sources: Value,
+}
+
+/// Reads and fully validates a file before anything reaches the database: one bad row refuses the
+/// whole file rather than leaving a half-loaded registry.
+pub fn read_rows(raw: &str) -> Result<Vec<DeclarativeRow>, String> {
+    let rows: Vec<DeclarativeRow> =
+        serde_json::from_str(raw).map_err(|error| format!("could not be read as JSON: {error}"))?;
+    let mut seen: Vec<&str> = Vec::new();
+    for row in &rows {
+        if crate::slugs::RESERVED_FOR_SYSTEM_TOOLS.contains(&row.slug.as_str()) {
+            return Err(format!("{:?} is a reserved system slug", row.slug));
+        }
+        if seen.contains(&row.slug.as_str()) {
+            return Err(format!("{:?} appears twice", row.slug));
+        }
+        seen.push(&row.slug);
+        crate::tools::declarative::parse_sources(&row.sources, &row.input_schema)
+            .map_err(|error| format!("{}: {error}", row.slug))?;
+    }
+    Ok(rows)
+}
+
+/// Upserts every row as an Active system tool. These are operator-supplied definitions, so they skip
+/// the LLM review a user-submitted tool goes through — the operator is the reviewer, the same way
+/// they are for the tools compiled into this binary.
+pub async fn load(service: &Service, db: &DatabaseConnection, path: &str) {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::error!(path, %error, "could not read the declarative tools file");
+            return;
+        }
+    };
+    let rows = match read_rows(&raw) {
+        Ok(rows) => rows,
+        Err(error) => {
+            // Refusing the file loudly and starting without it beats loading half a registry.
+            tracing::error!(path, %error, "declarative tools file refused, loading none of it");
+            return;
+        }
+    };
+    for row in rows {
+        match upsert(service, db, &row).await {
+            Ok(()) => tracing::info!(slug = %row.slug, "loaded declarative tool"),
+            Err(error) => tracing::error!(slug = %row.slug, %error, "failed to load declarative tool"),
+        }
+    }
+}
 ```
 
-**`args.rs` gains nothing.** A Rust arg type there earns its place because `run_system_tool` parses
-into it, and the derived `JsonSchema` and the reader are then one declaration. A declarative row has
-no Rust reader — `fill` reads the raw input — so a type would be a second declaration enforcing
-nothing: `{"lat": "x"}` would still fill the URL. Write each row's `input_schema` as a JSON literal
-beside its `sources`, where the `parse_sources` placeholder check can see it.
+`upsert` finds the existing `user_id IS NULL` row for the slug and updates `name`, `description`,
+`input_schema`, `sources`, `timeout_seconds` and `status = Active`, or inserts one with
+`risk: Risk::ReadOnly` — a declarative row only ever issues GETs, so its risk is decided by this
+code, never by the file. Follow `seed_pre_vetted_system_tool`'s shape in `main.rs`.
 
-In `services/tool/src/main.rs`, add `sources: Option<serde_json::Value>` to `SystemTool`, include it in `seeding_already_finished`'s comparison (`row.sources == definition.sources`), set it on the `ActiveModel` in `create_and_activate_system_tool` and `activate_without_llm_review`, change the return type to `[SystemTool; 7]`, set `sources: None` on the four existing entries, and append (filling the second and third source of each from Step 1's verified endpoints):
+In `main.rs`, after `seed_system_tools(&service, &db).await;`:
 
 ```rust
-        SystemTool {
-            slug: slugs::WEATHER,
-            name: "Current temperature at a coordinate",
-            description: "Returns the current temperature in degrees Celsius at a latitude and longitude, from several independent providers at once.",
-            risk: Risk::ReadOnly,
-            input_schema: serde_json::json!({
-                "type": "object",
-                "required": ["lat", "lon"],
-                "additionalProperties": false,
-                "properties": {
-                    "lat": {"type": "number", "description": "Latitude in decimal degrees."},
-                    "lon": {"type": "number", "description": "Longitude in decimal degrees."}
-                }
-            }),
-            sources: Some(serde_json::json!({
-                "fan_out": 3,
-                "take": 2,
-                "sources": [
-                    {"name": "open-meteo",
-                     "url": "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m",
-                     "pick": "current.temperature_2m"}
-                ]
-            })),
-        },
+    // Optional: a deployment with no declarative tools is a working deployment.
+    if let Ok(path) = std::env::var("DECLARATIVE_TOOLS_PATH") {
+        tool::declarative_seed::load(&service, &db, &path).await;
+    }
 ```
 
-…and the equivalent `stock_quote` (`{"symbol": {"type": "string"}}`) and `fx_rate`
-(`{"base": …, "quote": …}`) entries. Each needs **at least 3 sources** for `fan_out: 3, take: 2` to
-be meaningful; `parse_sources` refuses `take` above the source count, so the test in Step 2 catches
-a short list.
+- [ ] **Step 4: Wire it into Compose**
 
-Also call `parse_sources` inside `create_and_activate_system_tool` / `activate_without_llm_review`
-and log-and-skip a row it rejects, so a bad seed never reaches the registry.
+In `compose.yaml`, on the `tool` service, mount the operator's file read-only and pass its path:
 
-Modify `services/tool/src/args.rs`: nothing. See the note above.
+```yaml
+    environment:
+      DECLARATIVE_TOOLS_PATH: /etc/tool/declarative-tools.json
+    volumes:
+      - ./declarative-tools.json:/etc/tool/declarative-tools.json:ro
+```
 
-> **Gate check before committing:** grep your diff for subject words outside a seed literal's `description`, `name` and `url`. `rg -n 'weather|stock|fx|temperature' services/tool/src --glob '!main.rs'` must return nothing but `slugs.rs`. No prompt string anywhere gains a subject.
+Add `declarative-tools.json` to `.gitignore`, and document the variable in `.env.example`. The
+mount must tolerate a missing file (Compose creates a directory if the path does not exist — if that
+proves awkward, drop the volume from `compose.yaml` and document the `docker compose` override in
+the README instead, rather than committing a file with subjects in it).
 
 - [ ] **Step 5: Run the tests**
 
@@ -1099,11 +1169,19 @@ cargo clippy -p tool --all-targets -- -D warnings
 ```
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Gate check**
 
 ```bash
-git add services/tool/src/slugs.rs services/tool/src/main.rs
-git commit -m "tool: three declarative rows, each racing three open APIs for two answers"
+rg -n -i 'weather|stock|fx_rate|temperature|ticker' services/ common/ docs/superpowers/plans/
+```
+Expected: **nothing** outside this plan's own prose about the gate. No exemptions, no allowlist — if
+the grep finds a hit in `services/`, the work violates the rule it claims to respect.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add services/tool/src/declarative_seed.rs services/tool/src/lib.rs services/tool/src/main.rs compose.yaml .env.example .gitignore
+git commit -m "tool: load declarative rows an operator wrote; ship no subject"
 ```
 
 ---
@@ -1687,7 +1765,9 @@ git commit -m "chat: a turn with no request is answered in the transcript, not b
 
 - [ ] **Step 1: `services/tool/README.md`**
 
-The "Capabilities, Not Topics" section currently says a `weather` or `stock_quote` tool would be `web_fetch` with a topic glued on. Rewrite that section to say what is now true: the **code** holds capabilities only — `race`, one declarative executor — and a subject reaches the system as a registry row, the same way a user-created tool does. Say explicitly that `CreateTool` does not accept `sources`, and why (arbitrary outbound HTTP on user input is its own SSRF and quota decision).
+The "Capabilities, Not Topics" section stays, and gains the mechanism that now backs it: this service ships `race`, one declarative executor and a loader, and **no subject at all** — the rows naming one live in `DECLARATIVE_TOOLS_PATH`, a file the operator writes and the repository never sees. Say that a fresh clone therefore has the executor and no subjects, and that this is the intended state rather than a missing step. Say explicitly that `CreateTool` does not accept `sources`, and why (arbitrary outbound HTTP on end-user input is its own SSRF and quota decision, separate from an operator supplying a vetted file).
+
+Document `DECLARATIVE_TOOLS_PATH` under Configuration alongside the existing variables, with the row shape and a neutral `example.com` sample — **never** a real subject, or the README becomes the thing the gate forbids.
 
 Add a `race` section: factories not futures, `fan_out` as width with reserve, `take` as quorum, losers cancelled rather than awaited, `Outcome` rather than `Result` because a partial answer is normal. And a `Declarative Tools` section documenting the `sources` shape, `{field}` substitution against `input_schema`, `pick`, and why two answers are returned as two.
 
@@ -1726,4 +1806,28 @@ git commit -m "docs: declarative tools, the race primitive and the typed intent 
 
 ## Review
 
-After Task 9, run the repository's review gates before pushing — entry point and required evidence format in `.agents/skills/code-review/SKILL.md`. Pay particular attention to `gate-architecture`'s "Capabilities, Not Topics": the only place any subject may appear in this diff is a seed literal's `name`, `description` and `url` in `services/tool/src/main.rs`.
+After Task 9, run the repository's review gates before pushing — entry point and required evidence format in `.agents/skills/code-review/SKILL.md`.
+
+`gate-architecture`'s "Capabilities, Not Topics" is the one to check hardest, and the check is simple because there are no exemptions: **no subject name may appear anywhere in the diff.** Not in `slugs.rs`, not in a seed literal, not in a prompt, not in a test fixture — the executor's own tests use `alpha.example.com` and a made-up `example_reading` slug for exactly this reason. Run `rg -n -i 'weather|stock|fx_rate|temperature|ticker' services/ common/` and expect nothing.
+
+---
+
+## Operator note (not a task)
+
+Once Task 5 lands, the three rows the original request asked for are written **outside the repo**,
+in `declarative-tools.json`. Recover the verified keyless endpoints from the reverted commit:
+
+```bash
+git show d5a8d00:services/tool/src/tools/weather.rs
+git show d5a8d00:services/tool/src/tools/fx.rs
+git show d5a8d00:services/tool/src/tools/stocks.rs
+```
+
+Re-verify each with a live request before writing it in — these are free public APIs and they move:
+
+```bash
+curl -s 'https://api.open-meteo.com/v1/forecast?latitude=37.77&longitude=-122.42&current=temperature_2m'
+```
+
+Each row wants at least 3 sources for `fan_out: 3, take: 2` to mean anything; `read_rows` refuses a
+`take` above the source count, so a short list is caught at startup rather than at first use.
