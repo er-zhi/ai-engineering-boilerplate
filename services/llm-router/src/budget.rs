@@ -10,13 +10,21 @@ use serde_json::Value;
 use crate::decision::{Decision, Question, QuestionKind};
 use crate::wire::json_from;
 
+// Ours, not the vendor's: the vendor caps tokens, not question count, and sets no limit on how many
+// questions one call may ask. 64 is a ceiling this service chooses — a request needing more than that is
+// asking about too much at once, and the token budget below is the real constraint.
 pub const MAX_QUESTIONS: usize = 64;
 // The vendor's own ceilings, published on its choice and score pages.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 pub const MAX_SCORE_LEVELS: usize = 10;
 pub const MIN_SCORE_LEVELS: usize = 2;
 pub const MAX_QUESTION_ID_BYTES: usize = 64;
-pub const MAX_STATE_BYTES: usize = 262_144;
+// A proxy for the vendor's real limit, which is a token count: 32k tokens for state plus the longest
+// question, inside a 64k-token request budget. Bytes are not tokens and the ratio varies by content, so
+// this picks the conservative side, ~4 bytes/token: 128 KiB reads as at most 32k tokens, so it can never
+// be read by the vendor as over budget the way the old 256 KiB byte cap could — that cap was ~65k tokens,
+// which the vendor could refuse after we had already paid for the hop.
+pub const MAX_STATE_BYTES: usize = 131_072;
 pub const MAX_INSTRUCTIONS_BYTES: usize = 8_192;
 // The caller writes these and the provider bills for them, so each is bounded as well as counted: 255
 // options of arbitrary length is a large paid request. An option name is the key its answer comes back
@@ -317,6 +325,14 @@ mod tests {
     }
 
     #[test]
+    fn max_state_bytes_cannot_exceed_the_vendors_32k_token_ceiling() {
+        // The vendor's ceiling is 32k tokens for state plus the longest question. At the conservative
+        // ~4 bytes/token this comment assumes, 128 KiB reads as at most 32k tokens, so it can never be
+        // read by the vendor as over its limit the way the old 256 KiB byte cap could.
+        assert_eq!(MAX_STATE_BYTES, 128 * 1024);
+    }
+
+    #[test]
     fn a_state_exactly_at_the_byte_limit_is_accepted() {
         // Two of the bytes are the quotes serde writes around the string.
         let at_the_limit = json!("x".repeat(MAX_STATE_BYTES - 2));
@@ -326,6 +342,17 @@ mod tests {
             vec![noul_question("is_urgent")],
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn a_state_one_byte_over_the_limit_is_refused() {
+        // Two of the bytes are the quotes serde writes around the string, so this is MAX_STATE_BYTES + 1.
+        let one_byte_over = json!("x".repeat(MAX_STATE_BYTES - 1));
+
+        assert_refused(
+            deciding_about(one_byte_over, vec![noul_question("is_urgent")]),
+            &MAX_STATE_BYTES.to_string(),
+        );
     }
 
     #[test]

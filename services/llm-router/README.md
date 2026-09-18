@@ -97,11 +97,11 @@ Each question carries an `id` you choose, `instructions`, and the fields of its 
 
 Those two ceilings are the vendor's, published on the [choice](https://docs.typesafe.ai/primitives/choice) and [score](https://docs.typesafe.ai/primitives/score) pages. `Decide` enforces them itself, so an eleventh level is a free local rejection rather than a paid provider 422.
 
-Options and levels are **repeated, not maps**. Their order reaches the model, and a protobuf map has no defined order — so the wire keeps the order you wrote.
+Options and levels are **repeated, not maps**. The vendor's own API takes both as maps keyed by id and evaluates each question independently and in isolation, so option order carries no meaning to it; `repeated` is used because it is a stable wire shape and a protobuf map has none. `score` levels are the exception: the vendor documents them as evaluated lowest to highest, so their order is the one place it does matter.
 
 ### Ask Everything at Once
 
-One call carries as many questions as you like, and they are answered against the same state in a single provider round trip. TypeSafe calls this [speculative fan-out](https://docs.typesafe.ai/patterns/fan-out): ask the questions a branch *might* need, then let your code pick which answers matter. A second question is far cheaper than a second call.
+One call carries up to 64 questions, answered against the same state in a single provider round trip. That ceiling is ours, not the vendor's — the vendor caps tokens, not question count — and it is there because a request needing more than 64 questions at once is asking about too much in one call; the token budget below is the real constraint. TypeSafe calls this pattern [speculative fan-out](https://docs.typesafe.ai/patterns/fan-out): ask the questions a branch *might* need, then let your code pick which answers matter. A second question is far cheaper than a second call.
 
 ```bash
 curl -X POST llm-router:8083/llm_router.v1.SystemOneService/Decide \
@@ -152,7 +152,7 @@ curl -X POST llm-router:8083/llm_router.v1.SystemOneService/Decide \
 - **Every number is a double.** `{"days": 3}` reaches the provider as `{"days": 3.0}`, and an id beyond 2^53 loses precision outright. Send anything that must stay an exact integer as a string.
 - **An object's keys arrive sorted.** A `Value` object is a map, and this workspace's `serde_json` has no `preserve_order`, so the model sees the keys alphabetised rather than as you wrote them. Where order carries meaning — a transcript, a sequence of events — send an **array**, which keeps it.
 
-Ordering is preserved everywhere it changes an answer: questions, choice options and score levels are `repeated` for exactly this reason.
+Ordering only changes an answer for `score` levels, which the vendor evaluates lowest to highest — that is `repeated` for exactly this reason. Questions and choice options are `repeated` too, but for wire stability: the vendor takes them as maps keyed by id and evaluates each question independently and in isolation, so their order does not reach it.
 
 ### Confidence Is the Second Axis
 
@@ -173,7 +173,7 @@ One vendor serves this class today, so a decision runs on one model and a failur
 | questions in one call | 64 |
 | question id | 64 bytes |
 | `instructions` per question | 8 KiB |
-| `state` | 256 KiB |
+| `state` | 128 KiB |
 | `choice` options | 1 to 255 |
 | option name | 64 bytes |
 | option description | 1 KiB |
