@@ -1,6 +1,7 @@
 // The tool service as a library, so main.rs stays a thin binary entry point.
 
 pub mod args;
+pub mod declarative_seed;
 pub mod entity;
 pub mod error;
 pub mod policy;

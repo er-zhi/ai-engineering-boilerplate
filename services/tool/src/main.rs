@@ -390,6 +390,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     seed_system_tools(&service, &db).await;
 
+    // Optional: a deployment with no declarative tools is a working deployment.
+    if let Ok(path) = std::env::var("DECLARATIVE_TOOLS_PATH") {
+        tool::declarative_seed::load(&service, &db, &path).await;
+    }
+
     let tool_service = ToolServiceImpl { service };
     let connect = ConnectRouter::new().add_service(Arc::new(tool_service));
     let app = axum::Router::new()

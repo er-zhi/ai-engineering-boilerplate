@@ -107,3 +107,44 @@ emits no index at all, so the constraint silently does not exist.
 
 Every outbound HTTP call is bounded: one client is built with a default timeout in one place and
 injected, and `Execute` narrows it to the tool row's own `timeout_seconds`.
+
+## Declarative Tools
+
+`declarative_seed` loads tool rows from a file an operator writes, on top of the four system tools
+above. It ships no subject of its own — see "Capabilities, Not Topics" — so a fresh clone has the
+executor and no declarative tools until an operator supplies `DECLARATIVE_TOOLS_PATH`.
+
+Setting `DECLARATIVE_TOOLS_PATH` is optional; unset, the service starts normally with none loaded.
+When set, the file is read once at startup and every row is upserted as a system row (`user_id =
+NULL`, `status = Active`, `risk = Risk::ReadOnly` — a declarative row only ever issues GETs, so risk
+is decided by this code, never read from the file), skipping the LLM review a user-submitted tool
+goes through, the same way the compiled-in system tools do. **One bad row refuses the whole file**:
+a half-loaded registry is worse than an empty one, so a parse or validation failure on any row is
+logged and none of the file is loaded, rather than loading the rows that did parse.
+
+Each row is `{slug, name, description, timeout_seconds, input_schema, sources}`; `sources` is the
+shape `crate::tools::declarative::parse_sources` checks — `fan_out`, `take`, and a list of
+`{name, url, pick}` sources, where `{field}` in a `url` is filled from `input_schema`'s declared
+properties. A slug already reserved for a system tool (`slugs::RESERVED_FOR_SYSTEM_TOOLS`) or
+repeated within the file is refused.
+
+`compose.yaml` intentionally does **not** mount a declarative-tools file: Compose creates an empty
+*directory* at the bind-mount source when the host path does not exist, which every fresh clone
+hits by default since the file is gitignored and operator-supplied. Rather than ship a mount that
+litters the repo root with a stray directory (or commit a fake file just to keep it happy), an
+operator who wants declarative tools adds the mount and the env var at `up` time with an inline
+override, without creating a second compose file:
+
+```bash
+# Write declarative-tools.json in the repo root first (rows shaped as above), then:
+docker compose -f compose.yaml -f - up tool <<'EOF'
+services:
+  tool:
+    environment:
+      DECLARATIVE_TOOLS_PATH: /etc/tool/declarative-tools.json
+    volumes:
+      - ./declarative-tools.json:/etc/tool/declarative-tools.json:ro
+EOF
+```
+
+`declarative-tools.json` is gitignored: it is an ops artifact, never a repository file.
