@@ -28,40 +28,15 @@ impl Service {
         execution: &engine_core::Execution,
         events: &[engine_core::ExecutionEvent],
     ) -> Result<(), EngineError> {
-        // `None`: none of this module's callers (`interrupt`'s idle path, `resume`, `cancel`)
-        // can themselves produce `Completed`, so there are no resumable nodes to offer.
-        crate::store::commit_step(
-            &self.db,
-            execution_id,
-            None,
-            next_step,
-            execution,
-            events,
-            None,
-        )
-        .await?;
+        crate::store::commit_step(&self.db, execution_id, None, next_step, execution, events)
+            .await?;
         Ok(())
     }
 
-    /// Unlike `resume` and `cancel`, `interrupt` does not refuse a `Running` execution. The tick
-    /// loop owns that execution's state right now, so writing to it here would race a
-    /// concurrent commit and could be lost — that reasoning, `load_idle`'s, is sound and still
-    /// governs `resume` and `cancel` below. But refusing a plain follow-up is the wrong
-    /// response to it: a message that arrives while the agent is thinking is input, not an
-    /// error, so it is queued instead and applied at the execution's next checkpoint boundary
-    /// (`store::commit_step`'s `resolve_queued_input`). Everything else about `interrupt` is
-    /// unchanged: an execution that is not `Running` is interrupted immediately, exactly as
-    /// before.
     pub async fn interrupt(&self, execution_id: Uuid, input_json: &str) -> Result<(), EngineError> {
         let input: Value = serde_json::from_str(input_json)
             .map_err(|e| EngineError::InvalidRequest(e.to_string()))?;
-        let row = self.execution_row(execution_id).await?;
-        if row.status == entity::execution::Status::Running {
-            crate::store::queue_pending_input(&self.db, execution_id, &input).await?;
-            return Ok(());
-        }
-        let checkpoint = self.latest_checkpoint(execution_id).await?;
-        let execution = to_execution(&row, checkpoint)?;
+        let execution = self.load_idle(execution_id).await?;
         let next_step = self.next_checkpoint_step(execution_id).await?;
         let (execution, event) = engine_core::interrupt(execution, input);
         self.persist(
@@ -111,7 +86,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use engine_core::{ActiveNode, Budget};
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
 
     fn a_graph() -> String {
         serde_json::to_string(
@@ -187,109 +162,6 @@ mod tests {
         assert_eq!(
             execution.state.get("interrupt_input"),
             Some(&serde_json::json!({"role": "user", "text": "hi"}))
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn interrupt_against_a_running_execution_is_accepted_and_queued_not_refused() {
-        let test = crate::test_db::start().await;
-        let service = Service::new(test.db.clone());
-        service
-            .register_graph("t".to_owned(), &a_graph())
-            .await
-            .expect("register");
-        let execution_id = Uuid::new_v4();
-        entity::execution::ActiveModel {
-            id: Set(execution_id),
-            graph_id: Set("t".to_owned()),
-            graph_version: Set(1),
-            user_id: Set(None),
-            status: Set(entity::execution::Status::Running),
-            wait_kind: Set(None),
-            current_nodes: Set(
-                serde_json::to_value(vec![ActiveNode::plain(engine_core::NodeId("a".into()))])
-                    .unwrap(),
-            ),
-            iteration: Set(1),
-            max_iterations: Set(10),
-            deadline: Set(None),
-            budget: Set(serde_json::to_value(Budget::new(
-                1000,
-                10,
-                std::time::Duration::from_secs(60),
-            ))
-            .unwrap()),
-            lease_owner: Set(Some("worker-1".to_owned())),
-            lease_until: Set(Some(Utc::now() + chrono::Duration::seconds(30))),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-        }
-        .insert(&test.db)
-        .await
-        .expect("seed");
-
-        service
-            .interrupt(execution_id, r#"{"question": "and the population?"}"#)
-            .await
-            .expect("a mid-tick interrupt must be accepted, not refused");
-
-        let row = entity::execution::Entity::find_by_id(execution_id)
-            .one(&test.db)
-            .await
-            .expect("query")
-            .expect("row");
-        assert_eq!(
-            row.status,
-            entity::execution::Status::Running,
-            "queueing must not touch the execution row — the tick loop still owns it"
-        );
-
-        let queued = entity::pending_input::Entity::find()
-            .filter(entity::pending_input::Column::ExecutionId.eq(execution_id))
-            .all(&test.db)
-            .await
-            .expect("query");
-        assert_eq!(queued.len(), 1, "exactly the one message must be queued");
-        assert_eq!(
-            queued[0].input_json,
-            serde_json::json!({"question": "and the population?"})
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn interrupt_against_an_idle_execution_still_applies_immediately_with_nothing_queued() {
-        let test = crate::test_db::start().await;
-        let service = Service::new(test.db.clone());
-        service
-            .register_graph("t".to_owned(), &a_graph())
-            .await
-            .expect("register");
-        let execution_id = service
-            .start_execution("t".to_owned(), None, r#"{"question": "first"}"#, None)
-            .await
-            .expect("start");
-
-        service
-            .interrupt(execution_id, r#"{"question": "and the population?"}"#)
-            .await
-            .expect("interrupt");
-
-        let execution = service.get_execution(execution_id).await.expect("get");
-        assert_eq!(execution.status, engine_core::Status::Ready);
-        assert_eq!(
-            execution.state.get("question"),
-            Some(&serde_json::json!("and the population?")),
-            "today's immediate path must still land straight away"
-        );
-
-        let queued = entity::pending_input::Entity::find()
-            .filter(entity::pending_input::Column::ExecutionId.eq(execution_id))
-            .all(&test.db)
-            .await
-            .expect("query");
-        assert!(
-            queued.is_empty(),
-            "an idle interrupt must not go through the queue at all"
         );
     }
 

@@ -48,10 +48,6 @@ impl<E: TaskExecutor + 'static> Tick<E> {
         let (row, graph) = self.load_execution_and_graph(execution_id).await?;
         let (execution, next_step) = self.load_current_state(execution_id, &row, &graph).await?;
 
-        // Captured before `step` consumes `execution`: the node(s) this step's output came
-        // from, offered to `commit_step` as where a queued follow-up can resume if this step
-        // turns out to complete the execution — see `store::resolve_queued_input`.
-        let resumable_nodes = execution.current_nodes.clone();
         let outputs = self
             .run_active_nodes(&graph, &execution, execution.current_nodes.clone())
             .await?;
@@ -63,7 +59,6 @@ impl<E: TaskExecutor + 'static> Tick<E> {
             next_step,
             &next_execution,
             &events,
-            Some(&resumable_nodes),
         )
         .await
         .map_err(|e| e.to_string())

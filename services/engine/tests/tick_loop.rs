@@ -210,72 +210,6 @@ async fn run_to_completion(test: &common::test_db::TestDb, service: &Service) ->
     execution_id
 }
 
-/// A `TaskExecutor` that calls `Service::interrupt` from inside its own `execute`, so the call
-/// lands exactly while the real tick loop has this execution's row leased and `Running` — the
-/// race this whole feature exists for, reproduced for real rather than assembled by hand.
-struct InterruptingExecutor {
-    service: Service,
-    execution_id: uuid::Uuid,
-}
-
-impl engine_core::TaskExecutor for InterruptingExecutor {
-    async fn execute(
-        &self,
-        _kind: &str,
-        _config: &serde_json::Value,
-        _state: &serde_json::Value,
-        _idempotency_key: &str,
-    ) -> Result<serde_json::Value, engine_core::TaskError> {
-        self.service
-            .interrupt(self.execution_id, r#"{"question": "and the population?"}"#)
-            .await
-            .expect("a follow-up sent while this very tick is in flight must be accepted");
-        Ok(json!({"reply": "Paris"}))
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_follow_up_that_arrives_mid_tick_is_answered_once_the_one_tick_turn_would_otherwise_end()
-{
-    // `simple` has one task node and one unconditional edge to `end`, so — like `agent` on a
-    // question needing no tool — it completes in exactly one tick. Nothing but this commit ever
-    // touches the row between `Running` and the answer, so this is the case Task 7's own live
-    // check exposed: a queue that only gets checked at boundaries that never come is a queue in
-    // name only.
-    let test = engine::test_db::start().await;
-    let service = Service::new(test.db.clone());
-    register_simple(&service).await;
-    let execution_id = service
-        .start_execution(
-            "simple".to_owned(),
-            None,
-            r#"{"question": "what is the capital of France?"}"#,
-            None,
-        )
-        .await
-        .expect("start");
-
-    let executor = InterruptingExecutor {
-        service: Service::new(test.db.clone()),
-        execution_id,
-    };
-    let tick = Tick::new(test.db.clone(), executor, "race-test".to_owned());
-    assert!(tick.run_one().await.expect("tick"));
-
-    let execution = service.get_execution(execution_id).await.expect("get");
-    assert_eq!(
-        execution.status,
-        engine_core::Status::Ready,
-        "a follow-up that arrived in time must reopen the turn, not leave it Completed \
-         with the message dropped"
-    );
-    assert_eq!(
-        execution.state.get("question"),
-        Some(&json!("and the population?")),
-        "the follow-up must actually reach the field the llm node rereads"
-    );
-}
-
 async fn checkpoint_count(db: &sea_orm::DatabaseConnection, execution_id: uuid::Uuid) -> u64 {
     engine::entity::checkpoint::Entity::find()
         .filter(engine::entity::checkpoint::Column::ExecutionId.eq(execution_id))
@@ -339,36 +273,6 @@ async fn the_sweep_takes_a_finished_execution_but_never_its_events() {
         kinds.last().map(String::as_str),
         Some("ExecutionCompleted"),
         "and it still ends with the final word on this execution: {kinds:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_pending_input_left_behind_by_a_race_does_not_survive_the_sweep() {
-    // `store::commit_step` deletes a queued input the moment it drains its execution's queue —
-    // including the commit that finishes the execution — so this models only the narrow race
-    // `commit_step`'s own cleanup cannot close: an input queued after that commit already
-    // read an empty queue. Nothing applies it (the execution is done), so it must not survive
-    // as an orphan once the execution itself is swept.
-    let test = engine::test_db::start().await;
-    let service = Service::new(test.db.clone());
-    register_simple(&service).await;
-    let execution_id = run_to_completion(&test, &service).await;
-    engine::store::queue_pending_input(&test.db, execution_id, &json!({"question": "too late"}))
-        .await
-        .expect("queue");
-
-    sweep_terminal(&test.db, Duration::ZERO, 500)
-        .await
-        .expect("sweep");
-
-    let remaining = engine::entity::pending_input::Entity::find()
-        .filter(engine::entity::pending_input::Column::ExecutionId.eq(execution_id))
-        .count(&test.db)
-        .await
-        .expect("count pending inputs");
-    assert_eq!(
-        remaining, 0,
-        "a pending input for a swept execution must not be left orphaned"
     );
 }
 

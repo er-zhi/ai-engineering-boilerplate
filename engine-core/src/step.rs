@@ -121,19 +121,11 @@ pub fn interrupt(
     mut execution: Execution,
     input: serde_json::Value,
 ) -> (Execution, ExecutionEvent) {
-    let object = execution.state.as_object_mut().expect("state is an object");
-    // A `Wait(UserInput)` node's own task reads `interrupt_input` for the payload it woke on —
-    // that contract is unchanged. Separately, shallow-merge the input's own top-level fields
-    // into state: Chat's convention (`common::execution_input::ExecutionInput`) sends
-    // `{"question": "..."}`, and `question` is the one field every LLM node re-reads on each
-    // pass (`executors/llm.rs::build_prompt`). Without this, an accepted interrupt updated a
-    // key nothing consumed, and the graph kept answering the question it started with.
-    if let Some(fields) = input.as_object() {
-        for (key, value) in fields {
-            object.insert(key.clone(), value.clone());
-        }
-    }
-    object.insert("interrupt_input".to_owned(), input);
+    execution
+        .state
+        .as_object_mut()
+        .expect("state is an object")
+        .insert("interrupt_input".to_owned(), input);
     execution.status = Status::Ready;
     let event = execution.event(ExecutionPayload::Interrupted);
     (execution, event)
@@ -1075,27 +1067,6 @@ mod tests {
         assert_eq!(
             exec.state.get("interrupt_input"),
             Some(&json!({"role": "user", "text": "second"}))
-        );
-    }
-
-    #[test]
-    fn interrupt_also_merges_its_input_over_the_field_the_llm_node_rereads() {
-        let mut exec = execution("llm");
-        exec.state =
-            json!({"question": "what is the capital of France?", "llm": {"reply": "Paris"}});
-
-        let (exec, _event) = interrupt(exec, json!({"question": "and the population?"}));
-
-        assert_eq!(
-            exec.state.get("question"),
-            Some(&json!("and the population?")),
-            "the field build_prompt rereads must carry the new question, or an accepted \
-             interrupt changes nothing the graph ever looks at"
-        );
-        assert_eq!(
-            exec.state.get("llm"),
-            Some(&json!({"reply": "Paris"})),
-            "merging in the new field must not disturb unrelated state"
         );
     }
 
