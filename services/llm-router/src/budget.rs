@@ -62,6 +62,7 @@ pub fn published() -> DecisionBudget {
         min_score_levels: counted(MIN_SCORE_LEVELS),
         max_score_levels: counted(MAX_SCORE_LEVELS),
         max_level_bytes: counted(MAX_LEVEL_BYTES),
+        max_state_plus_question_bytes: counted(MAX_STATE_PLUS_QUESTION_BYTES),
         ..Default::default()
     }
 }
@@ -336,6 +337,34 @@ mod tests {
             counted(MAX_OPTION_DESCRIPTION_BYTES)
         );
         assert_eq!(budget.max_level_bytes, counted(MAX_LEVEL_BYTES));
+        assert_eq!(
+            budget.max_state_plus_question_bytes,
+            counted(MAX_STATE_PLUS_QUESTION_BYTES)
+        );
+    }
+
+    // The combined check (within_state_and_question_budget) is enforced but was, until this field
+    // existed, undiscoverable: a caller checking a request against every field DecisionBudget published
+    // could still have it refused for a size the published message never named. This ties the refusal a
+    // caller actually gets back to the value now published for exactly that limit, not just to the raw
+    // constant `a_choice_questions_options_alone_can_push_state_plus_question_over_the_combined_limit`
+    // above already pins — so a future `published()` that (wrongly) rendered this field from a different
+    // number than budget.rs enforces would fail here even if it happened to still equal
+    // MAX_STATE_PLUS_QUESTION_BYTES by coincidence elsewhere.
+    #[test]
+    fn a_request_refused_by_the_combined_check_names_the_published_limit() {
+        let published_limit = published().max_state_plus_question_bytes;
+        let descriptions = "d".repeat(MAX_OPTION_DESCRIPTION_BYTES);
+        let names = named(MAX_CHOICE_OPTIONS, "o");
+        let heavy = choice_question(
+            "department",
+            names
+                .iter()
+                .map(|name| (name.as_str(), descriptions.as_str()))
+                .collect(),
+        );
+
+        assert_refused(deciding(vec![heavy]), &published_limit.to_string());
     }
 
     #[test]

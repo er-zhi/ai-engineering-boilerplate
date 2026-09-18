@@ -166,7 +166,7 @@ One vendor serves this class today, so a decision runs on one model and a failur
 
 ### The Budget
 
-`Decide` rejects a request that exceeds any of these before spending anything, naming the limit and the question it refused. `DescribeModels` publishes the same numbers.
+`Decide` rejects a request that exceeds any of these before spending anything, naming the limit and the question it refused. `DescribeModels` publishes the same numbers. Every row but the last bounds one field on its own; a request can satisfy every one of those individually and still be refused, because the last row bounds `state` plus the single largest question together, not each independently.
 
 | Limit | Value |
 |---|---|
@@ -179,6 +179,7 @@ One vendor serves this class today, so a decision runs on one model and a failur
 | option description | 1 KiB |
 | `score` levels | 2 to 10 |
 | level text, and each noul criterion | 1 KiB |
+| `state` plus the largest question, combined | 64 KiB |
 
 Shape is checked too: an empty question list, a duplicate or empty id, a question with no type, and a `state` or `instructions` the caller never set are all refused locally rather than sent and billed.
 

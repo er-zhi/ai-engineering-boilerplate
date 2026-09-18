@@ -181,7 +181,9 @@ message DescribeModelsResponse {
 }
 
 // Every ceiling Decide enforces locally, rendered from the constants it enforces them with, so the published
-// budget and the check cannot drift. A request inside all of these is never refused for its size.
+// budget and the check cannot drift. A request that satisfies every field below individually is still
+// refused for its size if state plus its largest question exceeds max_state_plus_question_bytes — that
+// field is a combined ceiling over the two together, not one more independent field limit like the rest.
 message DecisionBudget {
   int32 max_questions = 1;
   int32 max_question_id_bytes = 2;
@@ -195,6 +197,14 @@ message DecisionBudget {
   int32 max_score_levels = 9;
   // One score level's text, and each of a noul's when_true / when_false criteria.
   int32 max_level_bytes = 10;
+  // The vendor bounds state plus the single largest question by token count, not by any one field's own
+  // byte limit above, so a request can satisfy every field here individually and still be refused for
+  // this sum. Rendered in bytes because this side has no tokenizer of its own: bytes are a conservative
+  // proxy for tokens, converted at the worst-case bytes-per-token ratio budget.rs assumes (plain English
+  // runs closer to 4 bytes/token; dense CJK, base64, and short-keyed JSON commonly run under 2, and a
+  // lower ratio means more tokens for the same bytes, which is why the worst case is used). Measured over
+  // state plus the largest single question, not each question independently.
+  int32 max_state_plus_question_bytes = 11;
 }
 
 message ModelCard {
