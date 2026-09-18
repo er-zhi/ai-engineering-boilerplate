@@ -85,6 +85,7 @@
   const SESSION_RESET = `${EVENT_KIND_PREFIX}SESSION_RESET`;
   const NOTIFICATION = `${EVENT_KIND_PREFIX}NOTIFICATION`;
   const TOPIC_PROGRESS = `${EVENT_KIND_PREFIX}TOPIC_PROGRESS`;
+  const CLARIFICATION_NEEDED = `${EVENT_KIND_PREFIX}CLARIFICATION_NEEDED`;
 
   function readable(value, prefix) {
     const name = String(value || "");
@@ -382,6 +383,10 @@
       }
       let payload = {};
       try { payload = JSON.parse(event.payloadJson || "{}"); } catch { payload = {}; }
+      if (event.kind === CLARIFICATION_NEEDED) {
+        appendMessage("assistant", payload.text || "");
+        return;
+      }
       if (event.kind === NOTIFICATION) {
         appendMessage("·", payload.text || payload.kind || "", "notification", rootTitleOf(topics, event.topicId));
         return;

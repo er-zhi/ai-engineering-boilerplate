@@ -364,6 +364,33 @@ pub async fn manager_with() -> (crate::test_db::TestDb, Arc<TopicManager>, Arc<F
     (test, manager, engine)
 }
 
+/// A fixed user id for tests that don't care whose session it is, only that `send_turn` sees one
+/// consistent caller.
+pub const OWNER: Uuid = Uuid::from_u128(1);
+
+/// A `TopicManager` wired to a caller-supplied llm-router URL — already armed, e.g. via
+/// `serve_decider` — plus a fresh fake Engine and database. For tests that drive `send_turn`
+/// end to end against a specific `Decide`/`Complete` script rather than the router this file owns.
+pub struct Harness {
+    pub manager: Arc<TopicManager>,
+    _test: crate::test_db::TestDb,
+}
+
+pub async fn harness_with_router(router_url: &str) -> Harness {
+    let test = crate::test_db::start().await;
+    let fake = Arc::new(FakeEngine::default());
+    let engine_url = serve(ConnectRouter::new().add_service(Arc::clone(&fake))).await;
+    let manager = Arc::new(
+        TopicManager::new(test.db.clone(), &engine_url, router_url)
+            .expect("manager")
+            .with_reconnect_delays(Duration::from_millis(1), Duration::from_millis(20)),
+    );
+    Harness {
+        manager,
+        _test: test,
+    }
+}
+
 pub async fn manager_with_router() -> (
     crate::test_db::TestDb,
     Arc<TopicManager>,

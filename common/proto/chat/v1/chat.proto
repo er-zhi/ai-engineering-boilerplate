@@ -91,6 +91,8 @@ enum ChatEventKind {
   CHAT_EVENT_KIND_NOTIFICATION = 8;
   CHAT_EVENT_KIND_SESSION_RESET = 9;
   CHAT_EVENT_KIND_TOPIC_CANCELLED = 10;
+  // The turn carried no request to act on. Session-level: topic_id is empty.
+  CHAT_EVENT_KIND_CLARIFICATION_NEEDED = 11;
 }
 
 message ChatEvent {

@@ -20,6 +20,7 @@ pub enum TopicEventKind {
     FocusChanged,
     Notification,
     SessionReset,
+    ClarificationNeeded,
 }
 
 impl TopicEventKind {
@@ -72,6 +73,12 @@ impl TopicEvent {
             payload: serde_json::json!({}),
             occurred_at,
         }
+    }
+
+    /// A session-level event: nothing it describes belongs to any one topic.
+    #[must_use]
+    pub fn session_wide(session_id: Uuid, kind: TopicEventKind) -> Self {
+        Self::new(session_id, None, kind, Utc::now())
     }
 
     #[must_use]

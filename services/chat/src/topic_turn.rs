@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::entity::message;
 use crate::entity::topic::{self, Status};
 use crate::error::ChatError;
+use crate::events::{TopicEvent, TopicEventKind};
 use crate::intent::{Action, MAX_TITLE_CHARS, Routing, TopicSummary, truncate};
 use crate::session_manager::principal_of;
 use crate::topic_manager::TopicManager;
@@ -35,7 +36,32 @@ impl TopicManager {
         if let Some(delivered) = self.already_delivered(turn_id, &topics).await? {
             return Ok(delivered);
         }
-        let actions = self.classify(&topics, focus_topic_id, &content).await;
+        let actions = match self
+            .intent
+            .route(&summaries(&topics), focus_topic_id, &content)
+            .await
+        {
+            // A turn with nothing to act on is answered here and now: creating a topic to ask
+            // "what did you mean?" would cost an Engine execution and a minute's wait for a reply
+            // the session can give instantly. This runs before `lock_turn` below, so two
+            // concurrent retries of one turn_id each publish their own clarification event — that
+            // is accepted and intentional, not an oversight: the event starts nothing and has no
+            // side effect to double up on, so publishing it twice costs nothing a client would
+            // notice.
+            Routing::Clarify => {
+                let session = self.session.get_or_create_session(user_id).await?;
+                self.publish(
+                    TopicEvent::session_wide(session.id, TopicEventKind::ClarificationNeeded)
+                        .with_payload(serde_json::json!({
+                            "text": crate::intent::CLARIFICATION_TEXT,
+                            "turn_id": turn_id,
+                        })),
+                )
+                .await;
+                return Ok(Vec::new());
+            }
+            Routing::Act(actions) => actions,
+        };
 
         let turn_guard = self.session.db.begin().await?;
         lock_turn(&turn_guard, turn_id).await?;
@@ -44,28 +70,6 @@ impl TopicManager {
             .await?;
         turn_guard.commit().await?;
         Ok(received)
-    }
-
-    async fn classify(
-        &self,
-        topics: &[topic::Model],
-        focus_topic_id: Option<i64>,
-        content: &str,
-    ) -> Vec<Action> {
-        let summaries: Vec<TopicSummary> = topics
-            .iter()
-            .map(|topic| TopicSummary {
-                id: topic.id,
-                title: topic.title.clone(),
-                status: topic.status,
-                result_summary: topic.result_summary.clone(),
-            })
-            .collect();
-        match self.intent.route(&summaries, focus_topic_id, content).await {
-            Routing::Act(actions) => actions,
-            // Task 8 replaces this with the CLARIFICATION_NEEDED event
-            Routing::Clarify => crate::intent::fallback(&summaries, focus_topic_id, content),
-        }
     }
 
     async fn deliver_turn(
@@ -250,11 +254,58 @@ fn advisory_key(turn_id: Uuid) -> i64 {
     i64::from_be_bytes(high.to_be_bytes())
 }
 
+fn summaries(topics: &[topic::Model]) -> Vec<TopicSummary> {
+    topics
+        .iter()
+        .map(|topic| TopicSummary {
+            id: topic.id,
+            title: topic.title.clone(),
+            status: topic.status,
+            result_summary: topic.result_summary.clone(),
+        })
+        .collect()
+}
+
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::*;
     use crate::fakes::*;
     use std::sync::atomic::Ordering;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_with_nothing_to_act_on_starts_no_topic_and_says_so() {
+        let (url, _) = crate::fakes::serve_decider(vec![("actionable", 0.1)]).await;
+        let harness = harness_with_router(&url).await;
+        let mut events = harness.manager.subscribe();
+
+        let started = harness
+            .manager
+            .send_turn(OWNER, Uuid::new_v4(), "hey".to_owned())
+            .await
+            .expect("a clarification is a normal outcome, not an error");
+
+        assert!(started.is_empty(), "no topic may be created: {started:?}");
+        let event = events.recv().await.expect("an event");
+        assert_eq!(event.kind, TopicEventKind::ClarificationNeeded);
+        assert_eq!(
+            event.topic_id, None,
+            "a clarification belongs to the session, not a topic"
+        );
+        assert_eq!(
+            event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str),
+            Some(crate::intent::CLARIFICATION_TEXT)
+        );
+        let (_focus, topics) = harness
+            .manager
+            .session
+            .get_session_view(OWNER)
+            .await
+            .expect("view");
+        assert!(topics.is_empty());
+    }
 
     #[test]
     fn two_different_turns_get_two_advisory_keys() {

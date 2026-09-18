@@ -100,6 +100,7 @@ fn event_kind_to_proto(kind: TopicEventKind) -> ChatEventKind {
         TopicEventKind::FocusChanged => ChatEventKind::FocusChanged,
         TopicEventKind::Notification => ChatEventKind::Notification,
         TopicEventKind::SessionReset => ChatEventKind::SessionReset,
+        TopicEventKind::ClarificationNeeded => ChatEventKind::ClarificationNeeded,
     }
 }
 

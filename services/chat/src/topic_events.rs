@@ -66,6 +66,14 @@ impl TopicManager {
         let live = self.events.subscribe();
         Ok((live, self.stored_events(session).await?))
     }
+
+    /// The live bus alone, with no replay — for tests that assert on one published event rather
+    /// than a session's whole history.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<TopicEvent> {
+        self.events.subscribe()
+    }
 }
 
 fn stored_row_to_event(row: event::Model) -> Option<TopicEvent> {
