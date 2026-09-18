@@ -22,14 +22,26 @@ const DECIDE_PATH: &str = "/v1/systemone";
 const MODELS_PATH: &str = "/v1/models";
 
 /// This adapter's own HTTP timeout to the vendor — never `openai_compatible`'s 60 s, and not
-/// shared with it: `Decide` is a typed decision, not generated prose, and Chat's own client gives
-/// the whole round trip only 2 s (see `chat::intent::DECIDE_CALL_TIMEOUT`) before it moves on to
-/// its deterministic fallback. The vendor's docs put a typical answer at about 100 ms, with 0.27 s
-/// published for a 13-question call, so this is generous room for a cold connection and network
-/// jitter, kept at the same order as Chat's own deadline rather than at completion's 60 s — a
-/// bigger number here would only mean this adapter keeps talking to the vendor well after Chat has
-/// already given up and answered the user from the fallback.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// shared with it: `Decide` is a typed decision, not generated prose. The vendor's docs put a
+/// typical answer at about 100 ms, with 0.27 s published for a 13-question call, so this is
+/// generous room for a cold connection and network jitter, kept at the same order as Chat's own
+/// deadline rather than at completion's 60 s.
+///
+/// **This is the INNER half of a matched pair with Chat's `intent::DECIDE_CALL_TIMEOUT` (the
+/// OUTER one, 2 s) — it must stay strictly below it, and if you change one, change both.** The
+/// reason is not just politeness: Chat's client asserts its deadline as the `grpc-timeout` header
+/// on the way out, and `connectrpc`'s server on this side parses that header on receipt and wraps
+/// the *entire* dispatch — `SystemOneApi::decide` → `Decisions::decide` → `decider.decide` →
+/// `SystemOne::ask`, including the pending vendor HTTP call this timeout bounds — in its own
+/// `timeout_at`, started the moment the request lands. This adapter's own clock only starts later,
+/// once `ask` actually issues the `reqwest` call. Two equal deadlines with an earlier and a later
+/// start are not a race: the outer one always wins. When it does, the whole `Decisions::decide`
+/// future is dropped before `self.record(...)` ever runs (that audit write happens synchronously
+/// after `decider.decide(...).await` resolves, not in a spawned task — see `decisions.rs`), so the
+/// `llm_router.decisions` row for that attempt — exactly the slow or failed one this measurement
+/// most needs — is silently never written. 1.5 s leaves margin below Chat's 2 s for the outer
+/// deadline's own header parsing, envelope decode, dispatch, and that synchronous audit write.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct SystemOne {
     http: reqwest::Client,
@@ -90,10 +102,13 @@ impl SystemOne {
 impl Decider for SystemOne {
     // Deliberately no retry here. TypeSafe's own SDK retries a failed call twice by default, but
     // this adapter returns `NotDecided` on the first failure and lets it propagate: there is one
-    // vendor for this class, so a retry has nothing else to fall back to, and `Decide` is advisory
-    // end to end — the caller (Chat's `route`) already has a deterministic fallback of its own,
-    // reached sooner if this adapter fails fast rather than spending part of the 2 s deadline
-    // trying the same call again. Considered and rejected, not overlooked.
+    // vendor for this class, so a retry has nothing else to fall back to, and it would spend part
+    // of this adapter's own 1.5 s budget re-trying the same call. This adapter is shared by every
+    // `Decide` caller and does not retry on any of their behalf; whether the specific caller has
+    // somewhere to fall back to is that caller's own property, not this adapter's. Chat's `route`
+    // does have a deterministic fallback and is reached sooner for it — that is Chat's reasoning
+    // for its own timeout, not a claim this adapter makes about every caller. Considered and
+    // rejected, not overlooked.
     async fn decide(&self, model: &str, decision: &Decision) -> Result<Verdict, NotDecided> {
         let sent = audit_body(model, decision);
         let decided = self
@@ -196,11 +211,34 @@ mod tests {
     const TEST_KEY: &str = "test-key";
     const MODEL: &str = "jev-latest";
 
-    // A regression guard: this adapter's own timeout must stay of the same order as Chat's 2 s
+    /// A local mirror of Chat's `intent::DECIDE_CALL_TIMEOUT` (the OUTER half of the matched pair
+    /// `REQUEST_TIMEOUT` documents above). This crate has no dependency on `chat` to check
+    /// against the real constant, so this pins the value the two are kept in sync with by hand;
+    /// Chat's own `intent.rs` tests pin the same value from its side. Keep both in sync with the
+    /// real `chat::intent::DECIDE_CALL_TIMEOUT` when either changes.
+    const CHAT_DECIDE_CALL_TIMEOUT_MIRROR: Duration = Duration::from_secs(2);
+
+    // A regression guard: this adapter's own timeout must stay of the same order as Chat's
     // `Decide` deadline, not drift back up toward completion's 60 s.
     #[test]
     fn the_adapters_own_timeout_is_seconds_not_the_completion_sides_sixty() {
-        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_millis(1500));
+    }
+
+    // The invariant the whole-branch review traced a lost audit row to: `connectrpc`'s server
+    // wraps this adapter's whole dispatch — including the vendor HTTP call `REQUEST_TIMEOUT`
+    // bounds — in Chat's own outer deadline, started strictly earlier than this adapter's own
+    // clock (see `REQUEST_TIMEOUT`'s doc comment). Equal or larger and the outer deadline always
+    // wins the race and drops the audit write; this pins that the inner must stay strictly below.
+    #[test]
+    fn this_adapters_own_timeout_stays_strictly_below_chats_outer_decide_deadline() {
+        assert!(
+            REQUEST_TIMEOUT < CHAT_DECIDE_CALL_TIMEOUT_MIRROR,
+            "the inner vendor-call timeout must stay strictly below Chat's outer Decide \
+             deadline, or the outer one always wins the race and the audit row for that \
+             attempt is silently never written: {REQUEST_TIMEOUT:?} vs \
+             {CHAT_DECIDE_CALL_TIMEOUT_MIRROR:?}"
+        );
     }
 
     fn adapter_for(stub: &TestSystemOne, timeout: Duration) -> SystemOne {

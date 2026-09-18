@@ -27,6 +27,18 @@ use crate::topic_status::status_word;
 /// llm-router and back. `Decide` is advisory — see `route`'s doc and `fallback` below — so this
 /// bounds how long a user waits for the deterministic fallback to kick in on a bad day, not how
 /// generously the vendor is normally treated.
+///
+/// **This is the OUTER half of a matched pair with llm-router's own
+/// `adapters::system_one::REQUEST_TIMEOUT` (the INNER one, 1.5 s) — the inner must stay strictly
+/// below this one, and if you change one, change both.** This client asserts this deadline on the
+/// wire as the `grpc-timeout` header; `connectrpc`'s server on llm-router's side parses it on
+/// receipt and wraps that whole side's dispatch — including the pending vendor HTTP call the inner
+/// timeout bounds — in its own `timeout_at`, started the moment the request lands there, strictly
+/// earlier than the inner adapter's own clock (which only starts once it actually issues its HTTP
+/// call). Two equal deadlines with an earlier and a later start are not a race: the outer one —
+/// this one — always wins, and when it does, llm-router drops that whole future, including its
+/// audit write, before that write ever runs — silently losing the very latency measurement this
+/// budget was tuned from. Keep this strictly above the inner one, with margin.
 const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// `Complete` produces generated text, not a typed decision, and keeps the older, more generous
 /// budget this timeout always had. Unrelated to, and unaffected by, `DECIDE_CALL_TIMEOUT` above —
@@ -503,6 +515,29 @@ mod tests {
     use super::*;
 
     const CLARIFY_BELOW: f64 = ACTIONABLE_THRESHOLD - 0.1;
+
+    /// A local mirror of llm-router's `adapters::system_one::REQUEST_TIMEOUT` (the INNER half of
+    /// the matched pair `DECIDE_CALL_TIMEOUT` documents above). This crate has no dependency on
+    /// `llm-router` to check against the real constant, so this pins the value the two are kept
+    /// in sync with by hand; llm-router's own `system_one` tests pin the same value from its
+    /// side. Keep both in sync with the real `system_one::REQUEST_TIMEOUT` when either changes.
+    const LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR: Duration = Duration::from_millis(1500);
+
+    // The invariant a lost audit row was traced to: connectrpc's server on llm-router's side
+    // starts its own deadline (this outer constant) strictly before llm-router's adapter starts
+    // its own inner one, so equal or larger and the outer always wins the race, dropping
+    // llm-router's decision future — audit write included — before it runs. Pins that the outer
+    // stays strictly above the inner.
+    #[test]
+    fn the_outer_chat_deadline_stays_strictly_above_llm_routers_inner_one() {
+        assert!(
+            DECIDE_CALL_TIMEOUT > LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR,
+            "Chat's outer Decide deadline must stay strictly above llm-router's own inner \
+             vendor-call timeout, or the outer one always wins the race and llm-router's audit \
+             row for that attempt is silently never written: {DECIDE_CALL_TIMEOUT:?} vs \
+             {LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR:?}"
+        );
+    }
 
     fn topics() -> Vec<TopicSummary> {
         vec![TopicSummary {
