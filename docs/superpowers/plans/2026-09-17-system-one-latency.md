@@ -134,6 +134,55 @@
 
 ---
 
+### Task 7: A follow-up must not fail because the agent was mid-tick
+
+**Why.** Found by the live check, not by any test. Sending "and the population?"
+straight after a question returns `{"code":"internal","message":"chat could not
+complete the request"}`, and `docker compose logs chat` gives the cause:
+
+```
+engine call failed: invalid_argument: execution ... is mid-tick, retry shortly
+```
+
+`services/engine/src/control.rs` refuses a message aimed at an execution that is
+currently ticking. That refusal predates this whole branch — `git log -S
+"mid-tick"` puts it in the original engine commit — and it was survivable only
+because routing used to take ~1.4 s, which was long enough for the tick to
+finish before delivery was attempted. Routing is now 150-300 ms, so a user who
+types a follow-up immediately lands inside the tick and gets an error. **Speed
+did not create this bug; it made it reachable.**
+
+**Files:**
+- Modify: `services/chat/src/topic_turn.rs` (the delivery path)
+- Test: inline tests in the same file
+
+**Steps:**
+- [ ] Read `services/engine/src/control.rs` first and see exactly which refusal
+      carries "mid-tick", so the retry matches that one case and nothing else. A
+      retry on a genuine `invalid_argument` — a malformed request — would spin
+      on an error that will never clear.
+- [ ] Retry that one refusal, briefly and boundedly: a handful of attempts over
+      a few hundred milliseconds, then give up and return what it returns today.
+      The contract's own words are "retry shortly", so this is the behaviour it
+      already invites; the caller simply never implemented its half.
+- [ ] Keep the whole retry well inside the turn's own budget. A user waiting
+      300 ms is fine; a user waiting two seconds for a follow-up is the latency
+      problem this plan exists to remove, reintroduced by the back door.
+- [ ] Test: a delivery refused as mid-tick once, then accepted, delivers and
+      returns `Ok` — and does so without the caller seeing an error.
+- [ ] Test: a delivery refused as mid-tick every time gives up and surfaces the
+      error rather than retrying forever.
+- [ ] Test: a refusal that is *not* mid-tick is returned immediately, with no
+      retry at all.
+- [ ] **Live check before committing**, per
+      `.superpowers/sdd/2026-09-17-system-one-latency/smoke-check.md`. The proof
+      this task works is the exact sequence that failed: ask a question, then
+      immediately send a follow-up fragment, and get a topic id rather than an
+      internal error.
+- [ ] Commit: `chat: a follow-up waits out a tick instead of failing the turn`
+
+---
+
 ## Explicitly not doing
 
 - **Knowledge Base `page_type` as a decision.** Correct in principle and nearly free, but ingest is not on the turn path and the benefit is quality, not latency. Do it when `page_type` becomes a search filter.
