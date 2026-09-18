@@ -36,14 +36,17 @@ use sea_orm::Database;
 
 use crate::adapters::KeyCheck;
 use crate::adapters::openai_compatible::OpenAiCompatible;
-use crate::adapters::system_one::SystemOne;
+use crate::adapters::system_one::{self, SystemOne};
 use crate::decisions::Decisions;
 use crate::log::{PartitionUpkeep, PgAuditLog};
 use crate::service::Router;
 use crate::tiers::Tiers;
 use crate::wire::tier_contracts;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+// `Complete` generates prose, so it keeps the old, generous budget. `Decide` has its own, far
+// shorter timeout — see `adapters::system_one::REQUEST_TIMEOUT` — deliberately not this constant,
+// so a change to either one can never silently move the other.
+const COMPLETION_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PARTITION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 const DEFAULT_SYSTEM_ONE_BASE_URL: &str = "https://api.typesafe.ai";
 const DEFAULT_SYSTEM_ONE_MODEL: &str = "jev-latest";
@@ -152,7 +155,7 @@ async fn type_safe_ai(
     let model =
         env(&lookup, "TYPESAFE_AI_MODEL").unwrap_or_else(|| DEFAULT_SYSTEM_ONE_MODEL.to_owned());
 
-    let provider = SystemOne::new(base_url, api_key, REQUEST_TIMEOUT)?;
+    let provider = SystemOne::new(base_url, api_key, system_one::REQUEST_TIMEOUT)?;
     match provider.verify_key().await {
         Ok(()) => {}
         Err(KeyCheck::Rejected) => {
@@ -189,7 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = env(&from_environment, "OPENROUTER_BASE_URL")
         .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_owned());
     let api_key = required(&from_environment, "OPENROUTER_API_KEY")?;
-    let provider = OpenAiCompatible::new(base_url, api_key, REQUEST_TIMEOUT)?;
+    let provider = OpenAiCompatible::new(base_url, api_key, COMPLETION_REQUEST_TIMEOUT)?;
     match provider.verify_key().await {
         Ok(()) => {}
         Err(KeyCheck::Rejected) => return Err("the provider rejected OPENROUTER_API_KEY".into()),
@@ -240,6 +243,16 @@ mod tests {
 
     async fn serving_models() -> TestSystemOne {
         TestSystemOne::listing(StatusCode::OK, json!({"models": []})).await
+    }
+
+    // A regression guard, not a behavior test: `Decide` and `Complete` must never again share one
+    // timeout constant. `COMPLETION_REQUEST_TIMEOUT` stays exactly what `REQUEST_TIMEOUT` used to
+    // be, and `system_one::REQUEST_TIMEOUT` (exercised by the adapter's own tests) is a different,
+    // much smaller constant — see the wiring in `main` and `type_safe_ai` above.
+    #[test]
+    fn completion_keeps_its_old_generous_timeout_unrelated_to_decides() {
+        assert_eq!(COMPLETION_REQUEST_TIMEOUT, Duration::from_secs(60));
+        assert_ne!(COMPLETION_REQUEST_TIMEOUT, system_one::REQUEST_TIMEOUT);
     }
 
     #[tokio::test(flavor = "multi_thread")]

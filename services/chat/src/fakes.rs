@@ -456,6 +456,15 @@ async fn served(router: Arc<FakeLlmRouter>) -> (String, Calls) {
     (url, calls)
 }
 
+/// Accepts the call and then never answers it: `decide` blocks on a barrier nothing else will
+/// ever join. For deadline tests that need to observe a `Decide` being abandoned rather than any
+/// particular answer.
+pub async fn serve_decider_hanging() -> String {
+    let router = Arc::new(FakeLlmRouter::default());
+    router.hold_every_call_until(Arc::new(tokio::sync::Barrier::new(2)));
+    serve(router_service(router)).await
+}
+
 pub async fn arm_completed_event(
     manager: &Arc<TopicManager>,
     fake: &FakeEngine,

@@ -18,7 +18,21 @@ use serde::{Deserialize, Serialize};
 use crate::entity::topic::Status;
 use crate::topic_status::status_word;
 
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// `Decide` gets its own deadline, separate from `Complete`'s (see `COMPLETE_CALL_TIMEOUT` below —
+/// the two must never again share one constant). The vendor's own docs put a typical answer at
+/// about 100 ms, with 0.27 s published for a 13-question call. This is 20x that headline number,
+/// not the usual 2x, because three things can each add real latency before any of the vendor's own
+/// answer arrives: a cold connection (no warm pool yet), a retry the vendor's SDK performs
+/// internally before it ever reports back to `services/llm-router`, and our own hop out to
+/// llm-router and back. `Decide` is advisory — see `route`'s doc and `fallback` below — so this
+/// bounds how long a user waits for the deterministic fallback to kick in on a bad day, not how
+/// generously the vendor is normally treated.
+const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// `Complete` produces generated text, not a typed decision, and keeps the older, more generous
+/// budget this timeout always had. Unrelated to, and unaffected by, `DECIDE_CALL_TIMEOUT` above —
+/// each client below is built with its own `ClientConfig`, so changing one can never silently move
+/// the other.
+const COMPLETE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_TITLE_CHARS: usize = 60;
 
 /// Getting this wrong is not symmetric: asking a person to repeat themselves costs one extra
@@ -168,16 +182,20 @@ impl TopicIntent {
         let target = llm_router_url
             .parse()
             .map_err(|e| format!("could not parse LLM_ROUTER_URL {llm_router_url:?}: {e}"))?;
-        let client_config = ClientConfig::new(target)
+        let base_config = ClientConfig::new(target)
             .with_protocol(Protocol::Grpc)
-            .with_default_timeout(CALL_TIMEOUT)
             .proto();
         Ok(Self {
             llm: LlmRouterServiceClient::new(
                 HttpClient::plaintext_http2_only(),
-                client_config.clone(),
+                base_config
+                    .clone()
+                    .with_default_timeout(COMPLETE_CALL_TIMEOUT),
             ),
-            decider: SystemOneServiceClient::new(HttpClient::plaintext_http2_only(), client_config),
+            decider: SystemOneServiceClient::new(
+                HttpClient::plaintext_http2_only(),
+                base_config.with_default_timeout(DECIDE_CALL_TIMEOUT),
+            ),
         })
     }
 
@@ -595,6 +613,32 @@ mod tests {
         };
         assert_eq!(actions.len(), 2);
         assert_eq!(calls.completions(), 1);
+    }
+
+    // Real network on loopback (the fake server, the TCP and HTTP/2 handshake), virtual time for
+    // the deadline itself: `start_paused` only auto-advances the clock once nothing else is ready
+    // to run, so the handshake and request still complete at wall-clock speed, and only the
+    // "server never responds" wait is fast-forwarded.
+    #[tokio::test(start_paused = true)]
+    async fn a_decider_that_never_answers_is_abandoned_within_the_new_deadline() {
+        let url = crate::fakes::serve_decider_hanging().await;
+        let intent = TopicIntent::new(&url).expect("client");
+
+        let started = tokio::time::Instant::now();
+        let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
+            panic!("a hung decider must still fall back, not clarify");
+        };
+        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DECIDE_CALL_TIMEOUT,
+            "returned before the deadline even elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "abandoned near the 2s deadline, not the old 30s one: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
