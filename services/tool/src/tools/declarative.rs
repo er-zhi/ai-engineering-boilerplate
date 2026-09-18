@@ -167,7 +167,7 @@ where
         .iter()
         .map(|(source, url)| {
             crate::race::op(source.name.as_str(), move || async move {
-                ask(client, url, &source.pick).await
+                ask(client, url, &source.pick, per_source_timeout).await
             })
         })
         .collect();
@@ -187,12 +187,16 @@ where
     }))
 }
 
-async fn ask(client: &reqwest::Client, url: &str, pick: &str) -> Result<Value, String> {
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| format!("request failed: {error}"))?;
+async fn ask(
+    client: &reqwest::Client,
+    url: &str,
+    pick: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    // `get_guarded` re-checks every redirect hop through the same SSRF guard `run` already applied
+    // to this URL's first hop — a public source that answers 302 with a private `Location` must not
+    // be able to walk past the guard just because the check only ever saw the URL it started with.
+    let mut response = crate::tools::web_fetch::get_guarded(client, url, timeout).await?;
     if !response.status().is_success() {
         return Err(format!("returned {}", response.status()));
     }
@@ -512,7 +516,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(30),
-            ask(&client, &format!("http://{address}/"), "t"),
+            ask(&client, &format!("http://{address}/"), "t", SOURCE_TIMEOUT),
         )
         .await
         .expect("a body that never ends must not be buffered whole")

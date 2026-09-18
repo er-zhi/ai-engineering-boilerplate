@@ -124,17 +124,66 @@ fn deepest_source(error: &reqwest::Error) -> String {
     detail
 }
 
+/// How many hops a redirect chain may take before it is abandoned. Matches reqwest's own default,
+/// so nothing that worked under the automatic policy stops working under this one.
+const MAX_REDIRECT_HOPS: usize = 10;
+
+/// A GET that applies `ensure_public_url` to **every** URL in the chain, not just the first.
+///
+/// The client is built with `Policy::none()`, so reqwest hands each 3xx back instead of following
+/// it. That is the point: an automatic redirect is a request to an address nothing checked, and a
+/// public host answering `Location: http://169.254.169.254/` would otherwise walk straight past the
+/// guard. A relative `Location` is resolved against the URL it arrived from, exactly as a browser
+/// would, and then checked like any other.
+pub async fn get_guarded(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<reqwest::Response, String> {
+    let mut here = url.to_owned();
+    for _ in 0..=MAX_REDIRECT_HOPS {
+        let response = client
+            .get(&here)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| readable_send_failure(&here, &e))?;
+        let Some(location) = redirect_target(&response) else {
+            return Ok(response);
+        };
+        let next = resolve(&here, &location)?;
+        ensure_public_url(&next).await?;
+        here = next;
+    }
+    Err(format!(
+        "{url} redirected more than {MAX_REDIRECT_HOPS} times, so the chain was abandoned"
+    ))
+}
+
+fn redirect_target(response: &reqwest::Response) -> Option<String> {
+    response
+        .status()
+        .is_redirection()
+        .then(|| response.headers().get(http::header::LOCATION))
+        .flatten()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn resolve(from: &str, location: &str) -> Result<String, String> {
+    url::Url::parse(from)
+        .map_err(|e| format!("could not read {from} as a URL: {e}"))?
+        .join(location)
+        .map(String::from)
+        .map_err(|e| format!("could not resolve redirect target {location:?}: {e}"))
+}
+
 pub async fn fetch(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
 ) -> Result<Extracted, String> {
-    let mut response = client
-        .get(url)
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(|e| readable_send_failure(url, &e))?;
+    let mut response = get_guarded(client, url, timeout).await?;
     if !response.status().is_success() {
         return Err(format!("fetch {url} returned {}", response.status()));
     }
@@ -248,6 +297,114 @@ mod tests {
         let address = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
         format!("http://{address}/page")
+    }
+
+    async fn serve_body(html: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move { axum::response::Html(html) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}/")
+    }
+
+    async fn serve_redirect(target: &str) -> String {
+        let target = target.to_owned();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let target = target.clone();
+                async move { axum::response::Redirect::temporary(&target) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}/")
+    }
+
+    async fn serve_self_redirect() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let target = format!("http://{address}/");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let target = target.clone();
+                async move { axum::response::Redirect::temporary(&target) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}/")
+    }
+
+    async fn serve_relative_redirect(landing: &'static str) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(
+                    move || async move { axum::response::Redirect::temporary(landing) },
+                ),
+            )
+            .route(
+                landing,
+                axum::routing::get(|| async {
+                    axum::response::Html("<html><body>landing</body></html>")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}/")
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_refused_at_the_hop() {
+        // A public host that answers 302 with a private Location is the whole attack: the first URL
+        // passes the guard, and without a per-hop check reqwest walks the rest of the way itself.
+        let redirector = serve_redirect("http://127.0.0.1:9/secrets").await;
+        let error = get_guarded(&reqwest::Client::new(), &redirector, TEST_TIMEOUT)
+            .await
+            .expect_err("the hop target must be refused");
+        assert!(error.contains("127.0.0.1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_public_address_is_followed() {
+        let destination = serve_body("<html><body>the page that answers</body></html>").await;
+        let redirector = serve_redirect(&destination).await;
+        let response = get_guarded(&reqwest::Client::new(), &redirector, TEST_TIMEOUT)
+            .await
+            .expect("a public hop is fine");
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_loop_stops_at_the_hop_cap_rather_than_spinning() {
+        let looping = serve_self_redirect().await;
+        let error = get_guarded(&reqwest::Client::new(), &looping, TEST_TIMEOUT)
+            .await
+            .expect_err("a loop must end");
+        assert!(error.contains("redirect"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_relative_location_is_resolved_against_the_url_it_came_from() {
+        let destination = serve_relative_redirect("/landing").await;
+        let response = get_guarded(&reqwest::Client::new(), &destination, TEST_TIMEOUT)
+            .await
+            .expect("a relative hop resolves");
+        assert!(response.status().is_success());
     }
 
     #[tokio::test]

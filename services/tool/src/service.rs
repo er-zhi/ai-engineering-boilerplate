@@ -65,6 +65,9 @@ const DEFAULT_TOOL_HTTP_TIMEOUT: Duration = Duration::from_secs(MAX_TIMEOUT_SECO
 pub fn bounded_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(DEFAULT_TOOL_HTTP_TIMEOUT)
+        // No automatic redirects: `tools::web_fetch::get_guarded` re-checks the SSRF guard against
+        // every hop itself, which only works if reqwest hands each 3xx back instead of following it.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("could not build the outbound http client: {error}"))
 }
