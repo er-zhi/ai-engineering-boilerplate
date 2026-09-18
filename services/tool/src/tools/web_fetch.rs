@@ -152,7 +152,9 @@ pub async fn get_guarded(
             return Ok(response);
         };
         let next = resolve(&here, &location)?;
-        ensure_public_url(&next).await?;
+        ensure_public_url(&next)
+            .await
+            .map_err(|reason| format!("redirect to {next} was refused: {reason}"))?;
         here = next;
     }
     Err(format!(
@@ -299,17 +301,12 @@ mod tests {
         format!("http://{address}/page")
     }
 
-    async fn serve_body(html: &'static str) -> String {
-        let app = axum::Router::new().route(
-            "/",
-            axum::routing::get(move || async move { axum::response::Html(html) }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("addr");
-        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-        format!("http://{address}/")
+    /// Builds the test client the way production does: `bounded_http_client()` is the one place
+    /// that decides `Policy::none()`, so a test using anything else (e.g. `reqwest::Client::new()`,
+    /// whose default policy follows redirects on its own) would never actually exercise
+    /// `get_guarded`'s per-hop check — reqwest would resolve the hop before our code saw it.
+    fn guarded_client() -> reqwest::Client {
+        crate::service::bounded_http_client().expect("build the guarded client")
     }
 
     async fn serve_redirect(target: &str) -> String {
@@ -373,26 +370,51 @@ mod tests {
         // A public host that answers 302 with a private Location is the whole attack: the first URL
         // passes the guard, and without a per-hop check reqwest walks the rest of the way itself.
         let redirector = serve_redirect("http://127.0.0.1:9/secrets").await;
-        let error = get_guarded(&reqwest::Client::new(), &redirector, TEST_TIMEOUT)
+        let error = get_guarded(&guarded_client(), &redirector, TEST_TIMEOUT)
             .await
             .expect_err("the hop target must be refused");
+        // Both substrings matter: "public host" proves the *guard* is why this failed (a plain
+        // connection failure to the same closed port would also happen to mention "127.0.0.1", so
+        // that alone wouldn't tell a refusal apart from a network error) and "127.0.0.1" proves the
+        // rejection named the actual offending hop, not just a generic refusal.
+        assert!(error.contains("public host"), "{error}");
         assert!(error.contains("127.0.0.1"), "{error}");
     }
 
     #[tokio::test]
     async fn a_redirect_to_a_public_address_is_followed() {
-        let destination = serve_body("<html><body>the page that answers</body></html>").await;
-        let redirector = serve_redirect(&destination).await;
-        let response = get_guarded(&reqwest::Client::new(), &redirector, TEST_TIMEOUT)
+        // A hop only needs to pass `ensure_public_url`'s classification to be let through, and that
+        // classification is a pure, local computation for a literal IP — no network call at all.
+        // 203.0.113.0/24 is IANA's reserved documentation range (RFC 5737; declarative.rs's own
+        // tests already lean on the same range as "genuinely public, deliberately unroutable"), so
+        // it proves the guard lets a public hop through without needing a live public server this
+        // sandboxed environment has no route to (confirmed separately: real internet access is not
+        // available here).
+        assert!(
+            ensure_public_url("http://203.0.113.5/").await.is_ok(),
+            "a reserved-but-public IP must classify as public"
+        );
+
+        let redirector = serve_redirect("http://203.0.113.5/").await;
+        let error = get_guarded(&guarded_client(), &redirector, Duration::from_millis(300))
             .await
-            .expect("a public hop is fine");
-        assert!(response.status().is_success());
+            .expect_err("this sandbox cannot route to the real internet, so the hop still fails");
+        assert!(
+            !error.contains("public host"),
+            "the guard, not connectivity, must not be why this failed: {error}"
+        );
     }
 
     #[tokio::test]
     async fn a_redirect_loop_stops_at_the_hop_cap_rather_than_spinning() {
+        // A redirect loop pointing at a private address terminates on the very first hop — the
+        // guard refuses it before a second request is ever sent, which is a *stronger* guarantee
+        // than needing the numeric MAX_REDIRECT_HOPS cap at all. That cap exists as a backstop for
+        // a chain of *distinct, genuinely public* hosts that redirect to each other indefinitely —
+        // a scenario this sandbox cannot construct locally (see the report for why), so its own
+        // arithmetic isn't exercised by this test. What this test does prove: the loop never spins.
         let looping = serve_self_redirect().await;
-        let error = get_guarded(&reqwest::Client::new(), &looping, TEST_TIMEOUT)
+        let error = get_guarded(&guarded_client(), &looping, TEST_TIMEOUT)
             .await
             .expect_err("a loop must end");
         assert!(error.contains("redirect"), "{error}");
@@ -400,11 +422,60 @@ mod tests {
 
     #[tokio::test]
     async fn a_relative_location_is_resolved_against_the_url_it_came_from() {
+        // A bare relative Location ("/landing") is not itself a valid absolute URL, so if
+        // `get_guarded` ever checked the raw Location instead of `resolve()`'s result, the failure
+        // here would read "must be an absolute http or https URL" — a different rejection than the
+        // one below. Seeing "public host" instead proves `resolve()` ran and turned the relative
+        // path into the full (still correctly refused, since this server is loopback) URL the guard
+        // actually judged.
         let destination = serve_relative_redirect("/landing").await;
-        let response = get_guarded(&reqwest::Client::new(), &destination, TEST_TIMEOUT)
+        let error = get_guarded(&guarded_client(), &destination, TEST_TIMEOUT)
             .await
-            .expect("a relative hop resolves");
-        assert!(response.status().is_success());
+            .expect_err("the resolved hop is still a private address");
+        assert!(
+            error.contains("public host"),
+            "resolve() must have produced a full URL for the guard to judge: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_private_listener_never_reaches_it() {
+        // The end-to-end proof: not just that `get_guarded` errors, but that the private service
+        // is never contacted at all. A closed port (as in the test above) can't tell the difference
+        // between "refused before connecting" and "connected, then failed" — a real listener can.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let secret = axum::Router::new().route(
+            "/secret",
+            axum::routing::get(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    "leaked secret data"
+                }
+            }),
+        );
+        let secret_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let secret_address = secret_listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(secret_listener, secret).await.expect("serve") });
+
+        let redirector = serve_redirect(&format!("http://{secret_address}/secret")).await;
+
+        let error = get_guarded(&guarded_client(), &redirector, TEST_TIMEOUT)
+            .await
+            .expect_err("the private listener must be refused");
+
+        assert!(error.contains("public host"), "{error}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the private listener must never have been reached"
+        );
     }
 
     #[tokio::test]
