@@ -79,11 +79,18 @@ goes out, not one at a time as they are tried.
 That covers the first hop. A redirect is a second request to an address nothing has checked yet, so
 `get_guarded` (`tools/web_fetch.rs`) follows redirects by hand and re-applies `ensure_public_url` to
 every `Location` before following it, rather than trusting an automatic redirect to stay inside the
-guard. `bounded_http_client` builds the one shared client with `Policy::none()` for exactly this
-reason — under the default policy reqwest would already have followed the hop before this code ever
-saw the target. `fetch()`, `fetch_richest()`, and a declarative source's request (`declarative::ask`)
-all go through `get_guarded`, so a public page that answers with a private `Location` is refused at
-the hop it appears on, not fetched one request later.
+guard. `bounded_http_client` builds the no-redirect client behind exactly this, with `Policy::none()`
+so reqwest hands each hop back instead of following it — under the default policy it would already
+have followed the hop before this code ever saw the target. `fetch()`, `fetch_richest()`, and a
+declarative source's request (`declarative::ask`) all go through `get_guarded` on this client, so a
+public page that answers with a private `Location` is refused at the hop it appears on, not fetched
+one request later.
+
+That guard only applies to URLs the model chose. A search vendor's own redirects (an http→https
+upgrade, a moved path, a CDN hop) are not requests to an address this process picked, so there is
+nothing for the guard to re-check hop by hop — `redirect_following_http_client` builds the ordinary,
+redirect-following client the search providers use instead, so a vendor's routine 301/308 does not
+fail the whole tool call.
 
 ## Search Providers
 

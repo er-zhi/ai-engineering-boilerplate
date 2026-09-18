@@ -44,7 +44,9 @@ message SendTurnRequest {
 }
 message SendTurnResponse {
   reserved 1; // was the first routed topic_id, before a turn could reach several topics
-  repeated string topic_ids = 2; // every topic the classifier routed this turn to
+  // Empty means the turn was accepted but started no topic — the shape a clarification returns,
+  // not an error.
+  repeated string topic_ids = 2; // every topic the routing decision routed this turn to
 }
 
 message GetSessionRequest {}

@@ -28,7 +28,10 @@ pub struct DeclarativeRow {
 }
 
 /// Reads and fully validates a file before anything reaches the database: one bad row refuses the
-/// whole file rather than leaving a half-loaded registry.
+/// whole file rather than leaving a half-loaded registry. This runs the exact same bounds
+/// `NewTool::checked` enforces for a user-submitted tool — a declarative row gets no separate,
+/// weaker rulebook, and neither does the update path in `update_declarative_tool`, which applies no
+/// bounds of its own and instead relies entirely on every row having passed here first.
 pub fn read_rows(raw: &str) -> Result<Vec<DeclarativeRow>, String> {
     let rows: Vec<DeclarativeRow> =
         serde_json::from_str(raw).map_err(|error| format!("could not be read as JSON: {error}"))?;
@@ -43,8 +46,27 @@ pub fn read_rows(raw: &str) -> Result<Vec<DeclarativeRow>, String> {
         seen.push(&row.slug);
         crate::tools::declarative::parse_sources(&row.sources, &row.input_schema)
             .map_err(|error| format!("{}: {error}", row.slug))?;
+        checked_declarative_row(row).map_err(|error| format!("{}: {error}", row.slug))?;
     }
     Ok(rows)
+}
+
+/// Builds (and discards) the `NewTool` a row would become, purely for the validation
+/// `NewTool::checked` performs: non-empty slug/name/description within their length bounds,
+/// `input_schema` an object, and `timeout_seconds` within range. `create_and_activate_declarative_tool`
+/// builds the real one later; this call only ever needs its `Result`.
+fn checked_declarative_row(row: &DeclarativeRow) -> Result<(), String> {
+    NewTool::checked(
+        row.slug.clone(),
+        row.name.clone(),
+        row.description.clone(),
+        row.input_schema.clone(),
+        serde_json::from_str(DECLARATIVE_OUTPUT_SCHEMA).expect("a fixed literal always parses"),
+        Risk::ReadOnly,
+        row.timeout_seconds,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Upserts every row as an Active system tool. These are operator-supplied definitions, so they skip
@@ -177,6 +199,14 @@ mod tests {
         let stolen = ONE_ROW.replace("example_reading", crate::slugs::WEB_FETCH);
         let error = read_rows(&stolen).expect_err("a system slug may not be taken");
         assert!(error.contains(crate::slugs::WEB_FETCH), "{error}");
+    }
+
+    #[test]
+    fn a_row_with_an_out_of_range_timeout_is_refused_before_any_row_loads() {
+        let broken = ONE_ROW.replace(r#""timeout_seconds": 8"#, r#""timeout_seconds": 0"#);
+        let error = read_rows(&broken)
+            .expect_err("timeout_seconds must be within NewTool::checked's bounds");
+        assert!(error.contains("example_reading"), "{error}");
     }
 
     #[test]

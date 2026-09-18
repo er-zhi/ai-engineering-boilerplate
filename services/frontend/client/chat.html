@@ -384,6 +384,11 @@
       let payload = {};
       try { payload = JSON.parse(event.payloadJson || "{}"); } catch { payload = {}; }
       if (event.kind === CLARIFICATION_NEEDED) {
+        // The user's own message never became a stored `chat.messages` row — a clarified turn
+        // starts no topic — so it only ever reaches the transcript through this payload. Without
+        // it, a reload rebuilds from `messages` and shows the assistant's reply with nothing above
+        // it.
+        appendMessage("you", payload.content || "");
         appendMessage("assistant", payload.text || "");
         return;
       }

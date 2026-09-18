@@ -29,7 +29,7 @@ impl BraveSearchProvider {
         Self {
             api_key,
             base_url,
-            client: crate::service::bounded_http_client().expect("client"),
+            client: crate::service::redirect_following_http_client().expect("client"),
         }
     }
 }
@@ -106,6 +106,60 @@ mod tests {
         let address = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
         format!("http://{address}/res/v1/web/search")
+    }
+
+    async fn redirect_301(location: &'static str) -> impl axum::response::IntoResponse {
+        (
+            axum::http::StatusCode::MOVED_PERMANENTLY,
+            [(axum::http::header::LOCATION, location)],
+        )
+    }
+
+    async fn fake_brave_unconditional() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "web": {"results": [{"title": "Async traits", "url": "https://example.com/a", "description": "A guide."}]}
+        }))
+    }
+
+    // Proves the provider's client follows a vendor's own 301 rather than failing on it: a search
+    // endpoint answering an http→https upgrade, a moved path, or a CDN hop must still yield results,
+    // not `"brave search returned 301 Moved Permanently"`.
+    async fn serve_via_301_redirect() -> String {
+        let app = axum::Router::new()
+            .route(
+                "/old",
+                axum::routing::get(|| redirect_301("/res/v1/web/search")),
+            )
+            .route(
+                "/res/v1/web/search",
+                axum::routing::get(fake_brave_unconditional),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}/old")
+    }
+
+    #[tokio::test]
+    async fn a_301_redirect_to_the_real_endpoint_is_followed() {
+        let url = serve_via_301_redirect().await;
+        let provider = BraveSearchProvider::with_base_url("fake-key".to_owned(), url);
+
+        let results = provider
+            .search("rust async traits", 5)
+            .await
+            .expect("a 301 hop should be followed, not treated as a failed request");
+
+        assert_eq!(
+            results,
+            vec![SearchResult {
+                title: "Async traits".to_owned(),
+                url: "https://example.com/a".to_owned(),
+                snippet: "A guide.".to_owned(),
+            }]
+        );
     }
 
     #[tokio::test]

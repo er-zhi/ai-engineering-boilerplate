@@ -55,6 +55,7 @@ impl TopicManager {
                         .with_payload(serde_json::json!({
                             "text": crate::intent::CLARIFICATION_TEXT,
                             "turn_id": turn_id,
+                            "content": content,
                         })),
                 )
                 .await;
@@ -298,6 +299,15 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(crate::intent::CLARIFICATION_TEXT)
         );
+        assert_eq!(
+            event
+                .payload
+                .get("content")
+                .and_then(serde_json::Value::as_str),
+            Some("hey"),
+            "the user's own message must ride along, or a reload has nothing to show above the \
+             assistant's clarification"
+        );
         let (_focus, topics) = harness
             .manager
             .session
@@ -305,6 +315,27 @@ mod tests {
             .await
             .expect("view");
         assert!(topics.is_empty());
+
+        // The guarantee has to survive a reconnect, not just live on the bus: a client that was
+        // never subscribed rebuilds the transcript from what `chat.events` actually stored.
+        let session = harness
+            .manager
+            .session_of_user(OWNER)
+            .await
+            .expect("session");
+        let stored = harness
+            .manager
+            .stored_events(&session)
+            .await
+            .expect("replay")
+            .into_iter()
+            .find(|stored| stored.kind == TopicEventKind::ClarificationNeeded)
+            .expect("the clarification must have been persisted, not just published live");
+        assert_eq!(stored.topic_id, None);
+        assert_eq!(
+            TopicEventKind::from_column("clarification_needed"),
+            Some(TopicEventKind::ClarificationNeeded)
+        );
     }
 
     #[test]
@@ -683,7 +714,7 @@ mod tests {
         assert_eq!(
             Some(ExecutionInput::in_state(&state).question.as_str()),
             Some("What is Claude Code?"),
-            "the classifier's self-contained question is what the worker is given"
+            "the routing decision's self-contained question is what the worker is given"
         );
     }
 
@@ -755,7 +786,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_classifier_failure_falls_back_to_continuing_the_focused_topic() {
+    async fn a_routing_decision_failure_falls_back_to_continuing_the_focused_topic() {
         let (_test, manager, fake, router) = manager_with_router().await;
         let user_id = Uuid::new_v4();
         let (topic_id, _) = manager
@@ -770,7 +801,7 @@ mod tests {
         let routed = manager
             .send_turn(user_id, Uuid::new_v4(), "and which IDEs?".into())
             .await
-            .expect("a classifier outage must not fail the turn");
+            .expect("a routing decision outage must not fail the turn");
 
         assert_eq!(routed, vec![topic_id]);
         assert_eq!(fake.interrupt_count(), 1);

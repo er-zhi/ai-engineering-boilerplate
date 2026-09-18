@@ -235,34 +235,34 @@ mod tests {
             "fan_out": 3,
             "take": 2,
             "sources": [
-                {"name": "one", "url": "https://example.com/?q={city}", "pick": "current.temp"},
-                {"name": "two", "url": "https://example.org/{city}", "pick": "temp"}
+                {"name": "one", "url": "https://example.com/?q={place}", "pick": "reading.value"},
+                {"name": "two", "url": "https://example.org/{place}", "pick": "value"}
             ]
         });
         let set =
-            parse_sources(&raw, &schema_with(json!({"city": {"type": "string"}}))).expect("parse");
+            parse_sources(&raw, &schema_with(json!({"place": {"type": "string"}}))).expect("parse");
         assert_eq!(set.fan_out, 3);
         assert_eq!(set.take, 2);
         assert_eq!(set.sources.len(), 2);
-        assert_eq!(set.sources[0].pick, "current.temp");
+        assert_eq!(set.sources[0].pick, "reading.value");
     }
 
     #[test]
     fn a_placeholder_the_input_schema_does_not_declare_is_refused() {
         let raw = json!({
             "fan_out": 1, "take": 1,
-            "sources": [{"name": "one", "url": "https://example.com/?q={region}", "pick": "temp"}]
+            "sources": [{"name": "one", "url": "https://example.com/?q={elsewhere}", "pick": "value"}]
         });
-        let error = parse_sources(&raw, &schema_with(json!({"city": {"type": "string"}})))
-            .expect_err("region is not an input field");
-        assert!(error.contains("region"), "{error}");
+        let error = parse_sources(&raw, &schema_with(json!({"place": {"type": "string"}})))
+            .expect_err("elsewhere is not an input field");
+        assert!(error.contains("elsewhere"), "{error}");
     }
 
     #[test]
     fn take_larger_than_the_sources_is_refused() {
         let raw = json!({
             "fan_out": 1, "take": 4,
-            "sources": [{"name": "one", "url": "https://example.com/", "pick": "temp"}]
+            "sources": [{"name": "one", "url": "https://example.com/", "pick": "value"}]
         });
         let error = parse_sources(&raw, &schema_with(json!({}))).expect_err("take exceeds sources");
         assert!(error.contains("take"), "{error}");
@@ -278,9 +278,9 @@ mod tests {
     fn an_unclosed_placeholder_is_refused() {
         let raw = json!({
             "fan_out": 1, "take": 1,
-            "sources": [{"name": "one", "url": "https://example.com/{city", "pick": "temp"}]
+            "sources": [{"name": "one", "url": "https://example.com/{place", "pick": "value"}]
         });
-        let error = parse_sources(&raw, &schema_with(json!({"city": {"type": "string"}})))
+        let error = parse_sources(&raw, &schema_with(json!({"place": {"type": "string"}})))
             .expect_err("unclosed placeholder");
         assert!(error.contains("one"), "{error}");
     }
@@ -290,8 +290,8 @@ mod tests {
         let raw = json!({
             "fan_out": 2, "take": 1,
             "sources": [
-                {"name": "dup", "url": "https://example.com/a", "pick": "temp"},
-                {"name": "dup", "url": "https://example.com/b", "pick": "temp"}
+                {"name": "dup", "url": "https://example.com/a", "pick": "value"},
+                {"name": "dup", "url": "https://example.com/b", "pick": "value"}
             ]
         });
         let error = parse_sources(&raw, &schema_with(json!({}))).expect_err("duplicate names");
@@ -310,48 +310,47 @@ mod tests {
 
     #[test]
     fn fill_refuses_an_unclosed_placeholder_rather_than_diverging_from_parse_sources() {
-        let error = fill("https://example.com/{city", &json!({"city": "x"})).expect_err("unclosed");
+        let error =
+            fill("https://example.com/{place", &json!({"place": "x"})).expect_err("unclosed");
         assert!(error.contains('{'), "{error}");
     }
 
     #[test]
     fn a_filled_value_is_url_encoded() {
         let filled = fill(
-            "https://example.com/?q={city}",
-            &json!({"city": "San Francisco & Oakland"}),
+            "https://example.com/?q={place}",
+            &json!({"place": "Example Place & Other"}),
         )
         .expect("fill");
         assert_eq!(
             filled,
-            "https://example.com/?q=San%20Francisco%20%26%20Oakland"
+            "https://example.com/?q=Example%20Place%20%26%20Other"
         );
     }
 
     #[test]
     fn a_missing_input_value_names_the_field_it_wanted() {
-        let error = fill("https://example.com/?q={city}", &json!({})).expect_err("no city");
-        assert!(error.contains("city"), "{error}");
+        let error = fill("https://example.com/?q={place}", &json!({})).expect_err("no place");
+        assert!(error.contains("place"), "{error}");
     }
 
     #[test]
     fn a_number_input_fills_without_its_json_quotes() {
-        let filled = fill("https://example.com/?lat={lat}", &json!({"lat": 37.77})).expect("fill");
-        assert_eq!(filled, "https://example.com/?lat=37.77");
+        let filled =
+            fill("https://example.com/?v={coord}", &json!({"coord": 37.77})).expect("fill");
+        assert_eq!(filled, "https://example.com/?v=37.77");
     }
 
     #[test]
     fn a_dotted_path_reaches_a_nested_value() {
-        let body = json!({"current": {"temperature_2m": 14.2}});
-        assert_eq!(
-            pick_value(&body, "current.temperature_2m"),
-            Some(json!(14.2))
-        );
+        let body = json!({"reading": {"value": 14.2}});
+        assert_eq!(pick_value(&body, "reading.value"), Some(json!(14.2)));
     }
 
     #[test]
     fn a_path_that_is_not_there_is_none_rather_than_null() {
-        let body = json!({"current": {"temperature_2m": 14.2}});
-        assert_eq!(pick_value(&body, "current.humidity"), None);
+        let body = json!({"reading": {"value": 14.2}});
+        assert_eq!(pick_value(&body, "reading.other"), None);
     }
 
     async fn serve(body: serde_json::Value) -> String {

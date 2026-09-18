@@ -29,7 +29,7 @@ impl YouSearchProvider {
         Self {
             api_key,
             base_url,
-            client: crate::service::bounded_http_client().expect("client"),
+            client: crate::service::redirect_following_http_client().expect("client"),
         }
     }
 }

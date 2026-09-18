@@ -43,12 +43,29 @@ pub const MIN_TIMEOUT_SECONDS: i32 = 1;
 pub const MAX_TIMEOUT_SECONDS: i32 = 300;
 const DEFAULT_TOOL_HTTP_TIMEOUT: Duration = Duration::from_secs(MAX_TIMEOUT_SECONDS as u64);
 
+fn tool_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().timeout(DEFAULT_TOOL_HTTP_TIMEOUT)
+}
+
+/// The guarded client behind `get_guarded`: `self.http`, `web_fetch`'s `fetch`/`fetch_richest`, and a
+/// declarative source's `ask` all send through this one, and their whole design assumes it is handed
+/// each 3xx hop raw so `get_guarded` can re-check the SSRF guard against the next target itself —
+/// under the default policy reqwest would already have followed the hop before this code ever saw
+/// it. Search providers do **not** use this client; see `redirect_following_http_client` for why.
 pub fn bounded_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(DEFAULT_TOOL_HTTP_TIMEOUT)
-        // No automatic redirects: `tools::web_fetch::get_guarded` re-checks the SSRF guard against
-        // every hop itself, which only works if reqwest hands each 3xx back instead of following it.
+    tool_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("could not build the outbound http client: {error}"))
+}
+
+/// The client behind `AnySearchProvider`. A search vendor's own redirects (an http→https upgrade, a
+/// moved path, a CDN hop) are not requests to an address this process chose, so there is nothing for
+/// an SSRF guard to re-check on each hop — reqwest is left to follow them itself, the way any HTTP
+/// client normally would. Handing a search provider the no-redirect `bounded_http_client` instead
+/// turns a vendor's ordinary 301/308 into a hard failure of the whole tool call.
+pub fn redirect_following_http_client() -> Result<reqwest::Client, String> {
+    tool_http_client_builder()
         .build()
         .map_err(|error| format!("could not build the outbound http client: {error}"))
 }
@@ -144,7 +161,11 @@ impl Service {
                 client_config.clone(),
             ),
             decider: SystemOneServiceClient::new(HttpClient::plaintext_http2_only(), client_config),
-            search: AnySearchProvider::from_api_keys(you_api_key, brave_api_key, http.clone()),
+            search: AnySearchProvider::from_api_keys(
+                you_api_key,
+                brave_api_key,
+                redirect_following_http_client()?,
+            ),
             http,
             kb: KnowledgeBaseClient::new(knowledge_base_url)?,
         })

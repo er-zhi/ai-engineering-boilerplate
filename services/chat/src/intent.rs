@@ -21,9 +21,10 @@ use crate::topic_status::status_word;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_TITLE_CHARS: usize = 60;
 
-/// Asking a person to repeat themselves is cheap; telling them nothing while an agent burns a
-/// minute on a greeting is not. So this threshold is high: below it we clarify, and being wrong
-/// costs one extra exchange.
+/// Getting this wrong is not symmetric: asking a person to repeat themselves costs one extra
+/// exchange, while letting an agent execution run a full minute on a bare greeting costs the whole
+/// exchange. So the turn only stops short once the model is fairly confident (under 35%) that it
+/// carries no request at all, rather than clarifying at the first sign of doubt.
 const ACTIONABLE_THRESHOLD: f64 = 0.35;
 /// Below this the model cannot separate the options at all, and the deterministic focus rule is a
 /// better answer than its guess.
@@ -488,7 +489,7 @@ mod tests {
     fn topics() -> Vec<TopicSummary> {
         vec![TopicSummary {
             id: 7,
-            title: "Weather in San Francisco today".to_owned(),
+            title: "An earlier topic, still running".to_owned(),
             status: crate::entity::topic::Status::Running,
             result_summary: None,
         }]
