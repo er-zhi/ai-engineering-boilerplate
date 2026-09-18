@@ -10,7 +10,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::entity::execution::TERMINAL_STATUSES;
-use crate::entity::{checkpoint, execution};
+use crate::entity::{checkpoint, execution, pending_input};
 
 pub async fn sweep_terminal(
     db: &DatabaseConnection,
@@ -38,6 +38,15 @@ pub async fn sweep_terminal(
 
     checkpoint::Entity::delete_many()
         .filter(checkpoint::Column::ExecutionId.is_in(ids.clone()))
+        .exec(&txn)
+        .await?;
+    // `commit_step` already deletes a row the moment it is drained (applied or discarded), so
+    // this normally finds nothing. It exists for the one case that path cannot close: input
+    // queued in the narrow window between the commit that finishes an execution and the moment
+    // that commit is visible. Without this, such a row would have no execution left to join
+    // against once the row below deletes it, and would sit orphaned forever.
+    pending_input::Entity::delete_many()
+        .filter(pending_input::Column::ExecutionId.is_in(ids.clone()))
         .exec(&txn)
         .await?;
     let deleted = execution::Entity::delete_many()

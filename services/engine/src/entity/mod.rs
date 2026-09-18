@@ -3,4 +3,5 @@
 pub mod checkpoint;
 pub mod execution;
 pub mod graph;
+pub mod pending_input;
 pub mod schedule;
