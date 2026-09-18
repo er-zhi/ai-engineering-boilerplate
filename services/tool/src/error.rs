@@ -12,6 +12,12 @@ pub enum ToolError {
     Db(#[from] sea_orm::DbErr),
     #[error("invalid json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A `Decide` call that failed for a reason that is ours or the vendor's, not the caller's —
+    /// a transient fault, a deployment-side problem, an unreachable decider. Kept distinct from
+    /// `InvalidRequest` so a submitter is never told to fix a definition that was never actually
+    /// reviewed: see `services/tool/src/service.rs`'s `decide_call_error`.
+    #[error("tool review is unavailable: {0}")]
+    ReviewUnavailable(String),
 }
 
 pub const INTERNAL_MESSAGE_WITHOUT_STORAGE_DETAIL: &str = "the request could not be completed";
@@ -25,6 +31,7 @@ impl From<ToolError> for ConnectError {
                 tracing::error!(%error, "tool service internal error");
                 ConnectError::internal(INTERNAL_MESSAGE_WITHOUT_STORAGE_DETAIL)
             }
+            ToolError::ReviewUnavailable(_) => ConnectError::unavailable(error.to_string()),
         }
     }
 }
