@@ -2,6 +2,8 @@
 // question, raced through `crate::race`. Nothing here knows what any of them is about — the subject
 // lives in the row's description, the same place a user-created tool's does.
 
+use std::collections::HashSet;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -47,8 +49,20 @@ pub fn parse_sources(raw: &Value, input_schema: &Value) -> Result<SourceSet, Str
         return Err("fan_out must be at least 1".to_owned());
     }
     let declared = declared_fields(input_schema);
+    let mut seen_names = HashSet::new();
     for source in &set.sources {
-        for field in placeholders(&source.url) {
+        if !seen_names.insert(source.name.as_str()) {
+            return Err(format!(
+                "source name {:?} is used more than once",
+                source.name
+            ));
+        }
+        if source.pick.is_empty() {
+            return Err(format!("source {:?} has an empty pick", source.name));
+        }
+        let fields = placeholders(&source.url)
+            .map_err(|error| format!("source {:?}: {error}", source.name))?;
+        for field in fields {
             if !declared.contains(&field) {
                 return Err(format!(
                     "source {:?} uses {{{field}}}, which input_schema does not declare",
@@ -68,7 +82,10 @@ fn declared_fields(input_schema: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn placeholders(template: &str) -> Vec<String> {
+/// Scans out every `{field}` placeholder. An unclosed `{` is refused rather than silently
+/// dropped — otherwise the literal brace reaches the HTTP layer unsubstituted, and only the
+/// first caller who trips it finds out.
+fn placeholders(template: &str) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     let mut rest = template;
     while let Some(start) = rest.find(PLACEHOLDER_OPEN) {
@@ -78,10 +95,10 @@ fn placeholders(template: &str) -> Vec<String> {
                 found.push(after[..end].to_owned());
                 rest = &after[end + PLACEHOLDER_CLOSE.len_utf8()..];
             }
-            None => break,
+            None => return Err(format!("{template:?} has a {{ with no closing }}")),
         }
     }
-    found
+    Ok(found)
 }
 
 /// Substitutes every `{field}` from `input`, percent-encoding the value. A field the caller did not
@@ -89,7 +106,7 @@ fn placeholders(template: &str) -> Vec<String> {
 /// return a plausible-looking answer about somewhere else.
 pub fn fill(template: &str, input: &Value) -> Result<String, String> {
     let mut filled = template.to_owned();
-    for field in placeholders(template) {
+    for field in placeholders(template)? {
         let value = input
             .get(&field)
             .ok_or_else(|| format!("input does not carry {field:?}"))?;
@@ -169,6 +186,46 @@ mod tests {
     fn an_empty_source_list_is_refused() {
         let raw = json!({"fan_out": 1, "take": 1, "sources": []});
         assert!(parse_sources(&raw, &schema_with(json!({}))).is_err());
+    }
+
+    #[test]
+    fn an_unclosed_placeholder_is_refused() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://example.com/{city", "pick": "temp"}]
+        });
+        let error = parse_sources(&raw, &schema_with(json!({"city": {"type": "string"}})))
+            .expect_err("unclosed placeholder");
+        assert!(error.contains("one"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_source_names_are_refused() {
+        let raw = json!({
+            "fan_out": 2, "take": 1,
+            "sources": [
+                {"name": "dup", "url": "https://example.com/a", "pick": "temp"},
+                {"name": "dup", "url": "https://example.com/b", "pick": "temp"}
+            ]
+        });
+        let error = parse_sources(&raw, &schema_with(json!({}))).expect_err("duplicate names");
+        assert!(error.contains("dup"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_pick_is_refused() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://example.com/", "pick": ""}]
+        });
+        let error = parse_sources(&raw, &schema_with(json!({}))).expect_err("empty pick");
+        assert!(error.contains("pick"), "{error}");
+    }
+
+    #[test]
+    fn fill_refuses_an_unclosed_placeholder_rather_than_diverging_from_parse_sources() {
+        let error = fill("https://example.com/{city", &json!({"city": "x"})).expect_err("unclosed");
+        assert!(error.contains('{'), "{error}");
     }
 
     #[test]
