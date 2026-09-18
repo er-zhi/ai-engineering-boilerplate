@@ -9,26 +9,56 @@ everything about actually running a graph.
 ## Topics Are Produced, Never Created
 
 There is deliberately no "new topic" control. The user creates **sessions**, and every message they
-type goes through one low-tier llm-router call (`classifier.rs`) that decides, from the session's
-existing topics and the current focus, whether the turn continues a topic or opens one — or several.
-A first message naming two unrelated subjects opens two root topics; a mid-conversation aside opens
-one more beside the running one; anything else continues an existing topic, which is still the
-common case.
+type is routed by one `SystemOneService.Decide` call (`intent.rs`, `TopicIntent::route`) carrying
+three typed questions about the new message, answered together in a single round trip because a
+second question on the same call is far cheaper than a second one:
 
-The classifier returns a list of actions, and nothing else is a valid answer:
+- **`route`** — asked only once the session already holds topics: which existing topic, if any, the
+  message continues, or whether it opens a new one instead. Read **first**, and that ordering is
+  load-bearing, not incidental: putting `route` ahead of `actionable` means a bare fragment that
+  plainly continues a live topic — "and?", "i'm still waiting" — is pinned to that topic before
+  anything asks whether it carries a request of its own, so it is never interrogated for one. Below
+  `ROUTE_CONFIDENCE_THRESHOLD` (0.5) the model cannot separate the options at all, and the
+  deterministic fallback below is a better answer than its guess.
+- **`actionable`** — does the message, alone, carry a request to act on. Below
+  `ACTIONABLE_THRESHOLD` (0.35) the turn is clarified instead of acted on; at or above it, it
+  proceeds. Getting this wrong is not symmetric: asking a person to repeat themselves costs one
+  extra exchange, while letting an agent execution run a full minute on a bare greeting costs the
+  whole exchange — so the turn only stops short once the model is fairly confident (under 35%) that
+  it carries no request at all, rather than clarifying at the first sign of doubt.
+- **`separate_themes`** — does the message raise more than one independent theme. Above
+  `SEPARATE_THEMES_THRESHOLD` (0.75) it is split into one topic per theme. Splitting a message that
+  actually holds a single theme costs a completion and leaves two half-topics behind, so this one
+  asks for real certainty.
+
+`separate_themes` is also the **only** branch that still spends an `llm-router` `Complete` call.
+Continuing a topic, opening one fresh topic from the message verbatim, and clarifying are all read
+straight off the typed `Decide` answer at zero extra cost — an approval needs no prose. Only a
+confident split needs the model to actually write out each theme's own `title` and `question`:
 
 ```json
-{"actions": [{"kind": "continue", "topic_id": 123},
+{"actions": [{"kind": "new", "title": "…", "question": "…"},
              {"kind": "new", "title": "…", "question": "…"}]}
 ```
 
-**Classification is advisory, never load-bearing.** Every failure mode — an unreachable router, a
-non-JSON answer, a hallucinated topic id that is not in the session — falls back to continuing the
-focused topic, or to opening one topic from the message itself when the session is empty. That
-fallback is the deterministic behaviour the service had before the classifier existed, so a turn is
-never lost to a bad classification. The parse is correspondingly forgiving: a fenced block, a bare
-object, or an object with commentary after it all have to work, because a low-tier model does not
-reliably emit only JSON.
+The parse is forgiving on purpose — a fenced block, a bare object, or an object with commentary
+after it all have to work — because a low-tier model does not reliably emit only JSON, and `split` is
+the one path here still asking one to.
+
+**Classification is advisory, never load-bearing.** Every failure mode — an unreachable decider, a
+call that returns no answers, a `route` naming a topic id that is not in the session, a `split` that
+fails to parse — falls back to continuing the focused topic, or to opening one topic from the
+message itself when the session is empty. That fallback (`intent::fallback`) is the deterministic
+behaviour the service had before any decision existed, so a turn is never lost to a bad or missing
+classification.
+
+**A clarification is the single load-bearing outcome.** When `actionable` comes back low and nothing
+routed, `send_turn` publishes a session-wide `CLARIFICATION_NEEDED` event and returns: no topic is
+created and no Engine execution starts. Critically, **no message row is written** for it either.
+`already_delivered` recognizes a turn as delivered by finding a message row keyed on its `turn_id`,
+and a clarified turn leaves none — so a client retry that reuses the same `turn_id` runs the routing
+decision again rather than replaying a stale answer. That is the same idempotence every other turn
+gets from its recorded message, produced here by recording nothing at all.
 
 `question` is not decoration. It is the self-contained restatement of what the topic is about, and
 it is the **only** state key the agent graph's prompt actually reads — `engine-core`'s prompt
@@ -238,7 +268,7 @@ not persisted: the row would land in the log of a session that was just deleted,
 There are two status spellings, not three. `chat.topics.status` is a smallint, `chat.v1.TopicStatus`
 is the contract, and `status_proto` in `topic_status.rs` is the one exhaustive match between them —
 so a status added to the column does not compile until the wire knows about it too. Wherever a
-status needs a *word* — the classifier prompt, a terminal `notification` — `status_word` takes the
+status needs a *word* — the turn-routing decision's state, a terminal `notification` — `status_word` takes the
 proto enum's declared name and drops its `TOPIC_STATUS_` prefix. There is no hand-written table of
 `"running"`, `"completed"`, `"cancelled"` anywhere, so none can be forgotten.
 
@@ -282,7 +312,7 @@ written against the two halves above: `GetSession` is the snapshot, `StreamEvent
 each line is tagged with the topic it belongs to — the Claude Code model, where background work
 reports back into the one conversation rather than into a pane of its own. The tag always names the
 **root** conversation, never a child's own synthesized title: a child topic is more turns in the same
-thread, so its label must not flip to whatever the classifier called the follow-up.
+thread, so its label must not flip to whatever the routing decision called the follow-up.
 
 **Ordering is `(at, sequence)` and nothing else.** A user turn sits at its message's `created_at`; a
 topic's acknowledgement sits at its *first* message's `created_at`, so it lands right behind the turn
@@ -318,8 +348,8 @@ each pane owns its own scrollbar, which requires `min-height: 0` on every ancest
 pane — a flex item's default `min-height: auto` refuses to shrink below its content and would push
 the page past `100vh`. Clicking a topic row moves the server's focus and highlights it; the
 transcript is session-wide and does not change. When the last unfinished topic completes the server
-clears focus, so the page falls back to the newest topic for the highlight only — the classifier, not
-that pointer, decides where the next turn lands.
+clears focus, so the page falls back to the newest topic for the highlight only — the routing
+decision, not that pointer, decides where the next turn lands.
 
 ## Input Limits
 
@@ -328,7 +358,7 @@ Checked once, at the RPC entry, so everything behind it takes values it can trus
 | Value | Limit | Why here |
 |---|---|---|
 | `CreateTopicRequest.input_json` | `MAX_INPUT_JSON_BYTES`, and must be a JSON **object** | Merged into an Engine execution's initial state, which rejects a non-object |
-| `SendTurnRequest.content` | `MAX_CONTENT_CHARS` | Long enough for a pasted stack trace, short enough that a runaway client cannot push an unbounded string through the classifier prompt and into `chat.messages` |
+| `SendTurnRequest.content` | `MAX_CONTENT_CHARS` | Long enough for a pasted stack trace, short enough that a runaway client cannot push an unbounded string through the routing decision and into `chat.messages` |
 | `CreateTopicRequest.title` | `MAX_TITLE_CHARS` | The width of `chat.topics.title`; past it, an `invalid_argument` naming the limit rather than a 500 out of Postgres |
 
 Each of those is also the width of the column behind it, from the same constant: `MAX_CONTENT_CHARS`

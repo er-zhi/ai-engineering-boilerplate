@@ -76,6 +76,8 @@ Reasoning models can spend the completion budget on hidden reasoning tokens befo
 
 A System One model does not generate text. It reads a **state** and answers **typed questions** about it with calibrated probabilities, so the decision lands in your code as a number rather than as prose to parse. Use it where an `if` needs a judgement it cannot compute: routing, triage, gating, ranking. Use `Complete` when you actually want words.
 
+Two callers use it today, and each still reaches for `Complete` only on the one branch that needs prose: Chat's `intent.rs` calls `Decide` once per turn to route it onto a topic, and falls to `Complete` only to write out the several `title`/`question` pairs a multi-theme split needs; Tool's `validate_tool` calls `Decide` to approve or refuse a submitted tool definition, and calls `Complete` only to explain a refusal.
+
 [`SystemOneService`](../../common/proto/llm_router/v1/llm_router.proto) serves the class:
 
 - `Decide` — one state, one or more questions, one answer per question.

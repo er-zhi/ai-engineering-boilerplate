@@ -6,18 +6,28 @@ catalog, injects it into the model's prompt, and calls `Execute` when the model 
 ## Capabilities, Not Topics
 
 Tools are verbs, never subjects. `web_search`, `web_fetch`, `kb_search` and `kb_read_document` are
-the four system tools, and that list does not grow when a new subject area comes up — a `weather` or
-`stock_quote` tool would be `web_fetch` with a topic glued on, answering one question and leaving
-every neighbouring one unanswered. Nothing here matches on what the user is asking about, and no
-tool description names a vendor: `web_search` is described by what it returns, not by which backend
-happens to be configured.
+the four system tools compiled into this binary, and that list does not grow when a new subject area
+comes up. Nothing here matches on what the user is asking about, and no tool description names a
+vendor: `web_search` is described by what it returns, not by which backend happens to be configured.
 
-`web_fetch` takes several URLs, fetches them concurrently, and returns the one carrying the most
-readable text. Public pages holding the same fact are individually unreliable — one 403s a
-datacentre IP, another is a JavaScript shell that extracts to nothing, a third is slow — so an agent
-handed a single URL spends a whole turn per failure. Fetching the candidates together costs one turn
-whatever any single source does, and a total failure returns one error listing every reason, so the
-model can tell "try other pages" from "this needs a different search".
+A live external fact still has to come from somewhere, and this service draws a hard line around
+where that "somewhere" gets decided. The code supplies capabilities — a fetch, a race, an executor
+for a row of endpoints — and a subject reaches the system only as a registry row an **operator**
+writes into a file outside the repository (`DECLARATIVE_TOOLS_PATH`, see "Declarative Tools" below).
+A fresh clone therefore ships the executor and no subjects at all: that is the intended state, not a
+step someone forgot. `CreateTool`, the RPC a user or an agent calls to define a new tool, does not
+accept a `sources` field — only an operator writing to that file can wire up a race of endpoints; a
+tool submission never can. Letting arbitrary outbound HTTP be driven by end-user input is its own
+SSRF and quota decision, a different and larger one than an operator vetting a file before it ever
+reaches the container.
+
+`web_fetch` takes several URLs and races them through the shared `race` primitive (below), returning
+the one carrying the most readable text. Public pages holding the same fact are individually
+unreliable — one 403s a datacentre IP, another is a JavaScript shell that extracts to nothing, a
+third is slow — so an agent handed a single URL spends a whole turn per failure. Fetching the
+candidates together costs one turn whatever any single source does, and a total failure returns one
+error listing every reason, so the model can tell "try other pages" from "this needs a different
+search".
 
 Returning the fullest page rather than the fastest is deliberate. Whoever answers first is decided
 by network latency, which has nothing to do with whether the page holds the answer: a marketing
@@ -66,6 +76,15 @@ untrusted input is the model's URL, so the check belongs where that input arrive
 `fetch()`'s own tests talk to a loopback server. Every candidate URL is checked before any request
 goes out, not one at a time as they are tried.
 
+That covers the first hop. A redirect is a second request to an address nothing has checked yet, so
+`get_guarded` (`tools/web_fetch.rs`) follows redirects by hand and re-applies `ensure_public_url` to
+every `Location` before following it, rather than trusting an automatic redirect to stay inside the
+guard. `bounded_http_client` builds the one shared client with `Policy::none()` for exactly this
+reason — under the default policy reqwest would already have followed the hop before this code ever
+saw the target. `fetch()`, `fetch_richest()`, and a declarative source's request (`declarative::ask`)
+all go through `get_guarded`, so a public page that answers with a private `Location` is refused at
+the hop it appears on, not fetched one request later.
+
 ## Search Providers
 
 One trait, two implementations, chosen by which key is configured — You.com first, then Brave, then
@@ -104,9 +123,35 @@ emits no index at all, so the constraint silently does not exist.
 - `KNOWLEDGE_BASE_URL`, `LLM_ROUTER_URL`
 - `YOU_SEARCH_API_KEY` or `BRAVE_SEARCH_API_KEY` (optional; without either, `web_search` returns a
   "not configured" error rather than failing at startup)
+- `DECLARATIVE_TOOLS_PATH` (optional; unset, the service starts with no declarative tools loaded —
+  see "Declarative Tools" below for the row shape and the Compose override that mounts it)
 
 Every outbound HTTP call is bounded: one client is built with a default timeout in one place and
 injected, and `Execute` narrows it to the tool row's own `timeout_seconds`.
+
+## `race`
+
+`race` (`src/race.rs`) is the primitive both `web_fetch` and Declarative Tools run on: hand it a
+slice of operation *factories*, and it starts `fan_out` of them at once, keeps the first `take` that
+succeed, and drops whatever is still running the moment that quorum is reached. It knows nothing
+about HTTP, URLs, or what any operation is about — it is the shape of "several ways to get the same
+thing," reused wherever that shape shows up.
+
+Operations are factories, not futures. A future that has already resolved — or been cancelled at its
+own timeout — cannot be polled a second time, so starting the next candidate once a slot frees up
+needs a fresh attempt, not the same value reused. `fan_out` is the width: how many operations run at
+once, with the rest waiting as reserve and starting only when a running one finishes, fails, or times
+out. `take` is the quorum: how many successes are enough. Reaching it drops the whole set of
+in-flight futures at once, which cancels them where they stand rather than waiting them out — a slow
+or hanging operation never holds up an answer the others already gave.
+
+`race` returns an `Outcome`, not a `Result`: fewer than `take` successes, with the rest genuinely
+failed, is a normal outcome a caller reasons about, not an error that unwinds. `taken` carries up to
+`take` `(name, value)` pairs in arrival order; `failures` names every operation that ran and did not
+succeed, one `"name: reason"` per attempt — an operation still in flight when the quorum was reached
+is cancelled and has no verdict, so it appears in neither list. The name a caller gives an operation
+is a borrowed `&str`, carried through to `Outcome` and never owned or leaked, because both
+`fetch_richest` and a declarative row's `run` build one of these fresh per execution.
 
 ## Declarative Tools
 
@@ -124,9 +169,42 @@ logged and none of the file is loaded, rather than loading the rows that did par
 
 Each row is `{slug, name, description, timeout_seconds, input_schema, sources}`; `sources` is the
 shape `crate::tools::declarative::parse_sources` checks — `fan_out`, `take`, and a list of
-`{name, url, pick}` sources, where `{field}` in a `url` is filled from `input_schema`'s declared
-properties. A slug already reserved for a system tool (`slugs::RESERVED_FOR_SYSTEM_TOOLS`) or
-repeated within the file is refused.
+`{name, url, pick}` sources. `{field}` in a `url` is filled from the tool's input, percent-encoded,
+and only from fields `input_schema` declares — a placeholder naming anything else is refused when
+the file is read, not on a caller's first request. `pick` is a dotted path into the source's JSON
+reply (`"current.value"` reaches into `{"current": {"value": …}}`). A slug already reserved for a
+system tool (`slugs::RESERVED_FOR_SYSTEM_TOOLS`) or repeated within the file is refused.
+
+A minimal row, with a placeholder subject and endpoints that do not exist:
+
+```json
+{
+  "slug": "example_reading",
+  "name": "Example reading",
+  "description": "Returns a reading from independent providers at once.",
+  "timeout_seconds": 8,
+  "input_schema": {
+    "type": "object",
+    "required": ["place"],
+    "properties": {"place": {"type": "string"}}
+  },
+  "sources": {
+    "fan_out": 2,
+    "take": 2,
+    "sources": [
+      {"name": "alpha", "url": "https://alpha.example.com/?q={place}", "pick": "reading.value"},
+      {"name": "beta",  "url": "https://beta.example.com/{place}",     "pick": "value"}
+    ]
+  }
+}
+```
+
+Every source races through the same `race` primitive `web_fetch` uses, but a declarative row's
+answer looks different from `web_fetch`'s: two sources that both answer come back as **two**
+entries — `{"source": "alpha", "value": …}` next to `{"source": "beta", "value": …}` — never one
+chosen value. Agreeing sources confirm each other, and disagreeing ones are a fact the model has to
+see, so nothing here averages or picks between them; that judgement belongs to whoever reads the
+result, not to this code.
 
 `compose.yaml` intentionally does **not** mount a declarative-tools file: Compose creates an empty
 *directory* at the bind-mount source when the host path does not exist, which every fresh clone

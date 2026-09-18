@@ -9,14 +9,23 @@ flowchart LR
   browser[Browser] -->|HTML and Connect JSON| gateway[Gateway]
   gateway -->|gRPC| crawler[Crawler]
   gateway -->|gRPC Search| kb[Knowledge Base]
+  gateway -->|gRPC| chat[Chat]
   crawler -->|gRPC Ingest| kb
-  kb -->|gRPC Complete| llm[LLM Router]
+  chat -->|gRPC| engine[Engine]
+  engine -->|gRPC| tool[Tool]
+  engine -->|gRPC Complete| llm[LLM Router]
+  tool -->|gRPC Search| kb
+  tool -->|gRPC Complete/Decide| llm
+  kb -->|gRPC Complete| llm
   llm -->|HTTPS| openrouter[OpenRouter]
   kb -->|HTTP| embedder[Native ANE embedder]
   gateway --- pg[(PostgreSQL)]
   crawler --- pg
   kb --- pg
   llm --- pg
+  chat --- pg
+  engine --- pg
+  tool --- pg
 ```
 
 Gateway is the only application service published to the host. It serves Frontend's static output and translates public Connect calls into internal gRPC calls. The browser therefore uses one origin and needs no CORS configuration.
@@ -24,6 +33,8 @@ Gateway is the only application service published to the host. It serves Fronten
 Crawler fetches and denoises pages, stores its crawl record, and submits each successfully stored page to Knowledge Base. Knowledge Base hashes content independently and skips enrichment and embedding when its own stored hash is unchanged. This makes Knowledge Base authoritative for its costs and allows a previously failed hand-off to succeed on a later crawl.
 
 Knowledge Base calls LLM Router for enrichment and the native embedder for document and query vectors. Search combines semantic and lexical passage retrieval and returns evidence; answer generation remains the caller's responsibility.
+
+Chat, Engine and Tool are the agent path, alongside Crawler and Knowledge Base's retrieval path. Gateway forwards chat traffic to Chat, which owns sessions and topics and asks Engine to run each topic as one execution of an agent graph. Engine calls LLM Router directly for a graph's `llm` nodes and Tool for its `tool` nodes; Tool in turn calls Knowledge Base for its two knowledge-base tools, and calls LLM Router both to decide whether a submitted tool definition is approved and, on a refusal, to explain it.
 
 ## Boundaries
 
@@ -33,6 +44,7 @@ Knowledge Base calls LLM Router for enrichment and the native embedder for docum
 - Frontend is a one-shot build container. It copies static files to a volume that Gateway mounts read-only; it is not a runtime server or Cargo workspace member.
 - `native/embedder-ane` is the only host-native component. Core ML has no Linux-container equivalent, so Knowledge Base reaches it through `host.docker.internal`.
 - Provider credentials exist only in LLM Router. Callers request a quality tier for completion, or send typed questions for a decision, and never choose a provider or model slug.
+- Chat and Tool both call `SystemOneService.Decide` for a typed decision — Chat to route a turn, Tool to approve or refuse a submitted tool definition — and reach `LlmRouterService.Complete` only where the branch actually needs generated words: Chat's multi-theme split, Tool's refusal explanation. Engine calls only `LlmRouterService`, for a graph's `llm` nodes; it never calls `SystemOneService`.
 
 ## Repository Layout
 
@@ -42,6 +54,9 @@ services/crawler/           crawl jobs, pages, and link graph
 services/knowledge-base/    enrichment, embeddings, and retrieval
 services/llm-router/        tier routing, fallback, structured decisions, and request audit
 services/gateway/           authentication, public API, static serving
+services/chat/              session and topic orchestration, turn routing
+services/engine/            agent graph executions and the tick loop
+services/tool/              tool registry and execution, including declarative rows
 services/frontend/          browser files copied into Gateway's volume
 native/embedder-ane/        host-native Core ML embedding process
 .agents/skills/code-review/ automated review gates
