@@ -1583,11 +1583,14 @@ pub enum Routing {
 1. Build the state with `decision_state`, which returns a **`serde_json::Value::Array`** — `[{"topics": [...]}, {"message": "..."}]`, topics in recency order with the focused one first, each `{"id", "title", "status", "focused"}` — because a `google.protobuf.Value` object arrives at the model with its keys alphabetised.
 2. Build the `Question`s via the `serde_json::from_value` idiom in Global Constraints. `route`'s options are `repeated`: one `ChoiceOption` per topic named `topic_<id>` with the title as its description, then `new`. **When `topics` is empty, omit `route` entirely** — its only option would be `new`, whose `confidence` is degenerate and provider-dependent, and whose answer changes nothing.
 3. `self.decider.decide(request).await` — on `Err`, log at `warn` and return `Routing::Act(fallback(topics, focus, message))`.
-4. Read `route` first: `confidence` below `ROUTE_CONFIDENCE_THRESHOLD`, or a `topic_<id>` not in `topics`, → treat as unrouted. `topic_<id>` present and confident → `Routing::Act(vec![Action::Continue { topic_id }])`, **and this returns before `actionable` is ever consulted**.
+4. Read `route` first. It has **three** outcomes, and conflating the last two is the mistake this step exists to prevent:
+   - confident `topic_<id>` that is in `topics` → `Routing::Act(vec![Action::Continue { topic_id }])`, returning **before `actionable` is ever consulted**;
+   - `confidence` below `ROUTE_CONFIDENCE_THRESHOLD`, **or** a `topic_<id>` not in `topics` → `Routing::Act(fallback(topics, focus, message))` and return. The model could not separate the options, or named something that does not exist; the deterministic focus rule is the better answer, and it is the behaviour the service had before any classifier existed;
+   - confident `new` — or no `route` question sent at all, because `topics` was empty → continue to step 5.
 5. `separate_themes` above `SEPARATE_THEMES_THRESHOLD` → `self.split(message).await`, which is the old `Complete` call with `parse_actions`; on any failure, fall through to step 6.
 6. `actionable` below `ACTIONABLE_THRESHOLD` → `Routing::Clarify`. Reached only when nothing existing was chosen, so a fragment aimed at a live topic has already left at step 4.
-7. Otherwise one `Action::New { title: truncate(message, MAX_TITLE_CHARS), question: message.to_owned() }`.
-8. Each answer is read at its own step and only where that step needs it. A `route` answer missing at step 4 means "unrouted", not "fall back"; an `actionable` answer missing at step 6 means "do not clarify". A decision carrying **no** answers at all → `fallback`.
+7. Otherwise one `Action::New { title: truncate(message, MAX_TITLE_CHARS), question: message.to_owned() }`. Reached only from step 4's third outcome, so a `new` here is a `new` the model was sure about.
+8. Each answer is read at its own step and only where that step needs it. A `route` answer missing when one was **sent** is step 4's second outcome — `fallback`, because the question was asked and went unanswered. An `actionable` answer missing at step 6 means "do not clarify". A decision carrying **no** answers at all → `fallback`.
 
 > **Why `route` is read before `actionable`, and it matters.** `classifier.rs`'s prompt spends most
 > of its rules insisting that "i'm still waiting", "and?", "more details please" and "that's not
