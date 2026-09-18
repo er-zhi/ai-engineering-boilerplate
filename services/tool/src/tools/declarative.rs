@@ -3,6 +3,7 @@
 // lives in the row's description, the same place a user-created tool's does.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -131,6 +132,80 @@ pub fn pick_value(body: &Value, path: &str) -> Option<Value> {
         here = here.get(segment)?;
     }
     Some(here.clone())
+}
+
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Fills every source's URL, checks each one through `guard` **before** any request goes out, then
+/// races them. Two answers are returned as two answers: agreeing sources confirm each other and
+/// disagreeing ones are a fact the model has to see, so nothing here averages or picks between them.
+pub async fn run<G, Fut>(
+    client: &reqwest::Client,
+    set: &SourceSet,
+    input: &Value,
+    per_source_timeout: Duration,
+    guard: G,
+) -> Result<Value, String>
+where
+    G: Fn(String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
+{
+    let mut ready: Vec<(&Source, String)> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    for source in &set.sources {
+        match fill(&source.url, input) {
+            Ok(url) => match guard(url.clone()).await {
+                Ok(()) => ready.push((source, url)),
+                Err(reason) => refused.push(format!("{}: {reason}", source.name)),
+            },
+            Err(reason) => refused.push(format!("{}: {reason}", source.name)),
+        }
+    }
+    // The name is borrowed from the row, never leaked: `run` is called on every execution of every
+    // declarative tool, so a leak here grows with traffic.
+    let ops: Vec<(&str, crate::race::OpFn<'_, Value>)> = ready
+        .iter()
+        .map(|(source, url)| {
+            crate::race::op(source.name.as_str(), move || async move {
+                ask(client, url, &source.pick).await
+            })
+        })
+        .collect();
+
+    let outcome = crate::race::race(&ops, set.fan_out, set.take, per_source_timeout).await;
+    if outcome.taken.is_empty() {
+        let mut reasons = refused;
+        reasons.extend(outcome.failures);
+        return Err(format!("every source failed — {}", reasons.join("; ")));
+    }
+    Ok(serde_json::json!({
+        "values": outcome
+            .taken
+            .into_iter()
+            .map(|(name, value)| serde_json::json!({"source": name, "value": value}))
+            .collect::<Vec<_>>()
+    }))
+}
+
+async fn ask(client: &reqwest::Client, url: &str, pick: &str) -> Result<Value, String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("returned {}", response.status()));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("body could not be read: {error}"))?;
+    if body.len() > MAX_BODY_BYTES {
+        return Err(format!("replied with more than {MAX_BODY_BYTES} bytes"));
+    }
+    let parsed: Value =
+        serde_json::from_slice(&body).map_err(|error| format!("reply is not JSON: {error}"))?;
+    pick_value(&parsed, pick).ok_or_else(|| format!("reply carries no {pick:?}"))
 }
 
 #[cfg(test)]
@@ -266,5 +341,146 @@ mod tests {
     fn a_path_that_is_not_there_is_none_rather_than_null() {
         let body = json!({"current": {"temperature_2m": 14.2}});
         assert_eq!(pick_value(&body, "current.humidity"), None);
+    }
+
+    async fn serve(body: serde_json::Value) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}/")
+    }
+
+    const SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn set_of(sources: Vec<Source>, fan_out: usize, take: usize) -> SourceSet {
+        SourceSet {
+            fan_out,
+            take,
+            sources,
+        }
+    }
+
+    fn source(name: &str, url: &str, pick: &str) -> Source {
+        Source {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            pick: pick.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_answers_come_back_with_the_sources_that_gave_them() {
+        let one = serve(json!({"current": {"t": 14.2}})).await;
+        let two = serve(json!({"current": {"t": 14.0}})).await;
+        let set = set_of(
+            vec![
+                source("one", &one, "current.t"),
+                source("two", &two, "current.t"),
+            ],
+            2,
+            2,
+        );
+        let out = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({}),
+            SOURCE_TIMEOUT,
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("both answer");
+        let values = out
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .expect("values");
+        assert_eq!(values.len(), 2);
+        let names: Vec<&str> = values
+            .iter()
+            .filter_map(|v| v.get("source")?.as_str())
+            .collect();
+        assert!(
+            names.contains(&"one") && names.contains(&"two"),
+            "{names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_private_address_is_refused_before_any_request_goes_out() {
+        let set = set_of(vec![source("local", "http://127.0.0.1:9/", "t")], 1, 1);
+        let error = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({}),
+            SOURCE_TIMEOUT,
+            |url: String| async move { crate::tools::web_fetch::ensure_public_url(&url).await },
+        )
+        .await
+        .expect_err("loopback must be refused");
+        assert!(error.contains("local"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_pick_that_finds_nothing_fails_that_source_not_the_whole_race() {
+        let good = serve(json!({"current": {"t": 14.2}})).await;
+        let thin = serve(json!({"current": {}})).await;
+        let set = set_of(
+            vec![
+                source("thin", &thin, "current.t"),
+                source("good", &good, "current.t"),
+            ],
+            2,
+            1,
+        );
+        let out = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({}),
+            SOURCE_TIMEOUT,
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("the good source answers");
+        let values = out
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .expect("values");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("source").and_then(serde_json::Value::as_str),
+            Some("good")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_source_failing_names_each_one() {
+        let set = set_of(
+            vec![
+                source("one", "https://203.0.113.1/", "t"),
+                source("two", "https://203.0.113.2/", "t"),
+            ],
+            2,
+            1,
+        );
+        let error = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({}),
+            Duration::from_millis(200),
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect_err("both are unroutable");
+        assert!(error.contains("one") && error.contains("two"), "{error}");
     }
 }

@@ -311,8 +311,40 @@ impl Service {
         }
         let input: Value = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidRequest(e.to_string()))?;
-        self.run_system_tool(slug, &input, registered_timeout(tool.timeout_seconds))
+        let timeout = registered_timeout(tool.timeout_seconds);
+        if let Some(raw) = tool.sources.clone() {
+            return self.run_declarative(&tool, &raw, &input, timeout).await;
+        }
+        self.run_system_tool(slug, &input, timeout).await
+    }
+
+    /// A row that declares its sources runs through one shared executor: its slug is a name, not a
+    /// branch, and this service holds no knowledge of what any of them is about.
+    async fn run_declarative(
+        &self,
+        tool: &crate::entity::tool::Model,
+        raw: &Value,
+        input: &Value,
+        timeout: Duration,
+    ) -> Result<ExecuteOutcome, ToolError> {
+        let set = match crate::tools::declarative::parse_sources(raw, &tool.input_schema) {
+            Ok(set) => set,
+            Err(problem) => return Ok(ExecuteOutcome::NotExecutable(problem)),
+        };
+        Ok(
+            match crate::tools::declarative::run(
+                &self.http,
+                &set,
+                input,
+                timeout,
+                |url| async move { crate::tools::web_fetch::ensure_public_url(&url).await },
+            )
             .await
+            {
+                Ok(value) => ExecuteOutcome::Ok(value),
+                Err(error) => ExecuteOutcome::Error(error),
+            },
+        )
     }
 
     async fn find_tool(
