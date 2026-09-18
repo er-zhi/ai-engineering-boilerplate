@@ -45,9 +45,14 @@
 **Interfaces:**
 - Consumes: nothing.
 - Produces: `tool::race::{race, Outcome, OpFn, OpFuture, op}` —
-  `pub async fn race<'a, T>(ops: &[(&'static str, OpFn<'a, T>)], fan_out: usize, take: usize, per_op_timeout: Duration) -> Outcome<T>`,
-  `pub struct Outcome<T> { pub taken: Vec<(&'static str, T)>, pub failures: Vec<String> }`,
-  `pub fn op<'a, T, F, Fut>(name: &'static str, f: F) -> (&'static str, OpFn<'a, T>)`.
+  `pub async fn race<'a, T>(ops: &'a [(&'a str, OpFn<'a, T>)], fan_out: usize, take: usize, per_op_timeout: Duration) -> Outcome<'a, T>`,
+  `pub struct Outcome<'a, T> { pub taken: Vec<(&'a str, T)>, pub failures: Vec<String> }`,
+  `pub fn op<'a, T, F, Fut>(name: &'a str, f: F) -> (&'a str, OpFn<'a, T>)`.
+
+> **The name is borrowed, never `&'static str`.** An operation's name comes from a URL or a
+> registry row at runtime. Naming it `&'static str` forces callers to `Box::leak` on **every**
+> execution, which is an unbounded leak, not a bounded one. The slice already has a lifetime;
+> the name rides it.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -63,36 +68,47 @@ mod tests {
 
     const QUICK: Duration = Duration::from_secs(5);
 
-    /// Counts its own cancellation: dropped before it resolved means the race cut it loose.
-    struct Tracked(Arc<AtomicUsize>, bool);
+    /// Counts cancellations only. `resolved` is set on the success path, so a future that ran to
+    /// completion is not confused with one the race cut loose — without that flag the counter would
+    /// tick either way and the test would prove nothing.
+    struct Tracked {
+        cancelled: Arc<AtomicUsize>,
+        resolved: bool,
+    }
 
     impl Drop for Tracked {
         fn drop(&mut self) {
-            if !self.1 {
-                self.0.fetch_add(1, Ordering::SeqCst);
+            if !self.resolved {
+                self.cancelled.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
 
-    fn answering<'a>(name: &'static str, after: Duration) -> (&'static str, OpFn<'a, &'static str>) {
+    /// Every race in these tests is wrapped in this: a test that asserts the race *stops early*
+    /// must fail when it does not, rather than pass slowly after the slow operation finishes.
+    const MUST_FINISH_WITHIN: Duration = Duration::from_millis(500);
+
+    fn answering<'a>(name: &'a str, after: Duration) -> (&'a str, OpFn<'a, &'a str>) {
         op(name, move || async move {
             tokio::time::sleep(after).await;
             Ok(name)
         })
     }
 
-    fn failing<'a>(name: &'static str) -> (&'static str, OpFn<'a, &'static str>) {
+    fn failing<'a>(name: &'a str) -> (&'a str, OpFn<'a, &'a str>) {
         op(name, move || async move { Err("refused".to_owned()) })
     }
 
     #[tokio::test]
-    async fn takes_the_quorum_and_stops() {
+    async fn takes_the_quorum_and_stops_without_waiting_for_the_rest() {
         let ops = [
             answering("a", Duration::from_millis(5)),
             answering("b", Duration::from_millis(10)),
-            answering("c", Duration::from_millis(500)),
+            answering("c", Duration::from_secs(30)),
         ];
-        let outcome = race(&ops, 3, 2, QUICK).await;
+        let outcome = tokio::time::timeout(MUST_FINISH_WITHIN, race(&ops, 3, 2, QUICK))
+            .await
+            .expect("the quorum was reached, so the race must not wait for c");
         assert_eq!(
             outcome.taken.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
             vec!["a", "b"]
@@ -106,21 +122,30 @@ mod tests {
         let ops = [
             answering("fast", Duration::from_millis(1)),
             op("slow", move || {
-                let guard = Tracked(slow.clone(), false);
+                let mut guard = Tracked {
+                    cancelled: slow.clone(),
+                    resolved: false,
+                };
                 async move {
                     tokio::time::sleep(Duration::from_secs(30)).await;
-                    drop(guard);
+                    guard.resolved = true;
                     Ok("slow")
                 }
             }),
         ];
-        let outcome = race(&ops, 2, 1, QUICK).await;
+        let outcome = tokio::time::timeout(MUST_FINISH_WITHIN, race(&ops, 2, 1, QUICK))
+            .await
+            .expect("the race must return on the first success");
         assert_eq!(outcome.taken.len(), 1);
-        assert_eq!(cancelled.load(Ordering::SeqCst), 1, "the slow op was not dropped");
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            1,
+            "the slow op resolved or was awaited instead of being dropped"
+        );
     }
 
     #[tokio::test]
-    async fn a_failure_starts_the_next_reserve_immediately() {
+    async fn a_failure_starts_the_next_reserve() {
         let ops = [
             failing("one"),
             failing("two"),
@@ -152,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_operations_is_a_named_failure_not_a_panic() {
-        let ops: [(&'static str, OpFn<'_, &'static str>); 0] = [];
+        let ops: [(&str, OpFn<'_, &str>); 0] = [];
         let outcome = race(&ops, 3, 1, QUICK).await;
         assert!(outcome.taken.is_empty());
         assert_eq!(outcome.failures, vec!["no operations to race".to_owned()]);
@@ -192,7 +217,7 @@ pub type OpFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send
 pub type OpFn<'a, T> = Box<dyn Fn() -> OpFuture<'a, T> + Send + Sync + 'a>;
 
 /// Boxes an operation factory so callers can put differently-typed closures in one slice.
-pub fn op<'a, T, F, Fut>(name: &'static str, f: F) -> (&'static str, OpFn<'a, T>)
+pub fn op<'a, T, F, Fut>(name: &'a str, f: F) -> (&'a str, OpFn<'a, T>)
 where
     F: Fn() -> Fut + Send + Sync + 'a,
     Fut: Future<Output = Result<T, String>> + Send + 'a,
@@ -203,10 +228,10 @@ where
 /// What a race produced. Not a `Result`: a partial answer is a normal outcome, and only the caller
 /// knows whether fewer than `take` successes is enough for what it is doing.
 #[derive(Debug)]
-pub struct Outcome<T> {
+pub struct Outcome<'a, T> {
     /// Up to `take` successes, in the order they arrived, each with the name of the operation that
     /// produced it.
-    pub taken: Vec<(&'static str, T)>,
+    pub taken: Vec<(&'a str, T)>,
     /// One `"name: reason"` per operation that was started and did not succeed. Operations still in
     /// flight when the quorum was reached are cancelled and appear nowhere: they have no verdict.
     pub failures: Vec<String>,
@@ -217,11 +242,11 @@ pub struct Outcome<T> {
 /// next one in the slice, so the width stays full. Reaching the quorum drops the whole set of
 /// in-flight futures, which cancels them where they stand rather than waiting them out.
 pub async fn race<'a, T>(
-    ops: &[(&'static str, OpFn<'a, T>)],
+    ops: &'a [(&'a str, OpFn<'a, T>)],
     fan_out: usize,
     take: usize,
     per_op_timeout: Duration,
-) -> Outcome<T> {
+) -> Outcome<'a, T> {
     if ops.is_empty() {
         return Outcome {
             taken: Vec::new(),
@@ -260,16 +285,15 @@ pub async fn race<'a, T>(
 }
 
 async fn attempt<'a, T>(
-    (name, factory): &(&'static str, OpFn<'a, T>),
+    (name, factory): &'a (&'a str, OpFn<'a, T>),
     per_op_timeout: Duration,
-) -> Result<(&'static str, T), String> {
+) -> Result<(&'a str, T), String> {
     match tokio::time::timeout(per_op_timeout, factory()).await {
         Ok(Ok(value)) => Ok((name, value)),
         Ok(Err(reason)) => Err(format!("{name}: {reason}")),
-        Err(_) => Err(format!(
-            "{name}: timed out after {}s",
-            per_op_timeout.as_secs()
-        )),
+        // `{:?}` rather than `as_secs()`: a 50 ms cap printed as "0s" reads like a bug report
+        // about the wrong thing.
+        Err(_) => Err(format!("{name}: timed out after {per_op_timeout:?}")),
     }
 }
 ```
@@ -344,24 +368,24 @@ pub async fn fetch_richest(
     // whoever answers first is decided by network latency, which has nothing to do with whether the
     // page holds the answer. The race decides *when to stop waiting*; the comparison decides *what
     // to return*, and it needs something to compare against.
-    let ops: Vec<(&'static str, crate::race::OpFn<'_, Extracted>)> = urls
+    let ops: Vec<(&str, crate::race::OpFn<'_, Extracted>)> = urls
         .iter()
-        .map(|url| {
-            let name: &'static str = Box::leak(url.clone().into_boxed_str());
-            crate::race::op(name, move || fetch(client, name, timeout))
-        })
+        .map(|url| crate::race::op(url.as_str(), move || fetch(client, url, timeout)))
         .collect();
     let outcome = crate::race::race(&ops, urls.len(), ANSWERS_BEFORE_CHOOSING, timeout).await;
+    let failures = outcome.failures.join("; ");
     outcome
         .taken
         .into_iter()
         .map(|(_, page)| page)
         .max_by_key(|page| page.main_text.len())
-        .ok_or_else(|| format!("every url failed — {}", outcome.failures.join("; ")))
+        .ok_or_else(|| format!("every url failed — {failures}"))
 }
 ```
 
-> **Why `Box::leak` and not a plain `&str`:** `race` names operations `&'static str` so an error string can be built without borrowing the operation set. A URL arrives owned at runtime. `args::MAX_URLS` caps this at 5 strings per call, so the leak is bounded by a constant, not by traffic. If a reviewer objects, the alternative is changing `OpFn`'s name to `String` in Task 1 and updating its tests — do that rather than leaving a note.
+> The operation name is `url.as_str()`, borrowed from the caller's slice. It must never be
+> `Box::leak`ed: `fetch_richest` runs on every `web_fetch` execution, so leaking a name per URL
+> per call is an unbounded leak, not one bounded by `MAX_URLS`.
 
 - [ ] **Step 4: Run the whole web_fetch suite**
 
@@ -536,8 +560,9 @@ pub struct Source {
     pub pick: String,
 }
 
-/// Reads and checks a row's `sources`. Every failure here is a seeding mistake, caught once at
-/// startup rather than per execution.
+/// Reads and checks a row's `sources`. Every failure here is a seeding mistake, so seeding calls it
+/// too (Task 5) and refuses to write a row it rejects — otherwise the first user to reach the tool
+/// is the one who finds out.
 pub fn parse_sources(raw: &Value, input_schema: &Value) -> Result<SourceSet, String> {
     let set: SourceSet =
         serde_json::from_value(raw.clone()).map_err(|error| format!("sources: {error}"))?;
@@ -664,7 +689,20 @@ git commit -m "tool: a tools row can declare the endpoints it races"
 
 **Interfaces:**
 - Consumes: `tool::race::{race, op, OpFn}` (Task 1); `parse_sources`, `fill`, `pick_value`, `SourceSet` (Task 3); `tool::tools::web_fetch::ensure_public_url`.
-- Produces: `pub async fn run(client: &reqwest::Client, set: &SourceSet, input: &Value, per_source_timeout: Duration) -> Result<Value, String>` returning `{"values": [{"source": "...", "value": ...}]}`.
+- Produces, final signature — the guard is a parameter so tests can reach loopback without weakening `ensure_public_url`:
+  ```rust
+  pub async fn run<G, Fut>(
+      client: &reqwest::Client,
+      set: &SourceSet,
+      input: &Value,
+      per_source_timeout: Duration,
+      guard: G,
+  ) -> Result<Value, String>
+  where
+      G: Fn(String) -> Fut + Send + Sync,
+      Fut: std::future::Future<Output = Result<(), String>> + Send,
+  ```
+  returning `{"values": [{"source": "...", "value": ...}]}`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -818,16 +856,13 @@ where
             Err(reason) => refused.push(format!("{}: {reason}", source.name)),
         }
     }
-    let ops: Vec<(&'static str, crate::race::OpFn<'_, Value>)> = ready
+    // The name is borrowed from the row, never leaked: `run` is called on every execution of every
+    // declarative tool, so a leak here grows with traffic.
+    let ops: Vec<(&str, crate::race::OpFn<'_, Value>)> = ready
         .iter()
         .map(|(source, url)| {
-            let name: &'static str = Box::leak(source.name.clone().into_boxed_str());
-            let pick = source.pick.clone();
-            let url = url.clone();
-            crate::race::op(name, move || {
-                let pick = pick.clone();
-                let url = url.clone();
-                async move { ask(client, &url, &pick).await }
+            crate::race::op(source.name.as_str(), move || {
+                async move { ask(client, url, &source.pick).await }
             })
         })
         .collect();
@@ -931,8 +966,7 @@ git commit -m "tool: one executor runs every declarative row, whatever it is abo
 
 **Files:**
 - Modify: `services/tool/src/slugs.rs`
-- Modify: `services/tool/src/main.rs:208-240` (`system_tool_definitions`, `SystemTool`, `seeding_already_finished`, `create_and_activate_system_tool`)
-- Modify: `services/tool/src/args.rs` (input types for the three rows)
+- Modify: `services/tool/src/main.rs:208-240` (`system_tool_definitions`, `SystemTool`, `seeding_already_finished`, `create_and_activate_system_tool`, `activate_without_llm_review`)
 - Test: inline tests in `services/tool/src/main.rs`
 
 **Interfaces:**
@@ -1009,29 +1043,11 @@ pub const RESERVED_FOR_SYSTEM_TOOLS: [&str; 7] = [
 ];
 ```
 
-In `services/tool/src/args.rs`:
-
-```rust
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Coordinates {
-    pub lat: f64,
-    pub lon: f64,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Symbol {
-    pub symbol: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CurrencyPair {
-    pub base: String,
-    pub quote: String,
-}
-```
+**`args.rs` gains nothing.** A Rust arg type there earns its place because `run_system_tool` parses
+into it, and the derived `JsonSchema` and the reader are then one declaration. A declarative row has
+no Rust reader — `fill` reads the raw input — so a type would be a second declaration enforcing
+nothing: `{"lat": "x"}` would still fill the URL. Write each row's `input_schema` as a JSON literal
+beside its `sources`, where the `parse_sources` placeholder check can see it.
 
 In `services/tool/src/main.rs`, add `sources: Option<serde_json::Value>` to `SystemTool`, include it in `seeding_already_finished`'s comparison (`row.sources == definition.sources`), set it on the `ActiveModel` in `create_and_activate_system_tool` and `activate_without_llm_review`, change the return type to `[SystemTool; 7]`, set `sources: None` on the four existing entries, and append (filling the second and third source of each from Step 1's verified endpoints):
 
@@ -1041,7 +1057,15 @@ In `services/tool/src/main.rs`, add `sources: Option<serde_json::Value>` to `Sys
             name: "Current temperature at a coordinate",
             description: "Returns the current temperature in degrees Celsius at a latitude and longitude, from several independent providers at once.",
             risk: Risk::ReadOnly,
-            input_schema: tool::args::input_schema::<tool::args::Coordinates>(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["lat", "lon"],
+                "additionalProperties": false,
+                "properties": {
+                    "lat": {"type": "number", "description": "Latitude in decimal degrees."},
+                    "lon": {"type": "number", "description": "Longitude in decimal degrees."}
+                }
+            }),
             sources: Some(serde_json::json!({
                 "fan_out": 3,
                 "take": 2,
@@ -1054,7 +1078,15 @@ In `services/tool/src/main.rs`, add `sources: Option<serde_json::Value>` to `Sys
         },
 ```
 
-…and the equivalent `stock_quote` (input `Symbol`) and `fx_rate` (input `CurrencyPair`) entries. Each needs **at least 3 sources** for `fan_out: 3, take: 2` to be meaningful; `parse_sources` refuses `take` above the source count, so the test in Step 2 catches a short list.
+…and the equivalent `stock_quote` (`{"symbol": {"type": "string"}}`) and `fx_rate`
+(`{"base": …, "quote": …}`) entries. Each needs **at least 3 sources** for `fan_out: 3, take: 2` to
+be meaningful; `parse_sources` refuses `take` above the source count, so the test in Step 2 catches
+a short list.
+
+Also call `parse_sources` inside `create_and_activate_system_tool` / `activate_without_llm_review`
+and log-and-skip a row it rejects, so a bad seed never reaches the registry.
+
+Modify `services/tool/src/args.rs`: nothing. See the note above.
 
 > **Gate check before committing:** grep your diff for subject words outside a seed literal's `description`, `name` and `url`. `rg -n 'weather|stock|fx|temperature' services/tool/src --glob '!main.rs'` must return nothing but `slugs.rs`. No prompt string anywhere gains a subject.
 
@@ -1070,7 +1102,7 @@ Expected: all pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add services/tool/src/slugs.rs services/tool/src/main.rs services/tool/src/args.rs
+git add services/tool/src/slugs.rs services/tool/src/main.rs
 git commit -m "tool: three declarative rows, each racing three open APIs for two answers"
 ```
 
@@ -1088,7 +1120,12 @@ git commit -m "tool: three declarative rows, each racing three open APIs for two
 
 - [ ] **Step 1: Write the failing tests**
 
-In `services/tool/src/service.rs`'s `mod tests`, extend the fake router to implement `SystemOneService` (scripted `noul`), then add:
+The existing `serve_llm(reply)` mounts only `LlmRouterService`. Replace it with
+`serve_llm_counting_decisions(noul: f64) -> (String, Arc<AtomicUsize>)`, which mounts **both**
+services on one `ConnectRouter` — `Decide` answers `{"id": "meets_standard", "noul": {"noul": noul}}`
+and `Complete` returns a fixed refusal sentence while bumping the counter. `draft_tool(&service)` is
+the existing create-a-Draft-row helper (extract it from the current tests if it is inline), and
+`OWNER` is a module-level `Uuid` the tests already use for the owning user. Then add: 
 
 ```rust
     #[tokio::test(flavor = "multi_thread")]
@@ -1216,9 +1253,11 @@ git commit -m "tool: validation is a calibrated yes/no, and only a refusal costs
 
 **Files:**
 - Create: `services/chat/src/intent.rs`
-- Delete: `services/chat/src/classifier.rs` (its `TopicSummary`, `Action`, `MAX_TITLE_CHARS`, `fallback` and multi-theme prompt move into `intent.rs`)
+- Delete: `services/chat/src/classifier.rs` (its `TopicSummary`, `Action`, `MAX_TITLE_CHARS`, `truncate`, `fallback`, `parse_actions` and multi-theme prompt move into `intent.rs`)
 - Modify: `services/chat/src/lib.rs`
-- Modify: `services/chat/src/fakes.rs` (add `SystemOneService` to the fake router)
+- Modify every importer of the old module — `rg -n 'classifier::' services/chat/src` lists exactly four:
+  `main.rs:7` (`MAX_TITLE_CHARS`), `topic_watcher.rs:12` (`truncate`), `topic_turn.rs:14` (`Action, MAX_TITLE_CHARS, TopicSummary, truncate`), `topic_manager.rs:12` (`TopicClassifier` → `TopicIntent`, and the field rename)
+- Modify: `services/chat/src/fakes.rs` — add `SystemOneService` to the **existing** `FakeLlmRouter`, not a separate type
 - Test: inline tests in `services/chat/src/intent.rs`
 
 **Interfaces:**
@@ -1250,13 +1289,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_to_act_on_asks_rather_than_routing() {
-        let (url, calls) = crate::fakes::serve_decider(vec![
-            ("actionable", CLARIFY_BELOW),
-        ]).await;
+    async fn nothing_to_act_on_and_nothing_to_continue_asks() {
+        // No topics at all, so `route` is not even sent: a greeting in an empty session is the
+        // clarification case.
+        let (url, calls) = crate::fakes::serve_decider(vec![("actionable", CLARIFY_BELOW)]).await;
         let intent = TopicIntent::new(&url).expect("client");
-        assert!(matches!(intent.route(&topics(), Some(7), "hey").await, Routing::Clarify));
+        assert!(matches!(intent.route(&[], None, "hey").await, Routing::Clarify));
         assert_eq!(calls.completions(), 0, "a clarification must not spend a completion");
+    }
+
+    #[tokio::test]
+    async fn a_fragment_aimed_at_a_live_topic_continues_it_instead_of_being_questioned() {
+        // "and?" carries no request of its own, so `actionable` is low — but it plainly continues
+        // the running topic, and interrogating the user about it is the failure this ordering
+        // exists to prevent.
+        let (url, _) = crate::fakes::serve_decider_choosing_with(
+            "topic_7",
+            0.9,
+            vec![("actionable", CLARIFY_BELOW)],
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
+            panic!("a fragment aimed at a live topic must never clarify");
+        };
+        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
     }
 
     #[tokio::test]
@@ -1361,7 +1418,12 @@ mod tests {
 
 - [ ] **Step 2: Add the fake decider to `services/chat/src/fakes.rs`**
 
-The existing `FakeLlmRouter` implements `LlmRouterService`. Add a `SystemOneService` impl to the same type plus a call counter, and three constructors returning `(url, Calls)`:
+`FakeLlmRouter` implements `LlmRouterService` and is what `manager_with_router()` mounts. Add
+`SystemOneService` **to that same type**, on the same `ConnectRouter`, with an `answer_decision(...)`
+arm beside the existing `answer_with` and `hold_every_call_until`. A separate fake type would leave
+every existing `topic_turn.rs` test talking to a router that cannot decide — see Task 8 Step 1.
+
+Then add a call counter and three convenience constructors returning `(url, Calls)`:
 
 ```rust
 /// Counts what a turn actually spent, so a test can assert that the fast path made one typed call
@@ -1376,11 +1438,19 @@ impl Calls {
     }
 }
 
-/// Answers `actionable` with the given noul and refuses to choose, so the caller clarifies.
+/// Answers only the given nouls; no `route` answer, so nothing is chosen.
 pub async fn serve_decider(nouls: Vec<(&'static str, f64)>) -> (String, Calls);
 
-/// Answers `actionable` high and `route` with `choice` and `confidence`.
+/// Answers `route` with `choice` and `confidence`, and `actionable` high.
 pub async fn serve_decider_choosing(choice: &'static str, confidence: f64) -> (String, Calls);
+
+/// As above, with the nouls scripted explicitly — used to prove that a low `actionable` does not
+/// override a confident route.
+pub async fn serve_decider_choosing_with(
+    choice: &'static str,
+    confidence: f64,
+    nouls: Vec<(&'static str, f64)>,
+) -> (String, Calls);
 
 /// Answers `separate_themes` high, and returns `plan` from `Complete`.
 pub async fn serve_decider_splitting(plan: &'static str) -> (String, Calls);
@@ -1433,12 +1503,21 @@ pub enum Routing {
 `route` does, in order:
 
 1. Build the state with `decision_state`, which returns a **`serde_json::Value::Array`** — `[{"topics": [...]}, {"message": "..."}]`, topics in recency order with the focused one first, each `{"id", "title", "status", "focused"}` — because a `google.protobuf.Value` object arrives at the model with its keys alphabetised.
-2. Build three `Question`s via the `serde_json::from_value` idiom in Global Constraints. `route`'s options are `repeated`: one `ChoiceOption` per topic named `topic_<id>` with the title as its description, then `new`.
+2. Build the `Question`s via the `serde_json::from_value` idiom in Global Constraints. `route`'s options are `repeated`: one `ChoiceOption` per topic named `topic_<id>` with the title as its description, then `new`. **When `topics` is empty, omit `route` entirely** — its only option would be `new`, whose `confidence` is degenerate and provider-dependent, and whose answer changes nothing.
 3. `self.decider.decide(request).await` — on `Err`, log at `warn` and return `Routing::Act(fallback(topics, focus, message))`.
-4. `actionable` noul below `ACTIONABLE_THRESHOLD` → `Routing::Clarify`.
-5. `separate_themes` noul above `SEPARATE_THEMES_THRESHOLD` → `self.split(message).await`, which is the old `Complete` call with `parse_actions`; on any failure, fall through to step 6.
-6. `route`: `confidence` below `ROUTE_CONFIDENCE_THRESHOLD`, or a `topic_<id>` not in `topics`, → `fallback`. `new` → one `Action::New { title: truncate(message, MAX_TITLE_CHARS), question: message.to_owned() }`. `topic_<id>` → `Action::Continue { topic_id }`.
-7. A missing answer for any id → `fallback`.
+4. Read `route` first: `confidence` below `ROUTE_CONFIDENCE_THRESHOLD`, or a `topic_<id>` not in `topics`, → treat as unrouted. `topic_<id>` present and confident → `Routing::Act(vec![Action::Continue { topic_id }])`, **and this returns before `actionable` is ever consulted**.
+5. `separate_themes` above `SEPARATE_THEMES_THRESHOLD` → `self.split(message).await`, which is the old `Complete` call with `parse_actions`; on any failure, fall through to step 6.
+6. `actionable` below `ACTIONABLE_THRESHOLD` → `Routing::Clarify`. Reached only when nothing existing was chosen, so a fragment aimed at a live topic has already left at step 4.
+7. Otherwise one `Action::New { title: truncate(message, MAX_TITLE_CHARS), question: message.to_owned() }`.
+8. Each answer is read at its own step and only where that step needs it. A `route` answer missing at step 4 means "unrouted", not "fall back"; an `actionable` answer missing at step 6 means "do not clarify". A decision carrying **no** answers at all → `fallback`.
+
+> **Why `route` is read before `actionable`, and it matters.** `classifier.rs`'s prompt spends most
+> of its rules insisting that "i'm still waiting", "and?", "more details please" and "that's not
+> what I asked" are ALWAYS `continue`. Every one of those is a fragment with no request in it, so a
+> correctly calibrated `actionable` comes back **low** — and clarifying on it would interrogate the
+> user about the most common turn shape in a live session. Putting `route` first means clarification
+> can only happen when there was nothing to continue in the first place, which is the case it was
+> designed for. This ordering is load-bearing; do not "simplify" it into a single early check.
 
 - [ ] **Step 5: Run the tests**
 
@@ -1541,29 +1620,45 @@ Rename `TopicManager`'s `classifier: TopicClassifier` field to `intent: TopicInt
             // answer is identical and starts nothing, which is cheaper than indexing event payloads
             // by turn.
             Routing::Clarify => {
-                self.session
-                    .publish(TopicEvent::session_wide(
-                        user_id,
-                        TopicEventKind::ClarificationNeeded,
-                        serde_json::json!({
+                self.publish(
+                    TopicEvent::session_wide(session_id, TopicEventKind::ClarificationNeeded)
+                        .with_payload(serde_json::json!({
                             "text": crate::intent::CLARIFICATION_TEXT,
                             "turn_id": turn_id,
-                        }),
-                    ))
-                    .await?;
+                        })),
+                )
+                .await;
                 return Ok(Vec::new());
             }
             Routing::Act(actions) => actions,
         };
 ```
 
-Add `TopicEvent::session_wide` beside the existing constructors in `events.rs` (`topic_id: None`), following whatever persistence path `SessionReset` already uses in `event_log.rs` so the event survives a reconnect.
+> `TopicManager::publish` (`services/chat/src/topic_events.rs:15`) is `pub(crate) async fn
+> publish(&self, event: TopicEvent)` — **infallible and on the manager**, so there is no `?` and it
+> is not reached through `self.session`. It persists and then broadcasts; `SessionReset`
+> (`topic_manager.rs:194`) deliberately bypasses persistence via `self.events.publish`, which a
+> clarification must **not** do — the transcript has to survive a reconnect. The id it takes is the
+> **session** uuid, not `user_id`.
+
+Add `TopicEvent::session_wide(session_id, kind)` beside the existing constructors in `events.rs`, setting `topic_id: None`.
+
+The Clarify branch runs **outside** `lock_turn`, so two concurrent retries of one `turn_id` publish two clarification events. That is acceptable and intentional — the event carries no side effect and starts nothing — and the comment above says so.
 
 - [ ] **Step 5: Render it in the frontend**
 
 In `services/frontend/`, find where `topic_completed` is turned into a transcript line and add a branch for `CHAT_EVENT_KIND_CLARIFICATION_NEEDED` that renders `payload.text` as an assistant reply with no topic heading.
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 6: Re-script the two existing tests that a Decide-first turn breaks**
+
+Every turn now calls `Decide` before `Complete`, so two tests in `services/chat/src/topic_turn.rs` no longer test what they were written to test. **They must be edited, not "expected to pass":**
+
+- `a_message_naming_two_themes_opens_two_topics_and_focuses_the_first` (≈line 643) scripts a two-action plan through `router.answer_with`. Add `router.answer_decision(...)` arming `separate_themes` above `SEPARATE_THEMES_THRESHOLD`, or the turn never reaches `Complete` and opens one topic instead of two.
+- `both_retries_of_one_turn_reach_the_classifier_before_either_takes_the_turn_lock` (≈line 351) parks both retries on a `Barrier` inside `Complete` via `hold_every_call_until`. `Complete` is no longer on the normal path, so the barrier is never reached and the test **hangs** to its `CLASSIFY_DEADLINE`. Move the hold onto `Decide` and rename the test to `…reach_the_decider_before…`.
+
+Three more (`a_first_message…`, `the_session_view…`, `a_continue_on_the_running_focus…`) would pass on fallback alone, which means they stop testing routing. Arm `answer_decision` in each so they exercise the decision they claim to.
+
+- [ ] **Step 7: Run the tests**
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -1571,9 +1666,9 @@ cargo nextest run -p chat
 cargo nextest run -p gateway
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
-Expected: all pass, including the pre-existing advisory-fallback tests, **unchanged**.
+Expected: all pass. The advisory-fallback tests (unreachable router, unusable output, unknown `topic_id`) keep their **assertions** unchanged — only their scripting changes.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add common/proto/chat/v1/chat.proto services/chat/src services/frontend
