@@ -41,6 +41,10 @@ pub struct Model {
     pub input_schema: Json,
     #[sea_orm(column_type = "JsonBinary")]
     pub output_schema: Json,
+    /// Set on a declarative tool: the endpoints it races and how to read them. `None` means this
+    /// row's behaviour is Rust, dispatched by slug.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub sources: Option<Json>,
     pub connection_id: Option<i64>,
     pub risk: Risk,
     pub timeout_seconds: i32,
