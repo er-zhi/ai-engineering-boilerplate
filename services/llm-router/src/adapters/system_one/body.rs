@@ -8,7 +8,9 @@ use common::proto::llm_router::v1::ChoiceOption;
 
 use crate::decision::{Decision, Question, QuestionKind};
 
-// The body the provider is sent, serialized straight from the caller's questions so their order survives to the model.
+// The body the provider is sent: state, plus each question keyed by its own id — the shape the vendor's
+// API takes, questions and choice criteria as maps evaluated independently and in isolation. Score
+// levels are the exception and stay an ordered array, because the vendor evaluates those lowest to highest.
 #[derive(Serialize)]
 pub struct DecideBody<'a> {
     state: &'a Value,
@@ -74,8 +76,10 @@ pub fn decide_body<'a>(model: &'a str, decision: &'a Decision) -> DecideBody<'a>
     }
 }
 
-// The same request for the decision log. The questions are an array here: jsonb has no key order of its own,
-// and the order the caller asked in is the whole reason the contract takes them as a list.
+// The same request for the decision log. The questions are an array here, not a map: jsonb objects have
+// no key order of their own, and an array keeps the order the caller wrote them in for whoever reads this
+// log later — not because the vendor reads it. The provider itself takes questions as a map keyed by id
+// and evaluates each independently.
 pub fn audit_body(model: &str, decision: &Decision) -> Value {
     json!({
         "model": model,
@@ -140,7 +144,7 @@ mod tests {
     const MODEL: &str = "jev-latest";
 
     #[test]
-    fn choice_options_reach_the_model_in_the_order_the_caller_offered_them() {
+    fn choice_options_are_written_to_the_wire_in_the_order_the_caller_offered_them() {
         let body =
             serde_json::to_string(&decide_body(MODEL, &decision(vec![department()]))).unwrap();
 
@@ -179,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn the_logged_request_keeps_the_questions_in_the_order_they_were_asked() {
+    fn the_logged_request_keeps_the_questions_in_the_order_they_were_asked_for_whoever_reads_it() {
         let logged = audit_body(
             MODEL,
             &decision(vec![

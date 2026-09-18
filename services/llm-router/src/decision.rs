@@ -18,7 +18,10 @@ pub struct Question {
     pub kind: QuestionKind,
 }
 
-// The option and level order is the caller's, because it is what the model reads.
+// Score.levels is the one field here whose order the vendor reads: it evaluates them lowest to highest,
+// and body.rs sends this Vec's order straight through as that ordered array. Choice.options is a Vec for
+// a stable shape, not because order reaches the model — the vendor takes choice criteria as a map keyed
+// by name, evaluated in isolation like every other question.
 #[derive(Clone, Debug)]
 pub enum QuestionKind {
     Noul {

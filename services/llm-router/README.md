@@ -97,7 +97,7 @@ Each question carries an `id` you choose, `instructions`, and the fields of its 
 
 Those two ceilings are the vendor's, published on the [choice](https://docs.typesafe.ai/primitives/choice) and [score](https://docs.typesafe.ai/primitives/score) pages. `Decide` enforces them itself, so an eleventh level is a free local rejection rather than a paid provider 422.
 
-Options and levels are **repeated, not maps**. The vendor's own API takes both as maps keyed by id and evaluates each question independently and in isolation, so option order carries no meaning to it; `repeated` is used because it is a stable wire shape and a protobuf map has none. `score` levels are the exception: the vendor documents them as evaluated lowest to highest, so their order is the one place it does matter.
+Options are **repeated, not maps**: the vendor's own API takes choice criteria as a map keyed by name and evaluates each question independently and in isolation, so option order carries no meaning to it; `repeated` is used because it is a stable wire shape and a protobuf map has none. `score` levels are different: the vendor keeps them as an ordered array end to end too, evaluated lowest to highest, so their order is the one place it actually matters.
 
 ### Ask Everything at Once
 
@@ -152,7 +152,7 @@ curl -X POST llm-router:8083/llm_router.v1.SystemOneService/Decide \
 - **Every number is a double.** `{"days": 3}` reaches the provider as `{"days": 3.0}`, and an id beyond 2^53 loses precision outright. Send anything that must stay an exact integer as a string.
 - **An object's keys arrive sorted.** A `Value` object is a map, and this workspace's `serde_json` has no `preserve_order`, so the model sees the keys alphabetised rather than as you wrote them. Where order carries meaning — a transcript, a sequence of events — send an **array**, which keeps it.
 
-Ordering only changes an answer for `score` levels, which the vendor evaluates lowest to highest — that is `repeated` for exactly this reason. Questions and choice options are `repeated` too, but for wire stability: the vendor takes them as maps keyed by id and evaluates each question independently and in isolation, so their order does not reach it.
+Ordering only changes an answer for `score` levels, which stay an ordered array end to end — including on the vendor's side — and are evaluated lowest to highest; that is `repeated` for exactly this reason. Questions and choice options are `repeated` too, but for wire stability: the vendor takes them as maps keyed by id and evaluates each question independently and in isolation, so their order does not reach it.
 
 ### Confidence Is the Second Axis
 

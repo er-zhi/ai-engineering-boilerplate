@@ -19,12 +19,27 @@ pub const MAX_CHOICE_OPTIONS: usize = 255;
 pub const MAX_SCORE_LEVELS: usize = 10;
 pub const MIN_SCORE_LEVELS: usize = 2;
 pub const MAX_QUESTION_ID_BYTES: usize = 64;
-// A proxy for the vendor's real limit, which is a token count: 32k tokens for state plus the longest
-// question, inside a 64k-token request budget. Bytes are not tokens and the ratio varies by content, so
-// this picks the conservative side, ~4 bytes/token: 128 KiB reads as at most 32k tokens, so it can never
-// be read by the vendor as over budget the way the old 256 KiB byte cap could — that cap was ~65k tokens,
-// which the vendor could refuse after we had already paid for the hop.
-pub const MAX_STATE_BYTES: usize = 131_072;
+// The worst bytes-per-token ratio this validator assumes, since it has no tokenizer of its own. Plain
+// English runs closer to 4 bytes/token; dense CJK, base64, and short-keyed JSON commonly run under 2 —
+// the conservative side to assume, because a *lower* ratio means *more* tokens for the same bytes.
+pub const WORST_CASE_BYTES_PER_TOKEN: usize = 2;
+// The vendor's real ceiling for one Decide call: 32k tokens for state plus the longest question, inside
+// a 64k-token request budget. A token count, not bytes — MAX_STATE_PLUS_QUESTION_BYTES below is this
+// service's conservative conversion of it, not a vendor-published byte number.
+pub const VENDOR_STATE_PLUS_QUESTION_TOKENS: usize = 32_768;
+// VENDOR_STATE_PLUS_QUESTION_TOKENS converted to bytes at the worst-case ratio above: 65_536 (64 KiB).
+// within_state_and_question_budget checks a state plus one question's total against this, in addition
+// to (not instead of) MAX_STATE_BYTES and every question field's own limit below — those each bound one
+// field, so none of them alone catches a state plus a heavily optioned choice question that is only
+// over budget in combination.
+pub const MAX_STATE_PLUS_QUESTION_BYTES: usize =
+    VENDOR_STATE_PLUS_QUESTION_TOKENS * WORST_CASE_BYTES_PER_TOKEN;
+// A proxy for part of the limit above, applied to state alone: MAX_STATE_PLUS_QUESTION_BYTES (65_536)
+// minus MAX_INSTRUCTIONS_BYTES (8_192, what a question's own instructions may claim) leaves 57_344; this
+// is set below that, at 48 KiB (49_152), so a question that also carries choice options or score levels
+// — summed with state by within_state_and_question_budget, not bounded by this constant alone — still
+// has headroom before that combined check refuses it.
+pub const MAX_STATE_BYTES: usize = 49_152;
 pub const MAX_INSTRUCTIONS_BYTES: usize = 8_192;
 // The caller writes these and the provider bills for them, so each is bounded as well as counted: 255
 // options of arbitrary length is a large paid request. An option name is the key its answer comes back
@@ -66,12 +81,15 @@ pub fn validated_decision(request: DecideRequest) -> Result<Decision, ConnectErr
     let state = json_from(request.state.into_option())
         .map_err(|error| ConnectError::invalid_argument(format!("state {error}")))?;
     let state = within_json_budget("state", state, MAX_STATE_BYTES)?;
+    let state_bytes = state.to_string().len();
 
     let mut asked = HashSet::new();
     let mut questions = Vec::with_capacity(request.questions.len());
     for question in request.questions {
         validated_id(&question.id, &mut asked)?;
-        questions.push(validated_question(question)?);
+        let question = validated_question(question)?;
+        within_state_and_question_budget(state_bytes, &question)?;
+        questions.push(question);
     }
 
     Ok(Decision { state, questions })
@@ -130,6 +148,48 @@ fn within_json_budget(what: &str, value: Value, limit: usize) -> Result<Value, C
         )));
     }
     Ok(value)
+}
+
+// MAX_STATE_BYTES and MAX_INSTRUCTIONS_BYTES each bound one field; neither catches a state plus a
+// question whose choice options or score levels, summed, are what pushes the two over the vendor's real
+// per-call ceiling — a heavily optioned choice question can dwarf the budget on its options alone even
+// though every individual name, description or level is within its own limit. This checks the sum.
+fn within_state_and_question_budget(
+    state_bytes: usize,
+    question: &Question,
+) -> Result<(), ConnectError> {
+    let bytes = question_bytes(question);
+    let combined = state_bytes + bytes;
+    if combined > MAX_STATE_PLUS_QUESTION_BYTES {
+        return Err(ConnectError::invalid_argument(format!(
+            "state is {state_bytes} bytes and question {} is {bytes} bytes; together they are {combined} \
+             bytes, over the {MAX_STATE_PLUS_QUESTION_BYTES} byte limit the vendor holds state plus one \
+             question to",
+            question.id
+        )));
+    }
+    Ok(())
+}
+
+// The bytes of everything about one question that counts toward the vendor's state-plus-question
+// ceiling: its instructions, plus whatever its kind asks the model to read — choice option names and
+// descriptions, score levels, or a noul's when_true/when_false.
+fn question_bytes(question: &Question) -> usize {
+    question.instructions.to_string().len() + kind_bytes(&question.kind)
+}
+
+fn kind_bytes(kind: &QuestionKind) -> usize {
+    match kind {
+        QuestionKind::Noul {
+            when_true,
+            when_false,
+        } => when_true.as_deref().map_or(0, str::len) + when_false.as_deref().map_or(0, str::len),
+        QuestionKind::Choice { options } => options
+            .iter()
+            .map(|option| option.name.len() + option.description.as_deref().map_or(0, str::len))
+            .sum(),
+        QuestionKind::Score { levels } => levels.iter().map(String::len).sum(),
+    }
 }
 
 fn validated_kind(id: &str, kind: Option<question::Kind>) -> Result<QuestionKind, ConnectError> {
@@ -325,11 +385,17 @@ mod tests {
     }
 
     #[test]
-    fn max_state_bytes_cannot_exceed_the_vendors_32k_token_ceiling() {
-        // The vendor's ceiling is 32k tokens for state plus the longest question. At the conservative
-        // ~4 bytes/token this comment assumes, 128 KiB reads as at most 32k tokens, so it can never be
-        // read by the vendor as over its limit the way the old 256 KiB byte cap could.
-        assert_eq!(MAX_STATE_BYTES, 128 * 1024);
+    fn state_plus_instructions_stays_under_the_vendors_token_ceiling_at_the_worst_case_ratio() {
+        // Not a restatement of the constant: this recomputes the relationship the comment on
+        // MAX_STATE_BYTES claims, from the same named ratio, so the two cannot silently drift apart.
+        let worst_case_tokens =
+            (MAX_STATE_BYTES + MAX_INSTRUCTIONS_BYTES) / WORST_CASE_BYTES_PER_TOKEN;
+
+        assert!(
+            worst_case_tokens < VENDOR_STATE_PLUS_QUESTION_TOKENS,
+            "state plus instructions is {worst_case_tokens} tokens at {WORST_CASE_BYTES_PER_TOKEN} \
+             bytes/token, the vendor's ceiling is {VENDOR_STATE_PLUS_QUESTION_TOKENS}"
+        );
     }
 
     #[test]
@@ -352,6 +418,27 @@ mod tests {
         assert_refused(
             deciding_about(one_byte_over, vec![noul_question("is_urgent")]),
             &MAX_STATE_BYTES.to_string(),
+        );
+    }
+
+    #[test]
+    fn a_choice_questions_options_alone_can_push_state_plus_question_over_the_combined_limit() {
+        // Every individual limit here is satisfied: 255 options is the class ceiling, not over it; each
+        // description is exactly MAX_OPTION_DESCRIPTION_BYTES, not over it; the state is trivial. Only
+        // the sum is over budget, which is exactly what within_state_and_question_budget exists to catch.
+        let descriptions = "d".repeat(MAX_OPTION_DESCRIPTION_BYTES);
+        let names = named(MAX_CHOICE_OPTIONS, "o");
+        let heavy = choice_question(
+            "department",
+            names
+                .iter()
+                .map(|name| (name.as_str(), descriptions.as_str()))
+                .collect(),
+        );
+
+        assert_refused(
+            deciding(vec![heavy]),
+            &MAX_STATE_PLUS_QUESTION_BYTES.to_string(),
         );
     }
 
