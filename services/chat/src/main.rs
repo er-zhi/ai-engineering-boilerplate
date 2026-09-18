@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use buffa::EnumValue;
-use chat::classifier::MAX_TITLE_CHARS;
 use chat::entity::message::MAX_CONTENT_CHARS;
 use chat::events::TopicEvent;
 use chat::events::TopicEventKind;
+use chat::intent::MAX_TITLE_CHARS;
 use chat::topic_manager::TopicManager;
 use chat::topic_status::status_proto;
 use chrono::Utc;

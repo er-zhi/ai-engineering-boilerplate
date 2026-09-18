@@ -11,10 +11,10 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use crate::classifier::{Action, MAX_TITLE_CHARS, TopicSummary, truncate};
 use crate::entity::message;
 use crate::entity::topic::{self, Status};
 use crate::error::ChatError;
+use crate::intent::{Action, MAX_TITLE_CHARS, Routing, TopicSummary, truncate};
 use crate::session_manager::principal_of;
 use crate::topic_manager::TopicManager;
 
@@ -61,9 +61,11 @@ impl TopicManager {
                 result_summary: topic.result_summary.clone(),
             })
             .collect();
-        self.classifier
-            .classify(&summaries, focus_topic_id, content)
-            .await
+        match self.intent.route(&summaries, focus_topic_id, content).await {
+            Routing::Act(actions) => actions,
+            // Task 8 replaces this with the CLARIFICATION_NEEDED event
+            Routing::Clarify => crate::intent::fallback(&summaries, focus_topic_id, content),
+        }
     }
 
     async fn deliver_turn(
@@ -345,14 +347,11 @@ mod tests {
         }
     }
 
-    const CLASSIFY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    const DECIDE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn both_retries_of_one_turn_reach_the_classifier_before_either_takes_the_turn_lock() {
+    async fn both_retries_of_one_turn_reach_the_decision_before_either_takes_the_turn_lock() {
         let (_test, manager, fake, router) = manager_with_router().await;
-        router.answer_with(
-            r#"{"actions":[{"kind":"new","title":"Claude Code","question":"What is Claude Code?"}]}"#,
-        );
         router.hold_every_call_until(Arc::new(tokio::sync::Barrier::new(2)));
         let user_id = Uuid::new_v4();
         manager.session_of_user(user_id).await.expect("session");
@@ -365,9 +364,9 @@ mod tests {
             })
             .collect();
         for retry in retries {
-            tokio::time::timeout(CLASSIFY_DEADLINE, retry)
+            tokio::time::timeout(DECIDE_DEADLINE, retry)
                 .await
-                .expect("the classifier call must not run under the turn lock")
+                .expect("the decision call must not run under the turn lock")
                 .expect("join")
                 .expect("send_turn");
         }
@@ -613,9 +612,7 @@ mod tests {
     async fn a_first_message_in_an_empty_session_becomes_a_started_topic() {
         let (_test, manager, fake, router) = manager_with_router().await;
         let user_id = Uuid::new_v4();
-        router.answer_with(
-            r#"{"actions":[{"kind":"new","title":"Claude Code","question":"What is Claude Code?"}]}"#,
-        );
+        router.answer_decision(None, vec![("actionable", 0.9)]);
 
         let topic_id = one_topic(
             manager
@@ -625,7 +622,7 @@ mod tests {
         );
 
         let topic = topic_row(&manager, topic_id).await;
-        assert_eq!(topic.title, "Claude Code");
+        assert_eq!(topic.title, "What is Claude Code?");
         assert_eq!(topic.status, Status::Running);
         assert_eq!(focus_of(&manager, user_id).await, Some(topic_id));
         let starts = fake.start_executions.lock().expect("lock");
@@ -643,6 +640,7 @@ mod tests {
     async fn a_message_naming_two_themes_opens_two_topics_and_focuses_the_first() {
         let (_test, manager, fake, router) = manager_with_router().await;
         let user_id = Uuid::new_v4();
+        router.answer_decision(None, vec![("separate_themes", 0.9)]);
         router.answer_with(
             r#"{"actions":[
                 {"kind":"new","title":"Claude Code","question":"What is Claude Code?"},
@@ -689,9 +687,7 @@ mod tests {
             .await
             .expect("create");
         let starts_before = fake.start_execution_count();
-        router.answer_with(&format!(
-            r#"{{"actions":[{{"kind":"continue","topic_id":{topic_id}}}]}}"#
-        ));
+        router.answer_decision(Some((&format!("topic_{topic_id}"), 0.9)), vec![]);
 
         let routed = manager
             .send_turn(user_id, Uuid::new_v4(), "and which IDEs?".into())
@@ -733,9 +729,7 @@ mod tests {
     async fn the_session_view_returns_each_topic_s_messages_in_order() {
         let (_test, manager, _fake, router) = manager_with_router().await;
         let user_id = Uuid::new_v4();
-        router.answer_with(
-            r#"{"actions":[{"kind":"new","title":"Claude Code","question":"What is Claude Code?"}]}"#,
-        );
+        router.answer_decision(None, vec![("actionable", 0.9)]);
         let first_turn_id = Uuid::new_v4();
         let topic_id = one_topic(
             manager
@@ -743,9 +737,7 @@ mod tests {
                 .await
                 .expect("send_turn"),
         );
-        router.answer_with(&format!(
-            r#"{{"actions":[{{"kind":"continue","topic_id":{topic_id}}}]}}"#
-        ));
+        router.answer_decision(Some((&format!("topic_{topic_id}"), 0.9)), vec![]);
         let second_turn_id = Uuid::new_v4();
         manager
             .send_turn(user_id, second_turn_id, "and which IDEs?".into())

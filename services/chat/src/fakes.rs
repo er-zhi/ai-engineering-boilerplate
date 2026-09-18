@@ -10,8 +10,10 @@ use common::proto::engine::v1::{
     StartExecutionResponse, StreamEventsRequest as EngineStreamEventsRequest,
 };
 use common::proto::llm_router::v1::{
-    CompleteRequest, CompleteResponse, DescribeTiersRequest, DescribeTiersResponse,
-    LlmRouterService,
+    Answer, ChoiceAnswer, CompleteRequest, CompleteResponse, DecideRequest, DecideResponse,
+    DescribeModelsRequest, DescribeModelsResponse, DescribeTiersRequest, DescribeTiersResponse,
+    LlmRouterService, LlmRouterServiceRegisterMarker, NoulAnswer, SystemOneService,
+    SystemOneServiceRegisterMarker,
 };
 use connectrpc::{
     RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult, ServiceStream,
@@ -198,11 +200,30 @@ impl EngineService for FakeEngine {
     }
 }
 
+/// Counts what a turn actually spent, so a test can assert that the fast path made one typed call
+/// and nothing else.
+#[derive(Clone, Default)]
+pub struct Calls(Arc<AtomicUsize>);
+
+impl Calls {
+    fn record(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn completions(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Default)]
 pub struct FakeLlmRouter {
     pub answer: Mutex<Option<String>>,
     pub prompts: Mutex<Vec<String>>,
     pub meeting: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub completions: Calls,
+    route: Mutex<Option<(String, f64)>>,
+    nouls: Mutex<HashMap<String, f64>>,
 }
 
 impl FakeLlmRouter {
@@ -212,6 +233,19 @@ impl FakeLlmRouter {
 
     pub fn hold_every_call_until(&self, meeting: Arc<tokio::sync::Barrier>) {
         *self.meeting.lock().expect("lock") = Some(meeting);
+    }
+
+    /// Arms the `Decide` response: `route` picks an existing topic (`"topic_<id>"`) or `"new"` with a
+    /// confidence, and `nouls` answers any other requested question id (`actionable`,
+    /// `separate_themes`) with a calibrated value. Neither is required — a call that arms nothing
+    /// leaves `Decide` failing, matching an unarmed `Complete`.
+    pub fn answer_decision(&self, route: Option<(&str, f64)>, nouls: Vec<(&str, f64)>) {
+        *self.route.lock().expect("lock") =
+            route.map(|(choice, confidence)| (choice.to_owned(), confidence));
+        *self.nouls.lock().expect("lock") = nouls
+            .into_iter()
+            .map(|(id, value)| (id.to_owned(), value))
+            .collect();
     }
 }
 
@@ -224,10 +258,7 @@ impl LlmRouterService for FakeLlmRouter {
     ) -> ServiceResult<CompleteResponse> {
         let owned = request.to_owned_message();
         self.prompts.lock().expect("lock").push(owned.user_prompt);
-        let meeting = self.meeting.lock().expect("lock").clone();
-        if let Some(meeting) = meeting {
-            meeting.wait().await;
-        }
+        self.completions.record();
         match self.answer.lock().expect("lock").clone() {
             Some(content) => Response::ok(CompleteResponse {
                 content,
@@ -245,6 +276,77 @@ impl LlmRouterService for FakeLlmRouter {
     ) -> ServiceResult<DescribeTiersResponse> {
         Response::ok(DescribeTiersResponse::default())
     }
+}
+
+// `Decide` is the first call of every turn now (see topic_turn.rs), so `hold_every_call_until`
+// holds here — the barrier used to sit on `complete`, back when that was the call every turn made.
+#[allow(refining_impl_trait)]
+impl SystemOneService for FakeLlmRouter {
+    async fn decide(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, DecideRequest>,
+    ) -> ServiceResult<DecideResponse> {
+        let owned = request.to_owned_message();
+        let meeting = self.meeting.lock().expect("lock").clone();
+        if let Some(meeting) = meeting {
+            meeting.wait().await;
+        }
+        let route = self.route.lock().expect("lock").clone();
+        let nouls = self.nouls.lock().expect("lock").clone();
+        if route.is_none() && nouls.is_empty() {
+            return Err(connectrpc::ConnectError::unavailable(
+                "configured fake llm-router failure",
+            ));
+        }
+        let answers = owned
+            .questions
+            .iter()
+            .filter_map(|question| scripted_answer(&question.id, &route, &nouls))
+            .collect();
+        Response::ok(DecideResponse {
+            answers,
+            ..Default::default()
+        })
+    }
+
+    async fn describe_models(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, DescribeModelsRequest>,
+    ) -> ServiceResult<DescribeModelsResponse> {
+        Response::ok(DescribeModelsResponse::default())
+    }
+}
+
+fn scripted_answer(
+    id: &str,
+    route: &Option<(String, f64)>,
+    nouls: &HashMap<String, f64>,
+) -> Option<Answer> {
+    if id == "route" {
+        let (choice, confidence) = route.as_ref()?;
+        return Some(Answer {
+            id: id.to_owned(),
+            answer: ChoiceAnswer {
+                choice: choice.clone(),
+                confidence: *confidence,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        });
+    }
+    let value = nouls.get(id)?;
+    Some(Answer {
+        id: id.to_owned(),
+        answer: NoulAnswer {
+            noul: *value,
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    })
 }
 
 async fn serve(connect: ConnectRouter) -> String {
@@ -272,13 +374,59 @@ pub async fn manager_with_router() -> (
     let fake = Arc::new(FakeEngine::default());
     let router = Arc::new(FakeLlmRouter::default());
     let engine_url = serve(ConnectRouter::new().add_service(Arc::clone(&fake))).await;
-    let router_url = serve(ConnectRouter::new().add_service(Arc::clone(&router))).await;
+    let router_url = serve(router_service(Arc::clone(&router))).await;
     let manager = Arc::new(
         TopicManager::new(test.db.clone(), &engine_url, &router_url)
             .expect("manager")
             .with_reconnect_delays(Duration::from_millis(1), Duration::from_millis(20)),
     );
     (test, manager, fake, router)
+}
+
+// `FakeLlmRouter` implements both traits on one type, so `add_service` needs the register marker
+// for each — one plain `add_service` call cannot infer which trait's route table to add.
+fn router_service(router: Arc<FakeLlmRouter>) -> ConnectRouter {
+    ConnectRouter::new()
+        .add_service::<_, LlmRouterServiceRegisterMarker>(Arc::clone(&router))
+        .add_service::<_, SystemOneServiceRegisterMarker>(router)
+}
+
+/// Answers only the given nouls; no `route` answer, so nothing is chosen.
+pub async fn serve_decider(nouls: Vec<(&'static str, f64)>) -> (String, Calls) {
+    let router = Arc::new(FakeLlmRouter::default());
+    router.answer_decision(None, nouls);
+    served(router).await
+}
+
+/// Answers `route` with `choice` and `confidence`, and `actionable` high.
+pub async fn serve_decider_choosing(choice: &'static str, confidence: f64) -> (String, Calls) {
+    serve_decider_choosing_with(choice, confidence, vec![("actionable", 0.9)]).await
+}
+
+/// As above, with the nouls scripted explicitly — used to prove that a low `actionable` does not
+/// override a confident route.
+pub async fn serve_decider_choosing_with(
+    choice: &'static str,
+    confidence: f64,
+    nouls: Vec<(&'static str, f64)>,
+) -> (String, Calls) {
+    let router = Arc::new(FakeLlmRouter::default());
+    router.answer_decision(Some((choice, confidence)), nouls);
+    served(router).await
+}
+
+/// Answers `separate_themes` high, and returns `plan` from `Complete`.
+pub async fn serve_decider_splitting(plan: &'static str) -> (String, Calls) {
+    let router = Arc::new(FakeLlmRouter::default());
+    router.answer_decision(None, vec![("separate_themes", 0.9)]);
+    router.answer_with(plan);
+    served(router).await
+}
+
+async fn served(router: Arc<FakeLlmRouter>) -> (String, Calls) {
+    let calls = router.completions.clone();
+    let url = serve(router_service(router)).await;
+    (url, calls)
 }
 
 pub async fn arm_completed_event(

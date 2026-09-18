@@ -9,11 +9,11 @@ use common::proto::engine::v1::ExecutionEventKind;
 use sea_orm::EntityTrait;
 use uuid::Uuid;
 
-use crate::classifier::truncate;
 use crate::engine_client::EngineEvent;
 use crate::entity::topic::{self, Status};
 use crate::error::ChatError;
 use crate::events::{TopicEvent, TopicEventKind};
+use crate::intent::truncate;
 use crate::session_manager::principal_of;
 use crate::topic_manager::TopicManager;
 use crate::topic_status::status_word;

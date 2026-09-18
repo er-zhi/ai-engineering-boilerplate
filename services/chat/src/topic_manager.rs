@@ -9,7 +9,6 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use crate::classifier::TopicClassifier;
 use crate::engine_client::EngineClient;
 use crate::entity::topic::{self, Status};
 use crate::entity::{message, session};
@@ -17,6 +16,7 @@ use crate::error::ChatError;
 use crate::event_log;
 use crate::event_log::event;
 use crate::events::{EventBus, TopicEvent, TopicEventKind};
+use crate::intent::TopicIntent;
 use common::principal::Principal;
 
 use crate::session_manager::{SessionManager, lock_session, principal_of};
@@ -27,7 +27,7 @@ pub struct TopicManager {
     pub session: SessionManager,
     pub(crate) engine: EngineClient,
     pub(crate) events: EventBus,
-    pub(crate) classifier: TopicClassifier,
+    pub(crate) intent: TopicIntent,
     pub(crate) reconnect_base_delay: std::time::Duration,
     pub(crate) reconnect_max_delay: std::time::Duration,
 }
@@ -42,7 +42,7 @@ impl TopicManager {
             session: SessionManager::new(db),
             engine: EngineClient::new(engine_url)?,
             events: EventBus::default(),
-            classifier: TopicClassifier::new(llm_router_url)?,
+            intent: TopicIntent::new(llm_router_url)?,
             reconnect_base_delay: crate::topic_watcher::RECONNECT_BASE_DELAY,
             reconnect_max_delay: crate::topic_watcher::RECONNECT_MAX_DELAY,
         })
