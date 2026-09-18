@@ -891,12 +891,19 @@ async fn ask(client: &reqwest::Client, url: &str, pick: &str) -> Result<Value, S
     if !response.status().is_success() {
         return Err(format!("returned {}", response.status()));
     }
-    let body = response
-        .bytes()
+    // Streamed and checked per chunk, never buffered whole and measured afterwards: a size check
+    // that runs after `.bytes()` has already allocated the reply prevents nothing it is named for.
+    // `fetch()` in web_fetch.rs is the pattern.
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| format!("body could not be read: {error}"))?;
-    if body.len() > MAX_BODY_BYTES {
-        return Err(format!("replied with more than {MAX_BODY_BYTES} bytes"));
+        .map_err(|error| format!("body could not be read: {error}"))?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_BODY_BYTES {
+            return Err(format!("replied with more than {MAX_BODY_BYTES} bytes"));
+        }
     }
     let parsed: Value =
         serde_json::from_slice(&body).map_err(|error| format!("reply is not JSON: {error}"))?;
@@ -958,6 +965,167 @@ Expected: all pass.
 ```bash
 git add services/tool/src/tools/declarative.rs services/tool/src/service.rs
 git commit -m "tool: one executor runs every declarative row, whatever it is about"
+```
+
+---
+
+### Task 4b: Re-check every redirect hop against the SSRF guard
+
+**Files:**
+- Modify: `services/tool/src/tools/web_fetch.rs` (add the guarded GET beside `ensure_public_url`, and use it in `fetch`)
+- Modify: `services/tool/src/tools/declarative.rs` (use it in `ask`)
+- Modify: `services/tool/src/service.rs` (`bounded_http_client`)
+- Test: inline tests in `services/tool/src/tools/web_fetch.rs`
+
+**Interfaces:**
+- Produces: `pub async fn get_guarded(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<reqwest::Response, String>` in `web_fetch.rs`.
+
+> **Why this task exists.** `bounded_http_client` sets no redirect policy, so reqwest follows up to
+> 10 redirects on its own and `ensure_public_url` only ever sees the *first* URL. A public host that
+> answers 302 with `Location: http://169.254.169.254/` sends the request straight into the private
+> network the guard exists to keep it out of. This is pre-existing — `web_fetch` has shipped with it
+> — and the declarative executor inherits it from the shared client, which is why it is fixed here
+> rather than left for later. The SSRF boundary is only a boundary if every hop crosses it.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `services/tool/src/tools/web_fetch.rs`'s `mod tests`, using the same loopback-server pattern the file already uses:
+
+```rust
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_refused_at_the_hop() {
+        // A public host that answers 302 with a private Location is the whole attack: the first URL
+        // passes the guard, and without a per-hop check reqwest walks the rest of the way itself.
+        let redirector = serve_redirect("http://127.0.0.1:9/secrets").await;
+        let error = get_guarded(&reqwest::Client::new(), &redirector, TEST_TIMEOUT)
+            .await
+            .expect_err("the hop target must be refused");
+        assert!(error.contains("127.0.0.1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_public_address_is_followed() {
+        let destination = serve_body("<html><body>the page that answers</body></html>").await;
+        let redirector = serve_redirect(&destination).await;
+        let response = get_guarded(&reqwest::Client::new(), &redirector, TEST_TIMEOUT)
+            .await
+            .expect("a public hop is fine");
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_loop_stops_at_the_hop_cap_rather_than_spinning() {
+        let looping = serve_self_redirect().await;
+        let error = get_guarded(&reqwest::Client::new(), &looping, TEST_TIMEOUT)
+            .await
+            .expect_err("a loop must end");
+        assert!(error.contains("redirect"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_relative_location_is_resolved_against_the_url_it_came_from() {
+        let destination = serve_relative_redirect("/landing").await;
+        let response = get_guarded(&reqwest::Client::new(), &destination, TEST_TIMEOUT)
+            .await
+            .expect("a relative hop resolves");
+        assert!(response.status().is_success());
+    }
+```
+
+The loopback test servers pass `ensure_public_url` only because the test calls `get_guarded`
+directly; write `serve_redirect` / `serve_self_redirect` / `serve_relative_redirect` /
+`serve_body` as small `axum` routers in the same style as the file's existing helpers. The first
+test deliberately points at `127.0.0.1:9`, which nothing listens on — the guard must refuse it
+before a connection is attempted, so the port being closed never matters.
+
+- [ ] **Step 2: Run them to verify they fail**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo nextest run -p tool web_fetch::
+```
+Expected: FAIL to compile — `get_guarded` is not defined.
+
+- [ ] **Step 3: Implement**
+
+```rust
+/// How many hops a redirect chain may take before it is abandoned. Matches reqwest's own default,
+/// so nothing that worked under the automatic policy stops working under this one.
+const MAX_REDIRECT_HOPS: usize = 10;
+
+/// A GET that applies `ensure_public_url` to **every** URL in the chain, not just the first.
+///
+/// The client is built with `Policy::none()`, so reqwest hands each 3xx back instead of following
+/// it. That is the point: an automatic redirect is a request to an address nothing checked, and a
+/// public host answering `Location: http://169.254.169.254/` would otherwise walk straight past the
+/// guard. A relative `Location` is resolved against the URL it arrived from, exactly as a browser
+/// would, and then checked like any other.
+pub async fn get_guarded(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<reqwest::Response, String> {
+    let mut here = url.to_owned();
+    for _ in 0..=MAX_REDIRECT_HOPS {
+        let response = client
+            .get(&here)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| readable_send_failure(&here, &e))?;
+        let Some(location) = redirect_target(&response) else {
+            return Ok(response);
+        };
+        let next = resolve(&here, &location)?;
+        ensure_public_url(&next).await?;
+        here = next;
+    }
+    Err(format!(
+        "{url} redirected more than {MAX_REDIRECT_HOPS} times, so the chain was abandoned"
+    ))
+}
+
+fn redirect_target(response: &reqwest::Response) -> Option<String> {
+    response
+        .status()
+        .is_redirection()
+        .then(|| response.headers().get(http::header::LOCATION))
+        .flatten()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn resolve(from: &str, location: &str) -> Result<String, String> {
+    url::Url::parse(from)
+        .map_err(|e| format!("could not read {from} as a URL: {e}"))?
+        .join(location)
+        .map(String::from)
+        .map_err(|e| format!("could not resolve redirect target {location:?}: {e}"))
+}
+```
+
+Then:
+- `bounded_http_client` in `services/tool/src/service.rs` gains `.redirect(reqwest::redirect::Policy::none())`, with a comment pointing at `get_guarded` as the reason.
+- `fetch` in `web_fetch.rs` calls `get_guarded(client, url, timeout)` in place of its current `client.get(url).timeout(timeout).send()`, keeping its existing status check, streaming body cap and extraction untouched.
+- `ask` in `declarative.rs` does the same in place of its `client.get(url).send()`.
+
+Both call sites still apply `ensure_public_url` to the **first** URL where their untrusted input arrives, as they do today. `get_guarded` covers hops two onward; it is not a replacement for the entry check, because the entry check is what keeps a first request to a private address from being attempted at all.
+
+- [ ] **Step 4: Run the tests**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo nextest run -p tool
+cargo clippy -p tool --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+Expected: all pass, including every pre-existing `web_fetch` test — `fetch`'s observable behaviour must not change for any non-redirecting URL.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add services/tool/src/tools/web_fetch.rs services/tool/src/tools/declarative.rs services/tool/src/service.rs
+git commit -m "tool: the SSRF guard checks every redirect hop, not just the first URL"
 ```
 
 ---
