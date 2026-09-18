@@ -66,6 +66,7 @@ impl Dispatcher {
             .map(|tool| CatalogEntry {
                 name: tool.slug,
                 description: tool.description,
+                input_schema_json: tool.input_schema_json,
             })
             .collect();
         *cached = Some(CachedCatalog {
@@ -249,7 +250,7 @@ mod tests {
         }))
         .await;
         let dispatcher = Dispatcher::new(
-            LlmTaskExecutor::new(&llm_url).expect("llm client"),
+            LlmTaskExecutor::new(&llm_url, &tool_url).expect("llm client"),
             ToolTaskExecutor::new(&tool_url).expect("tool client"),
         );
         let state = json!({"llm": {"tool_call": {"name": "web_search", "args": {}}}});
@@ -270,7 +271,7 @@ mod tests {
         });
         let llm_url = serve_llm(Arc::clone(&llm)).await;
         let dispatcher = Dispatcher::new(
-            LlmTaskExecutor::new(&llm_url).expect("llm client"),
+            LlmTaskExecutor::new(&llm_url, &tool_url).expect("llm client"),
             ToolTaskExecutor::new(&tool_url).expect("tool client"),
         );
         let config = json!({"tool_calling": true});
@@ -297,7 +298,7 @@ mod tests {
         });
         let llm_url = serve_llm(Arc::clone(&llm)).await;
         let dispatcher = Dispatcher::new(
-            LlmTaskExecutor::new(&llm_url).expect("llm client"),
+            LlmTaskExecutor::new(&llm_url, "http://127.0.0.1:1").expect("llm client"),
             ToolTaskExecutor::new("http://127.0.0.1:1").expect("tool client"),
         );
 
@@ -318,7 +319,7 @@ mod tests {
         }))
         .await;
         let dispatcher = Dispatcher::new(
-            LlmTaskExecutor::new(&llm_url).expect("llm client"),
+            LlmTaskExecutor::new(&llm_url, &tool_url).expect("llm client"),
             ToolTaskExecutor::new(&tool_url).expect("tool client"),
         );
         let config = json!({"tool_calling": true});

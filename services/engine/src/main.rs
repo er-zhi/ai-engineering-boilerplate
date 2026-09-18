@@ -293,9 +293,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(_sole_engine) = engine::lease::claim_sole_engine_lock(&db).await? else {
         return Err(SECOND_ENGINE_REFUSED.into());
     };
+    let llm_router_url = env("LLM_ROUTER_URL")?;
+    let tool_service_url = env("TOOL_SERVICE_URL")?;
     let executor = dispatch::Dispatcher::new(
-        LlmTaskExecutor::new(&env("LLM_ROUTER_URL")?)?,
-        ToolTaskExecutor::new(&env("TOOL_SERVICE_URL")?)?,
+        LlmTaskExecutor::new(&llm_router_url, &tool_service_url)?,
+        ToolTaskExecutor::new(&tool_service_url)?,
     );
     match engine::lease::expire_abandoned_leases(&db).await {
         Ok(0) => {}
