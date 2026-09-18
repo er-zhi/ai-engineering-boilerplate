@@ -3,7 +3,8 @@
 use buffa::EnumValue;
 use chrono::Utc;
 use common::proto::llm_router::v1::{
-    CompleteRequest, LlmRouterServiceClient, QualityTier, ResponseFormat, Sampling,
+    CompleteRequest, DecideRequest, LlmRouterServiceClient, Noul, QualityTier, Question,
+    SystemOneServiceClient, answer::Answer as Given,
 };
 use connectrpc::Protocol;
 use connectrpc::client::{ClientConfig, HttpClient};
@@ -12,7 +13,6 @@ use sea_orm::{
     QueryFilter,
 };
 use serde_json::Value;
-use std::sync::LazyLock;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -22,38 +22,19 @@ use crate::providers::{AnySearchProvider, SearchProvider};
 use crate::tools::kb_client::KnowledgeBaseClient;
 
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
-const FEEDBACK_PLACEHOLDER: &str = "one or two sentences";
-const UNUSABLE_VERDICT: &str = "the model did not return the expected JSON shape";
 
-static VALIDATE_SYSTEM_PROMPT: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        r#"You validate a tool definition against 2026 API design standards. You will be given a tool's name, description, JSON Schema input_schema, JSON Schema output_schema, risk level, and timeout_seconds. Respond with exactly this JSON and nothing else, with approved false when it does not pass: {}. Approve only if input_schema and output_schema are each a plausible JSON Schema object, description clearly states what the tool does (and, for risk "write" or "destructive", what it changes), and timeout_seconds is plausible for that work."#,
-        serde_json::to_string(&Verdict {
-            approved: true,
-            feedback: FEEDBACK_PLACEHOLDER.to_owned(),
-        })
-        .expect("a Verdict always serializes")
-    )
-});
+// A wrong "yes" ships an unreviewed tool definition; a wrong "no" only costs a resubmission. 0.7 leans toward
+// the cheaper mistake without demanding near-certainty.
+const APPROVAL_THRESHOLD: f64 = 0.7;
 
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
-#[serde(default)]
-struct Verdict {
-    approved: bool,
-    feedback: String,
-}
+// A tool definition either meets the standard or it does not: that is a calibrated yes/no, not prose. Words
+// are only needed to explain a refusal, so they are only paid for on a refusal.
+const VALIDATION_INSTRUCTIONS: &str = "Does this tool definition meet 2026 API design standards?";
+const WHEN_TRUE: &str = "input_schema and output_schema are each a plausible JSON Schema object, the description clearly states what the tool does and, for write or destructive risk, what it changes, and timeout_seconds is plausible for that work";
+const WHEN_FALSE: &str = "any of those is missing, vague or implausible";
 
-impl Verdict {
-    fn reached(content: &str) -> (bool, String) {
-        let verdict: Self = serde_json::from_str(content).unwrap_or_default();
-        let feedback = if verdict.feedback.trim().is_empty() {
-            UNUSABLE_VERDICT.to_owned()
-        } else {
-            verdict.feedback
-        };
-        (verdict.approved, feedback)
-    }
-}
+const REFUSAL_SYSTEM_PROMPT: &str = "You are told a tool definition did not meet 2026 API design standards. You will be given the tool's name, description, JSON Schema input_schema, JSON Schema output_schema, risk level, and timeout_seconds. Explain in one or two sentences why this tool definition does not meet the standard.";
+const REFUSAL_FALLBACK: &str = "the review service could not explain the refusal";
 
 pub const MAX_SLUG_CHARS: usize = 64;
 pub const MAX_NAME_CHARS: usize = 128;
@@ -134,6 +115,7 @@ fn bounded(field: &str, value: &str, max_chars: usize) -> Result<(), ToolError> 
 pub struct Service {
     db: DatabaseConnection,
     llm: LlmRouterServiceClient<HttpClient>,
+    decider: SystemOneServiceClient<HttpClient>,
     search: AnySearchProvider,
     http: reqwest::Client,
     kb: KnowledgeBaseClient,
@@ -151,15 +133,17 @@ impl Service {
             .parse()
             .map_err(|e| format!("could not parse LLM_ROUTER_URL {llm_router_url:?}: {e}"))?;
         let http = bounded_http_client()?;
+        let client_config = ClientConfig::new(target)
+            .with_protocol(Protocol::Grpc)
+            .with_default_timeout(VALIDATE_TIMEOUT)
+            .proto();
         Ok(Self {
             db,
             llm: LlmRouterServiceClient::new(
                 HttpClient::plaintext_http2_only(),
-                ClientConfig::new(target)
-                    .with_protocol(Protocol::Grpc)
-                    .with_default_timeout(VALIDATE_TIMEOUT)
-                    .proto(),
+                client_config.clone(),
             ),
+            decider: SystemOneServiceClient::new(HttpClient::plaintext_http2_only(), client_config),
             search: AnySearchProvider::from_api_keys(you_api_key, brave_api_key, http.clone()),
             http,
             kb: KnowledgeBaseClient::new(knowledge_base_url)?,
@@ -209,32 +193,47 @@ impl Service {
                 "tool {tool_id} is not Draft"
             )));
         }
-        let user_prompt = format!(
-            "name: {}\ndescription: {}\ninput_schema: {}\noutput_schema: {}\nrisk: {:?}\ntimeout_seconds: {}",
-            tool.name,
-            tool.description,
-            tool.input_schema,
-            tool.output_schema,
-            tool.risk,
-            tool.timeout_seconds,
-        );
-        let response = self
-            .llm
-            .complete(CompleteRequest {
-                tier: EnumValue::Known(QualityTier::Medium),
-                system_prompt: VALIDATE_SYSTEM_PROMPT.clone(),
-                user_prompt,
-                sampling: Sampling {
-                    response_format: Some(EnumValue::Known(ResponseFormat::JsonObject)),
-                    ..Default::default()
-                }
-                .into(),
-                ..Default::default()
-            })
+
+        let mut request: DecideRequest = serde_json::from_value(serde_json::json!({
+            "state": definition_state(&tool),
+        }))
+        .map_err(|e| ToolError::InvalidRequest(format!("could not build the decision: {e}")))?;
+        let mut question: Question = serde_json::from_value(serde_json::json!({
+            "instructions": VALIDATION_INSTRUCTIONS,
+        }))
+        .map_err(|e| ToolError::InvalidRequest(format!("could not build the question: {e}")))?;
+        question.id = "meets_standard".to_owned();
+        question.kind = Noul {
+            when_true: Some(WHEN_TRUE.to_owned()),
+            when_false: Some(WHEN_FALSE.to_owned()),
+            ..Default::default()
+        }
+        .into();
+        request.questions = vec![question];
+
+        let decided = self
+            .decider
+            .decide(request)
             .await
             .map_err(|e| ToolError::InvalidRequest(format!("llm-router call failed: {e}")))?
             .into_owned();
-        let (approved, feedback) = Verdict::reached(&response.content);
+        let approved = decided
+            .answers
+            .iter()
+            .find(|answer| answer.id == "meets_standard")
+            .and_then(|answer| match answer.answer.as_ref() {
+                Some(Given::Noul(noul)) => Some(noul.noul),
+                _ => None,
+            })
+            .map(|noul| noul >= APPROVAL_THRESHOLD)
+            .ok_or_else(|| {
+                ToolError::InvalidRequest("the decision carried no answer".to_owned())
+            })?;
+        let feedback = if approved {
+            String::new()
+        } else {
+            self.refusal_words(&tool).await
+        };
 
         let mut active: ActiveModel = tool.into();
         active.status = Set(if approved {
@@ -246,6 +245,30 @@ impl Service {
         active.update(&self.db).await?;
 
         Ok((approved, feedback))
+    }
+
+    // A refusal is the only branch that needs prose, so Complete is only ever reached from here.
+    async fn refusal_words(&self, tool: &crate::entity::tool::Model) -> String {
+        let response = self
+            .llm
+            .complete(CompleteRequest {
+                tier: EnumValue::Known(QualityTier::Medium),
+                system_prompt: REFUSAL_SYSTEM_PROMPT.to_owned(),
+                user_prompt: definition_text(tool),
+                ..Default::default()
+            })
+            .await;
+        match response {
+            Ok(response) => {
+                let content = response.into_owned().content;
+                if content.trim().is_empty() {
+                    REFUSAL_FALLBACK.to_owned()
+                } else {
+                    content
+                }
+            }
+            Err(_) => REFUSAL_FALLBACK.to_owned(),
+        }
     }
 
     pub async fn activate_tool(&self, tool_id: i64, user_id: Uuid) -> Result<(), ToolError> {
@@ -471,6 +494,23 @@ fn already_reviewed(status: Status) -> bool {
     status != Status::Draft
 }
 
+// What the decider (and, on a refusal, Complete) is told about the tool under review.
+fn definition_state(tool: &crate::entity::tool::Model) -> Value {
+    Value::String(definition_text(tool))
+}
+
+fn definition_text(tool: &crate::entity::tool::Model) -> String {
+    format!(
+        "name: {}\ndescription: {}\ninput_schema: {}\noutput_schema: {}\nrisk: {:?}\ntimeout_seconds: {}",
+        tool.name,
+        tool.description,
+        tool.input_schema,
+        tool.output_schema,
+        tool.risk,
+        tool.timeout_seconds,
+    )
+}
+
 async fn ensure_all_urls_public(urls: &[String]) -> Result<(), String> {
     for url in urls {
         crate::tools::web_fetch::ensure_public_url(url).await?;
@@ -499,15 +539,22 @@ pub enum ExecuteOutcome {
 mod tests {
     use super::*;
     use common::proto::llm_router::v1::{
-        CompleteResponse, DescribeTiersRequest, DescribeTiersResponse, LlmRouterService,
+        Answer, CompleteResponse, DecideResponse, DescribeModelsRequest, DescribeModelsResponse,
+        DescribeTiersRequest, DescribeTiersResponse, LlmRouterService, NoulAnswer,
+        SystemOneService,
     };
     use connectrpc::{
         RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
     };
     use serde_json::json;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TEST_TIMEOUT_SECONDS: i32 = 30;
+    // A fixed owner so validate_tool tests can share draft_tool without minting a Uuid each time.
+    const OWNER: Uuid = Uuid::from_u128(1);
+    const REFUSAL_SENTENCE: &str =
+        "the description does not say what changes, and the timeout looks implausible";
 
     fn a_tool(slug: &str, name: &str, description: &str, risk: Risk) -> NewTool {
         NewTool::checked(
@@ -522,8 +569,18 @@ mod tests {
         .expect("a valid tool definition")
     }
 
+    async fn draft_tool(service: &Service) -> i64 {
+        service
+            .create_tool(
+                Some(OWNER),
+                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
+            )
+            .await
+            .expect("create")
+    }
+
     struct FakeLlmRouter {
-        reply: String,
+        completions: Arc<AtomicUsize>,
     }
 
     #[allow(refining_impl_trait)]
@@ -533,8 +590,9 @@ mod tests {
             _ctx: RequestContext,
             _request: ServiceRequest<'_, CompleteRequest>,
         ) -> ServiceResult<CompleteResponse> {
+            self.completions.fetch_add(1, Ordering::SeqCst);
             Response::ok(CompleteResponse {
-                content: self.reply.clone(),
+                content: REFUSAL_SENTENCE.to_owned(),
                 ..Default::default()
             })
         }
@@ -547,18 +605,56 @@ mod tests {
         }
     }
 
-    async fn serve_llm(reply: &str) -> String {
-        let fake = Arc::new(FakeLlmRouter {
-            reply: reply.to_owned(),
+    struct FakeSystemOne {
+        noul: f64,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl SystemOneService for FakeSystemOne {
+        async fn decide(
+            &self,
+            _ctx: RequestContext,
+            _request: ServiceRequest<'_, DecideRequest>,
+        ) -> ServiceResult<DecideResponse> {
+            Response::ok(DecideResponse {
+                answers: vec![Answer {
+                    id: "meets_standard".to_owned(),
+                    answer: NoulAnswer {
+                        noul: self.noul,
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        }
+
+        async fn describe_models(
+            &self,
+            _ctx: RequestContext,
+            _request: ServiceRequest<'_, DescribeModelsRequest>,
+        ) -> ServiceResult<DescribeModelsResponse> {
+            Response::ok(DescribeModelsResponse::default())
+        }
+    }
+
+    // The same URL now serves both LlmRouterService and SystemOneService, so the fake mounts both
+    // on one router. `completions` counts Complete calls, so a test can prove a path made none.
+    async fn serve_llm_counting_decisions(noul: f64) -> (String, Arc<AtomicUsize>) {
+        let completions = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(FakeLlmRouter {
+            completions: completions.clone(),
         });
-        let connect = ConnectRouter::new().add_service(fake);
+        let decider = Arc::new(FakeSystemOne { noul });
+        let connect = ConnectRouter::new().add_service(llm).add_service(decider);
         let app = axum::Router::new().fallback_service(connect.into_axum_service());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let address = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-        format!("http://{address}")
+        (format!("http://{address}"), completions)
     }
 
     async fn service_with(llm_url: &str) -> (crate::test_db::TestDb, Service) {
@@ -588,8 +684,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_confident_yes_validates_without_asking_for_words() {
+        let (llm_url, completions) = serve_llm_counting_decisions(0.93).await;
+        let (_test, service) = service_with(&llm_url).await;
+        let tool_id = draft_tool(&service).await;
+
+        let (approved, feedback) = service
+            .validate_tool(tool_id, OWNER)
+            .await
+            .expect("validate");
+
+        assert!(approved);
+        assert!(
+            feedback.is_empty(),
+            "an approval needs no prose: {feedback:?}"
+        );
+        assert_eq!(
+            completions.load(Ordering::SeqCst),
+            0,
+            "Complete was called on the happy path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_spends_one_completion_on_the_reason() {
+        let (llm_url, completions) = serve_llm_counting_decisions(0.08).await;
+        let (_test, service) = service_with(&llm_url).await;
+        let tool_id = draft_tool(&service).await;
+
+        let (approved, feedback) = service
+            .validate_tool(tool_id, OWNER)
+            .await
+            .expect("validate");
+
+        assert!(!approved);
+        assert!(!feedback.is_empty());
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreachable_decider_refuses_rather_than_approving() {
+        let (_test, service) = service_with("http://127.0.0.1:1").await;
+        let tool_id = draft_tool(&service).await;
+        assert!(service.validate_tool(tool_id, OWNER).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn create_tool_rejects_a_user_owned_system_slug() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let (_test, service) = service_with(&llm_url).await;
         let user_id = Uuid::new_v4();
 
@@ -611,7 +753,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn create_tool_starts_as_draft() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let (test, service) = service_with(&llm_url).await;
         let user_id = Uuid::new_v4();
 
@@ -633,24 +775,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn validate_tool_approves_and_advances_to_validated() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "clear and safe"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let (test, service) = service_with(&llm_url).await;
-        let user_id = Uuid::new_v4();
-        let tool_id = service
-            .create_tool(
-                Some(user_id),
-                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
-            )
-            .await
-            .expect("create");
+        let tool_id = draft_tool(&service).await;
 
         let (approved, feedback) = service
-            .validate_tool(tool_id, user_id)
+            .validate_tool(tool_id, OWNER)
             .await
             .expect("validate");
 
         assert!(approved);
-        assert_eq!(feedback, "clear and safe");
+        assert!(feedback.is_empty());
         let row = crate::entity::tool::Entity::find_by_id(tool_id)
             .one(&test.db)
             .await
@@ -661,42 +796,27 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn validate_tool_rejects_a_tool_that_is_no_longer_draft() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let (_test, service) = service_with(&llm_url).await;
-        let user_id = Uuid::new_v4();
-        let tool_id = service
-            .create_tool(
-                Some(user_id),
-                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
-            )
-            .await
-            .expect("create");
+        let tool_id = draft_tool(&service).await;
         service
-            .validate_tool(tool_id, user_id)
+            .validate_tool(tool_id, OWNER)
             .await
             .expect("first validate");
 
-        let error = service.validate_tool(tool_id, user_id).await.unwrap_err();
+        let error = service.validate_tool(tool_id, OWNER).await.unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidRequest(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn validate_tool_rejection_stays_draft() {
-        let llm_url =
-            serve_llm(r#"{"approved": false, "feedback": "description is unclear"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.08).await;
         let (_test, service) = service_with(&llm_url).await;
-        let user_id = Uuid::new_v4();
-        let tool_id = service
-            .create_tool(
-                Some(user_id),
-                a_tool("echo", "Echo", "does something unclear", Risk::ReadOnly),
-            )
-            .await
-            .expect("create");
+        let tool_id = draft_tool(&service).await;
 
         let (approved, _) = service
-            .validate_tool(tool_id, user_id)
+            .validate_tool(tool_id, OWNER)
             .await
             .expect("validate");
 
@@ -705,35 +825,28 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn activate_tool_requires_validated_status() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let (_test, service) = service_with(&llm_url).await;
-        let user_id = Uuid::new_v4();
-        let tool_id = service
-            .create_tool(
-                Some(user_id),
-                a_tool("echo", "Echo", "Echoes input", Risk::ReadOnly),
-            )
-            .await
-            .expect("create");
+        let tool_id = draft_tool(&service).await;
 
         assert!(
-            service.activate_tool(tool_id, user_id).await.is_err(),
+            service.activate_tool(tool_id, OWNER).await.is_err(),
             "still Draft, not Validated"
         );
 
         service
-            .validate_tool(tool_id, user_id)
+            .validate_tool(tool_id, OWNER)
             .await
             .expect("validate");
         service
-            .activate_tool(tool_id, user_id)
+            .activate_tool(tool_id, OWNER)
             .await
             .expect("activate");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn list_tools_hides_other_users_tools() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let (_test, service) = service_with(&llm_url).await;
         let owner = Uuid::new_v4();
         let stranger = Uuid::new_v4();
@@ -748,7 +861,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_a_read_only_system_tool_runs_it() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         seed_system_tools(&service).await;
@@ -768,7 +881,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_argument_the_tool_does_not_declare_is_refused_naming_the_one_it_takes() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         seed_system_tools(&service).await;
@@ -792,7 +905,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_an_unregistered_slug_is_an_error() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
 
@@ -806,7 +919,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_a_write_tool_requires_approval_without_running_it() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         let user_id = Uuid::new_v4();
@@ -828,7 +941,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_a_user_created_tool_is_not_executable() {
-        let llm_url = serve_llm(r#"{"approved": true, "feedback": "ok"}"#).await;
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         let user_id = Uuid::new_v4();
