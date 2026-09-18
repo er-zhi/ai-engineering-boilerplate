@@ -19,12 +19,17 @@ use crate::error::ToolError;
 use crate::providers::{AnySearchProvider, SearchProvider};
 use crate::tools::kb_client::KnowledgeBaseClient;
 
-/// One round trip to `Decide`, end to end, same order and same reasoning as
-/// `services/chat/src/intent.rs`'s `DECIDE_CALL_TIMEOUT`: the vendor typically answers in about
-/// 100 ms, so 2 s covers a cold connection, a retry the vendor's SDK performs before it reports
-/// back, and this service's own hop out to llm-router and back — not a generous budget for the
-/// vendor, a bound on how long a submitter waits before `decide_call_error` turns the failure into
-/// an honest answer.
+/// One round trip to `Decide`, end to end. Measured in this deployment, `Decide`'s p50 is about
+/// 155 ms against `Complete`'s p50 of about 2000 ms (`llm_router.decisions.latency_ms` and
+/// `llm_router.requests.latency_ms`) — the same measurement `services/chat/src/intent.rs`'s and
+/// `services/engine/src/executors/llm.rs`'s `DECIDE_CALL_TIMEOUT` cite.
+///
+/// This caller's deadline is deliberately longer than either of those: a human submits a tool
+/// definition once, interactively, and would rather wait than have a slow vendor fail the
+/// submission outright, and — unlike Chat's turn or the engine's fast-dispatch path, which both
+/// have somewhere to fall back to — this path has no fallback if `Decide` fails: `decide_call_error`
+/// just turns it into a refusal. 10 s covers a cold connection and this service's own hop out to
+/// llm-router and back with room to spare, while one human waits on one submission.
 ///
 /// **Must stay strictly above `services/llm-router`'s `adapters::system_one::REQUEST_TIMEOUT`
 /// (1.5 s and shared by every caller of that adapter, this one included).** This client's deadline
@@ -35,9 +40,9 @@ use crate::tools::kb_client::KnowledgeBaseClient;
 /// audit row its synchronous write would have produced) before the inner timeout ever gets to
 /// finish and report cleanly; a whole-branch review traced exactly that bug for Chat's matching
 /// pair, fixed by keeping the inner strictly below the outer — see
-/// `services/llm-router/src/adapters/system_one/mod.rs`'s `REQUEST_TIMEOUT` doc comment. 2 s
-/// leaves the same margin here.
-const VALIDATE_TIMEOUT: Duration = Duration::from_secs(2);
+/// `services/llm-router/src/adapters/system_one/mod.rs`'s `REQUEST_TIMEOUT` doc comment. 10 s
+/// leaves generous margin here.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // A wrong "yes" ships an unreviewed tool definition; a wrong "no" only costs a resubmission. 0.7 leans toward
 // the cheaper mistake without demanding near-certainty.
@@ -693,7 +698,10 @@ mod tests {
     // The same race the whole-branch review traced for Chat's matching pair: an outer deadline
     // that is not strictly above llm-router's inner one always wins it, silently dropping the
     // audit row for the slow or failed attempt this timeout exists to bound. See
-    // `VALIDATE_TIMEOUT`'s doc comment.
+    // `VALIDATE_TIMEOUT`'s doc comment. This bound is the only hard requirement on the value —
+    // `VALIDATE_TIMEOUT` sits at 10 s, well above Chat's and the engine's matching 2 s constants,
+    // because this caller has no fallback if `Decide` fails and one human is waiting on one
+    // submission, not a live conversation.
     #[test]
     fn validate_timeout_stays_strictly_above_the_adapters_inner_deadline() {
         assert!(

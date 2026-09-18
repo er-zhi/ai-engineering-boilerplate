@@ -182,8 +182,9 @@ message DescribeModelsResponse {
 
 // Every ceiling Decide enforces locally, rendered from the constants it enforces them with, so the published
 // budget and the check cannot drift. A request that satisfies every field below individually is still
-// refused for its size if state plus its largest question exceeds max_state_plus_question_bytes — that
-// field is a combined ceiling over the two together, not one more independent field limit like the rest.
+// refused for its size if state plus its largest question exceeds max_state_plus_question_bytes, or if
+// state plus every question together exceeds max_request_bytes — those two fields are combined ceilings,
+// not one more independent field limit each like the rest.
 message DecisionBudget {
   int32 max_questions = 1;
   int32 max_question_id_bytes = 2;
@@ -205,6 +206,12 @@ message DecisionBudget {
   // lower ratio means more tokens for the same bytes, which is why the worst case is used). Measured over
   // state plus the largest single question, not each question independently.
   int32 max_state_plus_question_bytes = 11;
+  // The vendor's ceiling for the whole call: state plus every question together, not just the largest
+  // one — max_state_plus_question_bytes above can pass a request that is only over budget once every
+  // question is summed, since MAX_QUESTIONS questions can each be individually light and still add up
+  // past this ceiling. Rendered in bytes at the same worst-case ratio as max_state_plus_question_bytes,
+  // for the same reason.
+  int32 max_request_bytes = 12;
 }
 
 message ModelCard {

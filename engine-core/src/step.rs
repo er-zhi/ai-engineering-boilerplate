@@ -294,6 +294,7 @@ fn apply_output(
             }));
             if let Some(Node::Task { config, .. }) = graph.node(&output.node.node) {
                 charge_budget(execution, value);
+                apply_fast_tool_call(execution, value);
                 if let (Some(key), Some(reducer)) = (state_key(config), reducer_of(config)) {
                     apply_reducer(&mut execution.state, key, reducer, value.clone());
                 }
@@ -346,6 +347,29 @@ fn record_edges(
 /// node-per-node loop would have charged it, not less.
 fn extra_tool_call_charge(value: &serde_json::Value) -> u32 {
     u32::from(value.get(crate::llm_output::FAST_TOOL_CALL_FIELD).is_some())
+}
+
+/// The same `FAST_TOOL_CALL_FIELD` `extra_tool_call_charge` reads, for the same reason: an `llm`
+/// node's own reducer writes its output under its own `state_key` (`"llm"` in every graph today),
+/// never under `TOOL_RESULT_STATE_KEY` — only the graph's separate `tool` node's `Append` reducer
+/// does that. A fast-dispatched call bypasses that node entirely, so without this its result would
+/// never reach `TOOL_RESULT_STATE_KEY` at all, and every prompt built after it — including the very
+/// next one, if the model calls a second tool the normal way — would render as if that first call
+/// had never happened (see `services/engine/src/executors/llm.rs`'s `build_prompt`, which renders
+/// only that key). Appending it here, unconditionally, keeps `TOOL_RESULT_STATE_KEY` the one place
+/// every tool result lands regardless of which path produced it.
+fn apply_fast_tool_call(execution: &mut Execution, value: &serde_json::Value) {
+    if let Some(result) = value
+        .get(crate::llm_output::FAST_TOOL_CALL_FIELD)
+        .and_then(|call| call.get("result"))
+    {
+        apply_reducer(
+            &mut execution.state,
+            crate::llm_output::TOOL_RESULT_STATE_KEY,
+            crate::graph::Reducer::Append,
+            result.clone(),
+        );
+    }
 }
 
 fn charge_budget(execution: &mut Execution, value: &serde_json::Value) {
@@ -1068,6 +1092,102 @@ mod tests {
         );
 
         assert_eq!(exec.budget.tool_calls_remaining, calls_before - 2);
+    }
+
+    // The fast path's own `state_key` is `"llm"`, written by `Replace` (see `builder.rs`'s
+    // `agent_graph`) — never `TOOL_RESULT_STATE_KEY`, which only the graph's separate `tool` node's
+    // `Append` reducer writes. Without `apply_fast_tool_call`, a fast-dispatched result would be
+    // invisible to `build_prompt` and every render after it, which is why the model kept calling
+    // tools it had already gotten an answer from.
+    #[test]
+    fn a_fast_dispatched_tool_calls_result_reaches_tool_result_for_later_prompts() {
+        let g = graph(
+            vec![
+                Node::Task {
+                    id: NodeId("a".into()),
+                    kind: "llm".into(),
+                    config: json!({"state_key": "llm", "reducer": "Replace"}),
+                },
+                Node::End {
+                    id: NodeId("end".into()),
+                },
+            ],
+            vec![Edge {
+                from: NodeId("a".into()),
+                to: NodeId("end".into()),
+                condition: Condition::Always,
+            }],
+            "a",
+        );
+        let exec = execution("a");
+
+        let (exec, _) = step(
+            &g,
+            exec,
+            vec![ok(
+                "a",
+                json!({
+                    "reply": "68F, fog",
+                    crate::llm_output::FAST_TOOL_CALL_FIELD: {
+                        "name": "weather", "args": {}, "result": {"temp": "68F"},
+                    },
+                }),
+            )],
+            Utc::now(),
+        );
+
+        assert_eq!(
+            exec.state.get(crate::llm_output::TOOL_RESULT_STATE_KEY),
+            Some(&json!([{"temp": "68F"}])),
+            "the fast-dispatched result must land in tool_result, the one key every later prompt reads"
+        );
+    }
+
+    // A fast dispatch can follow a tool result the normal `llm` → `tool` loop already appended (or
+    // precede one a later iteration appends) — either way its result joins the same array in order,
+    // not overwrite it, so the whole call history stays visible to every later prompt.
+    #[test]
+    fn a_fast_dispatched_tool_calls_result_appends_after_any_earlier_ones() {
+        let g = graph(
+            vec![
+                Node::Task {
+                    id: NodeId("a".into()),
+                    kind: "llm".into(),
+                    config: json!({"state_key": "llm", "reducer": "Replace"}),
+                },
+                Node::End {
+                    id: NodeId("end".into()),
+                },
+            ],
+            vec![Edge {
+                from: NodeId("a".into()),
+                to: NodeId("end".into()),
+                condition: Condition::Always,
+            }],
+            "a",
+        );
+        let mut exec = execution("a");
+        exec.state = json!({"tool_result": [{"first": true}]});
+
+        let (exec, _) = step(
+            &g,
+            exec,
+            vec![ok(
+                "a",
+                json!({
+                    "reply": null,
+                    crate::llm_output::FAST_TOOL_CALL_FIELD: {
+                        "name": "weather", "args": {}, "result": {"second": true},
+                    },
+                }),
+            )],
+            Utc::now(),
+        );
+
+        assert_eq!(
+            exec.state.get("tool_result"),
+            Some(&json!([{"first": true}, {"second": true}]))
+        );
     }
 
     #[test]

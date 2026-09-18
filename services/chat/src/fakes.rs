@@ -33,6 +33,11 @@ use crate::topic_manager::TopicManager;
 pub struct FakeEngine {
     pub interrupts: Mutex<Vec<InterruptRequest>>,
     pub interrupt_failures_remaining: AtomicUsize,
+    /// Distinct from `interrupt_failures_remaining`: this simulates Engine reporting the topic's
+    /// execution as merely busy (`unavailable`), not broken, so `send_turn` must treat it as a
+    /// visible non-error outcome — see `topic_turn.rs`'s `engine_call_error` and item 5 of the fix
+    /// wave this belongs to.
+    pub interrupt_busy_remaining: AtomicUsize,
     pub start_executions: Mutex<Vec<StartExecutionRequest>>,
     pub principals: Mutex<Vec<Option<Principal>>>,
     pub completions: Mutex<HashMap<String, ExecutionEvent>>,
@@ -108,13 +113,24 @@ impl EngineService for FakeEngine {
             .expect("lock")
             .push(request.to_owned_message());
         if self
-            .interrupt_failures_remaining
+            .interrupt_busy_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
         {
             return Err(connectrpc::ConnectError::unavailable(
+                "configured fake engine: execution mid-tick",
+            ));
+        }
+        if self
+            .interrupt_failures_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(connectrpc::ConnectError::internal(
                 "configured fake engine interrupt failure",
             ));
         }

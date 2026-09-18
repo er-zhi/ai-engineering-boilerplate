@@ -14,6 +14,11 @@ pub enum EngineError {
     ExecutionNotFound(uuid::Uuid),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// The caller's request was fine; the execution it named is mid-tick and cannot be touched
+    /// right now. Distinct from `InvalidRequest`: retrying later, unchanged, can succeed, which is
+    /// exactly what `invalid_argument` promises never happens — see the `From` impl below.
+    #[error("execution busy: {0}")]
+    Busy(String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("database error: {0}")]
@@ -28,6 +33,7 @@ impl From<EngineError> for ConnectError {
             EngineError::InvalidGraph(_) | EngineError::InvalidRequest(_) => {
                 ConnectError::invalid_argument(error.to_string())
             }
+            EngineError::Busy(_) => ConnectError::unavailable(error.to_string()),
             EngineError::GraphNotFound(..) | EngineError::ExecutionNotFound(_) => {
                 ConnectError::not_found(error.to_string())
             }
@@ -89,5 +95,17 @@ mod tests {
             connect.to_string().contains("must decode to a JSON object"),
             "{connect}"
         );
+    }
+
+    // `unavailable`, not `invalid_argument`: a mid-tick execution is not a bad request, and the
+    // caller should not be told its retry will fail the same way — see `Busy`'s doc.
+    #[test]
+    fn a_busy_execution_answers_unavailable_not_invalid_argument() {
+        let connect = ConnectError::from(EngineError::Busy(
+            "execution 1 is mid-tick, retry shortly".to_owned(),
+        ));
+
+        assert_eq!(connect.code, ConnectError::unavailable("").code);
+        assert!(connect.to_string().contains("mid-tick"), "{connect}");
     }
 }

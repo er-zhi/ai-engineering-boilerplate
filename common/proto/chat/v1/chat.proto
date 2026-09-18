@@ -95,6 +95,9 @@ enum ChatEventKind {
   CHAT_EVENT_KIND_TOPIC_CANCELLED = 10;
   // The turn carried no request to act on. Session-level: topic_id is empty.
   CHAT_EVENT_KIND_CLARIFICATION_NEEDED = 11;
+  // A turn could not be delivered because its topic's execution was still busy (mid-tick) when it
+  // arrived. The turn was not queued and must be resent; topic_id names the topic it was aimed at.
+  CHAT_EVENT_KIND_ENGINE_BUSY = 12;
 }
 
 message ChatEvent {

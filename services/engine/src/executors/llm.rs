@@ -102,19 +102,21 @@ const RENDERED_TOOL_RESULTS: usize = 4;
 const MAX_TOOL_RESULT_CHARS: usize = 4_000;
 const TRUNCATION_MARK: &str = "… (truncated)";
 
-/// `Decide` gets its own deadline, separate from `CALL_TIMEOUT` (`Complete`'s). Same order and
-/// reasoning as `services/chat/src/intent.rs`'s `DECIDE_CALL_TIMEOUT` and
-/// `services/tool/src/service.rs`'s `VALIDATE_TIMEOUT`: the vendor typically answers in about
-/// 100 ms, so 2 s covers a cold connection, a retry the vendor's SDK performs before it reports
-/// back, and this service's own hop out to llm-router and back — not a generous budget for the
-/// vendor, a bound on how long this node waits before falling back to today's flow.
+/// `Decide` gets its own deadline, separate from `CALL_TIMEOUT` (`Complete`'s). Same measurement
+/// `services/chat/src/intent.rs`'s `DECIDE_CALL_TIMEOUT` cites: measured in this deployment,
+/// `Decide`'s p50 is about 155 ms against `Complete`'s p50 of about 2000 ms
+/// (`llm_router.decisions.latency_ms` and `llm_router.requests.latency_ms`). 2 s covers a cold
+/// connection and this service's own hop out to llm-router and back — not a generous budget for
+/// the vendor, a bound on how long this node waits before falling back to today's flow.
+/// `services/tool/src/service.rs`'s `VALIDATE_TIMEOUT` reasons the same way but is deliberately
+/// longer, since that path has no fallback to fall back to.
 ///
 /// **Must stay strictly above `services/llm-router`'s `adapters::system_one::REQUEST_TIMEOUT`
-/// (1.5 s), for the same reason Chat's and Tool's matching constants must**: this deadline is
-/// asserted as the `grpc-timeout` header llm-router's connectrpc server parses on receipt, wrapping
-/// the *entire* dispatch to the vendor in a deadline that starts strictly before the adapter's own
-/// clock does. Equal or shorter and this outer deadline always wins that race, silently dropping
-/// llm-router's decision future — audit write included — before the inner timeout ever finishes.
+/// (1.5 s), for the same reason Chat's matching constant must**: this deadline is asserted as the
+/// `grpc-timeout` header llm-router's connectrpc server parses on receipt, wrapping the *entire*
+/// dispatch to the vendor in a deadline that starts strictly before the adapter's own clock does.
+/// Equal or shorter and this outer deadline always wins that race, silently dropping llm-router's
+/// decision future — audit write included — before the inner timeout ever finishes.
 const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// A wrong or slow tool dispatched on the fast path is exactly one tool call, so it gets the same
 /// budget the normal `tool` node gives one — see `executors::tool::CALL_TIMEOUT`, which this

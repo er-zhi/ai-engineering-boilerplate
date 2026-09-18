@@ -101,6 +101,7 @@ fn event_kind_to_proto(kind: TopicEventKind) -> ChatEventKind {
         TopicEventKind::Notification => ChatEventKind::Notification,
         TopicEventKind::SessionReset => ChatEventKind::SessionReset,
         TopicEventKind::ClarificationNeeded => ChatEventKind::ClarificationNeeded,
+        TopicEventKind::EngineBusy => ChatEventKind::EngineBusy,
     }
 }
 

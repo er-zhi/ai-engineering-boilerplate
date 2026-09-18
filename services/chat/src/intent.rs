@@ -19,14 +19,13 @@ use crate::entity::topic::Status;
 use crate::topic_status::status_word;
 
 /// `Decide` gets its own deadline, separate from `Complete`'s (see `COMPLETE_CALL_TIMEOUT` below —
-/// the two must never again share one constant). The vendor's own docs put a typical answer at
-/// about 100 ms, with 0.27 s published for a 13-question call. This is 20x that headline number,
-/// not the usual 2x, because three things can each add real latency before any of the vendor's own
-/// answer arrives: a cold connection (no warm pool yet), a retry the vendor's SDK performs
-/// internally before it ever reports back to `services/llm-router`, and our own hop out to
-/// llm-router and back. `Decide` is advisory — see `route`'s doc and `fallback` below — so this
-/// bounds how long a user waits for the deterministic fallback to kick in on a bad day, not how
-/// generously the vendor is normally treated.
+/// the two must never again share one constant). Measured in this deployment, `Decide`'s p50 is
+/// about 155 ms against `Complete`'s p50 of about 2000 ms (`llm_router.decisions.latency_ms` and
+/// `llm_router.requests.latency_ms`). 2 s leaves wide headroom above that p50, because real latency
+/// can still stack up before an answer arrives: a cold connection (no warm pool yet), and our own
+/// hop out to llm-router and back. `Decide` is advisory — see `route`'s doc and `fallback` below —
+/// so this bounds how long a user waits for the deterministic fallback to kick in on a bad day, not
+/// how generously the vendor is normally treated.
 ///
 /// **This is the OUTER half of a matched pair with llm-router's own
 /// `adapters::system_one::REQUEST_TIMEOUT` (the INNER one, 1.5 s) — the inner must stay strictly
@@ -61,6 +60,13 @@ const SEPARATE_THEMES_THRESHOLD: f64 = 0.75;
 
 pub const CLARIFICATION_TEXT: &str =
     "I didn't catch a request in that — what would you like me to find out?";
+
+/// Shown when a follow-up arrives while its topic's execution is still running and Engine's
+/// `Interrupt` reports back busy rather than accepting it — see `topic_turn.rs::send_turn`. This is
+/// the interim answer to a message that could not be delivered: it tells the user honestly rather
+/// than losing the turn behind an `internal` error, without queueing it for them.
+pub const ENGINE_BUSY_TEXT: &str =
+    "Still working on the previous question — send that again in a moment.";
 
 const NEW_TOPIC_OPTION: &str = "new";
 const TOPIC_OPTION_PREFIX: &str = "topic_";

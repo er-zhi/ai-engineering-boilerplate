@@ -66,11 +66,49 @@ impl TopicManager {
 
         let turn_guard = self.session.db.begin().await?;
         lock_turn(&turn_guard, turn_id).await?;
-        let received = self
-            .deliver_turn(user_id, turn_id, &content, actions)
-            .await?;
+        // Engine reporting busy is caught here, not propagated: there is nowhere to queue this
+        // turn (see `EngineError::Busy`'s doc and item 5 of the fix wave this belongs to), so
+        // `turn_guard` rolls back with nothing written — the message truly was not delivered — but
+        // the caller must still see `Ok`, with something visible in the transcript in place of the
+        // `internal` error this used to come back as.
+        let received = match self.deliver_turn(user_id, turn_id, &content, actions).await {
+            Ok(received) => received,
+            Err(ChatError::EngineBusy(topic_id, _message)) => {
+                self.note_engine_busy(user_id, topic_id, turn_id, &content)
+                    .await?;
+                return Ok(Vec::new());
+            }
+            Err(other) => return Err(other),
+        };
         turn_guard.commit().await?;
         Ok(received)
+    }
+
+    /// Publishes a visible stand-in for a turn that could not be delivered because its topic's
+    /// execution was busy — see `send_turn`'s call site.
+    async fn note_engine_busy(
+        &self,
+        user_id: Uuid,
+        topic_id: i64,
+        turn_id: Uuid,
+        content: &str,
+    ) -> Result<(), ChatError> {
+        let session = self.session.get_or_create_session(user_id).await?;
+        self.publish(
+            TopicEvent::new(
+                session.id,
+                Some(topic_id),
+                TopicEventKind::EngineBusy,
+                Utc::now(),
+            )
+            .with_payload(serde_json::json!({
+                "text": crate::intent::ENGINE_BUSY_TEXT,
+                "turn_id": turn_id,
+                "content": content,
+            })),
+        )
+        .await;
+        Ok(())
     }
 
     async fn deliver_turn(
@@ -204,7 +242,7 @@ impl TopicManager {
                 self.engine
                     .interrupt(&principal_of(&session), execution_id, &input_json)
                     .await
-                    .map_err(ChatError::Engine)?;
+                    .map_err(|error| engine_call_error(topic.id, error))?;
                 Ok(Delivery::Existing(topic.id))
             }
             Status::Queued => Ok(Delivery::Existing(topic.id)),
@@ -237,6 +275,17 @@ impl TopicManager {
             .create_topic(user_id, Some(parent.id), title, input_json)
             .await?;
         Ok(child_id)
+    }
+}
+
+// `unavailable` is how Engine reports an execution that is merely mid-tick — see
+// `services/engine/src/error.rs`'s `EngineError::Busy` and its `From` impl. Anything else Engine's
+// `Interrupt` can fail with is a real failure, unchanged from before this distinction existed.
+fn engine_call_error(topic_id: i64, error: connectrpc::ConnectError) -> ChatError {
+    if error.code == connectrpc::ErrorCode::Unavailable {
+        ChatError::EngineBusy(topic_id, error.to_string())
+    } else {
+        ChatError::Engine(error.to_string())
     }
 }
 
@@ -686,6 +735,59 @@ mod tests {
             fake.interrupt_count(),
             2,
             "the retry must reach Engine, not short-circuit on a marker from the failed attempt"
+        );
+        assert_eq!(stored_turns(&manager, topic_id, turn_id).await, 1);
+    }
+
+    // Reproduces the bug live traffic hit: a follow-up sent while its topic's execution is still
+    // running used to come back `internal` in under 200 ms with the message nowhere — no topic
+    // row, no message row, nothing in the transcript. `SendTurn` must return `Ok`, and the user
+    // must see something, without this turning into a queue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_follow_up_while_engine_is_busy_is_visible_not_lost() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let (topic_id, _) = manager
+            .create_topic(user_id, None, "First".into(), serde_json::json!({}))
+            .await
+            .expect("create");
+        fake.interrupt_busy_remaining.store(1, Ordering::Relaxed);
+        let mut events = manager.subscribe();
+        let turn_id = Uuid::new_v4();
+
+        let routed = manager
+            .send_turn(user_id, turn_id, "still there?".into())
+            .await
+            .expect("SendTurn must return Ok even while Engine is busy");
+
+        assert!(routed.is_empty(), "nothing was delivered: {routed:?}");
+        assert_eq!(
+            stored_turns(&manager, topic_id, turn_id).await,
+            0,
+            "a busy Engine delivers nothing, so no dedup marker is left behind either"
+        );
+        let event = events.recv().await.expect("an event");
+        assert_eq!(event.kind, TopicEventKind::EngineBusy);
+        assert_eq!(event.topic_id, Some(topic_id));
+        assert_eq!(
+            event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str),
+            Some(crate::intent::ENGINE_BUSY_TEXT),
+            "the user must see something in the transcript, not silence"
+        );
+
+        let retried = manager
+            .send_turn(user_id, turn_id, "still there?".into())
+            .await
+            .expect("the retry, once Engine is no longer busy, must actually deliver");
+
+        assert_eq!(retried, vec![topic_id]);
+        assert_eq!(
+            fake.interrupt_count(),
+            2,
+            "the retry must reach Engine again, not short-circuit on nothing having been recorded"
         );
         assert_eq!(stored_turns(&manager, topic_id, turn_id).await, 1);
     }

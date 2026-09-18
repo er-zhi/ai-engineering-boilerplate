@@ -76,7 +76,7 @@ Reasoning models can spend the completion budget on hidden reasoning tokens befo
 
 A System One model does not generate text. It reads a **state** and answers **typed questions** about it with calibrated probabilities, so the decision lands in your code as a number rather than as prose to parse. Use it where an `if` needs a judgement it cannot compute: routing, triage, gating, ranking. Use `Complete` when you actually want words.
 
-Two callers use it today, and each still reaches for `Complete` only on the one branch that needs prose: Chat's `intent.rs` calls `Decide` once per turn to route it onto a topic, and falls to `Complete` only to write out the several `title`/`question` pairs a multi-theme split needs; Tool's `validate_tool` calls `Decide` to approve or refuse a submitted tool definition, and calls `Complete` only to explain a refusal.
+Two callers use it today: Chat's `intent.rs` calls `Decide` once per turn to route it onto a topic, and reaches for `Complete` only to write out the several `title`/`question` pairs a multi-theme split needs; Tool's `validate_tool` calls `Decide` against a set of per-criterion questions and composes a refusal in Rust from whichever answers came back false — it calls `Complete` nowhere in that path.
 
 [`SystemOneService`](../../common/proto/llm_router/v1/llm_router.proto) serves the class:
 
@@ -166,20 +166,21 @@ One vendor serves this class today, so a decision runs on one model and a failur
 
 ### The Budget
 
-`Decide` rejects a request that exceeds any of these before spending anything, naming the limit and the question it refused. `DescribeModels` publishes the same numbers. Every row but the last bounds one field on its own; a request can satisfy every one of those individually and still be refused, because the last row bounds `state` plus the single largest question together, not each independently.
+`Decide` rejects a request that exceeds any of these before spending anything, naming the limit and the question it refused. `DescribeModels` publishes the same numbers. Every row but the last two bounds one field on its own; a request can satisfy every one of those individually and still be refused, because the last two rows bound `state` plus questions together, not each field independently: one over `state` plus the single largest question, the other over `state` plus every question in the call summed.
 
 | Limit | Value |
 |---|---|
 | questions in one call | 64 |
 | question id | 64 bytes |
 | `instructions` per question | 8 KiB |
-| `state` | 128 KiB |
+| `state` | 48 KiB |
 | `choice` options | 1 to 255 |
 | option name | 64 bytes |
 | option description | 1 KiB |
 | `score` levels | 2 to 10 |
 | level text, and each noul criterion | 1 KiB |
 | `state` plus the largest question, combined | 64 KiB |
+| `state` plus every question, combined | 128 KiB |
 
 Shape is checked too: an empty question list, a duplicate or empty id, a question with no type, and a `state` or `instructions` the caller never set are all refused locally rather than sent and billed.
 

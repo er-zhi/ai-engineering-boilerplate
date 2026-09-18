@@ -22,10 +22,11 @@ const DECIDE_PATH: &str = "/v1/systemone";
 const MODELS_PATH: &str = "/v1/models";
 
 /// This adapter's own HTTP timeout to the vendor — never `openai_compatible`'s 60 s, and not
-/// shared with it: `Decide` is a typed decision, not generated prose. The vendor's docs put a
-/// typical answer at about 100 ms, with 0.27 s published for a 13-question call, so this is
-/// generous room for a cold connection and network jitter, kept at the same order as Chat's own
-/// deadline rather than at completion's 60 s.
+/// shared with it: `Decide` is a typed decision, not generated prose. Measured in this deployment,
+/// `Decide`'s p50 is about 155 ms against `Complete`'s p50 of about 2000 ms
+/// (`llm_router.decisions.latency_ms` and `llm_router.requests.latency_ms`), so 1.5 s is generous
+/// room for a cold connection and network jitter, kept at the same order as Chat's own deadline
+/// rather than at completion's 60 s.
 ///
 /// **This is the INNER half of a matched pair with Chat's `intent::DECIDE_CALL_TIMEOUT` (the
 /// OUTER one, 2 s) — it must stay strictly below it, and if you change one, change both.** The

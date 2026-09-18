@@ -13,7 +13,7 @@ impl Service {
     async fn load_idle(&self, execution_id: Uuid) -> Result<engine_core::Execution, EngineError> {
         let row = self.execution_row(execution_id).await?;
         if row.status == entity::execution::Status::Running {
-            return Err(EngineError::InvalidRequest(format!(
+            return Err(EngineError::Busy(format!(
                 "execution {execution_id} is mid-tick, retry shortly"
             )));
         }
@@ -212,6 +212,61 @@ mod tests {
             row.status,
             entity::execution::Status::Completed,
             "a finished execution is not revived"
+        );
+    }
+
+    // The caller's request was fine here — the execution is just mid-tick. This must answer
+    // `Busy`, not `InvalidRequest`: the status a connect error carries is what tells Chat whether
+    // this is worth telling the user to retry, or a request it should never resend unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_tick_execution_is_refused_as_busy_not_invalid() {
+        let test = crate::test_db::start().await;
+        let service = Service::new(test.db.clone());
+        service
+            .register_graph("t".to_owned(), &a_graph())
+            .await
+            .expect("register");
+        let execution_id = Uuid::new_v4();
+        entity::execution::ActiveModel {
+            id: Set(execution_id),
+            graph_id: Set("t".to_owned()),
+            graph_version: Set(1),
+            user_id: Set(None),
+            status: Set(entity::execution::Status::Running),
+            wait_kind: Set(None),
+            current_nodes: Set(serde_json::json!([])),
+            iteration: Set(1),
+            max_iterations: Set(10),
+            deadline: Set(None),
+            budget: Set(serde_json::to_value(Budget::new(
+                1000,
+                10,
+                std::time::Duration::from_secs(60),
+            ))
+            .unwrap()),
+            lease_owner: Set(Some("worker-1".to_owned())),
+            lease_until: Set(Some(Utc::now() + chrono::Duration::seconds(30))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+        }
+        .insert(&test.db)
+        .await
+        .expect("seed");
+
+        let result = service.cancel(execution_id).await;
+
+        assert!(matches!(result, Err(EngineError::Busy(_))), "{result:?}");
+        let connect: connectrpc::ConnectError = result.unwrap_err().into();
+        assert_eq!(connect.code, connectrpc::ConnectError::unavailable("").code);
+        let row = entity::execution::Entity::find_by_id(execution_id)
+            .one(&test.db)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            row.status,
+            entity::execution::Status::Running,
+            "a mid-tick execution is left alone, not cancelled out from under the worker running it"
         );
     }
 

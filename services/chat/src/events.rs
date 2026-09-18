@@ -21,6 +21,11 @@ pub enum TopicEventKind {
     Notification,
     SessionReset,
     ClarificationNeeded,
+    /// Published in place of delivering a turn whose target topic's execution was still running
+    /// when Engine's `Interrupt` reported back busy — see `topic_turn.rs::send_turn`. Distinct from
+    /// `ClarificationNeeded`: the user's message was well-formed, the server was just busy, and the
+    /// right response is "try again shortly," not "say more."
+    EngineBusy,
 }
 
 impl TopicEventKind {

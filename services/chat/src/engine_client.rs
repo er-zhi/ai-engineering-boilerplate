@@ -6,8 +6,8 @@ use common::proto::engine::v1::{
     EngineServiceClient, ExecutionEvent, ExecutionEventKind, InterruptRequest,
     StartExecutionRequest, StreamEventsRequest,
 };
-use connectrpc::Protocol;
 use connectrpc::client::{CallOptions, ClientConfig, HttpClient};
+use connectrpc::{ConnectError, Protocol};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -98,12 +98,16 @@ impl EngineClient {
         Uuid::parse_str(&response.execution_id).map_err(|e| e.to_string())
     }
 
+    /// Kept as the raw `ConnectError`, not stringified like this client's other calls: its `code`
+    /// is what lets `topic_turn.rs` tell an execution that is merely busy (`unavailable` — see
+    /// `services/engine/src/error.rs`'s `EngineError::Busy`) apart from one Engine genuinely could
+    /// not interrupt, which callers must still treat as a real failure.
     pub async fn interrupt(
         &self,
         principal: &Principal,
         execution_id: Uuid,
         input_json: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), ConnectError> {
         self.inner
             .interrupt_with_options(
                 InterruptRequest {
@@ -113,8 +117,7 @@ impl EngineClient {
                 },
                 principal_options(principal),
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
         Ok(())
     }
 
@@ -179,6 +182,7 @@ mod tests {
         received_interrupts: Mutex<Vec<InterruptRequest>>,
         received_principals: Mutex<Vec<Option<Principal>>>,
         stream_delay: Duration,
+        interrupt_error: Mutex<Option<connectrpc::ErrorCode>>,
     }
 
     fn fake_engine(execution_id: Uuid) -> Arc<FakeEngine> {
@@ -191,6 +195,7 @@ mod tests {
             received_interrupts: Mutex::new(Vec::new()),
             received_principals: Mutex::new(Vec::new()),
             stream_delay,
+            interrupt_error: Mutex::new(None),
         })
     }
 
@@ -240,6 +245,9 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push(request.to_owned_message());
+            if let Some(code) = *self.interrupt_error.lock().expect("lock") {
+                return Err(connectrpc::ConnectError::new(code, "configured failure"));
+            }
             Response::ok(InterruptResponse::default())
         }
         async fn resume(
@@ -340,6 +348,25 @@ mod tests {
         let received = fake.received_interrupts.lock().expect("lock");
         assert_eq!(received[0].execution_id, execution_id.to_string());
         assert_eq!(received[0].input_json, r#"{"question": "more"}"#);
+    }
+
+    // `interrupt`'s Err carries the real `ConnectError`, not a stringified one, precisely so a
+    // caller can tell `unavailable` (Engine merely busy) apart from anything else — see the doc on
+    // `interrupt` above. This pins that the code survives the round trip over the wire.
+    #[tokio::test]
+    async fn interrupts_error_code_survives_the_round_trip() {
+        let execution_id = Uuid::new_v4();
+        let fake = fake_engine(execution_id);
+        *fake.interrupt_error.lock().expect("lock") = Some(connectrpc::ErrorCode::Unavailable);
+        let url = serve(Arc::clone(&fake)).await;
+        let client = EngineClient::new(&url).expect("client");
+
+        let error = client
+            .interrupt(&a_principal(), execution_id, "{}")
+            .await
+            .expect_err("the fake is configured to fail this call");
+
+        assert_eq!(error.code, connectrpc::ErrorCode::Unavailable);
     }
 
     #[tokio::test]

@@ -41,6 +41,18 @@ pub const MAX_STATE_PLUS_QUESTION_BYTES: usize =
 // has headroom before that combined check refuses it.
 pub const MAX_STATE_BYTES: usize = 49_152;
 pub const MAX_INSTRUCTIONS_BYTES: usize = 8_192;
+// The vendor's ceiling for the whole call, not just its largest question: 64k tokens for state plus
+// every question together. A token count, not bytes — MAX_REQUEST_BYTES below is this service's
+// conservative conversion of it, at the same worst-case ratio as MAX_STATE_PLUS_QUESTION_BYTES above.
+pub const VENDOR_REQUEST_TOKENS: usize = 65_536;
+// VENDOR_REQUEST_TOKENS converted to bytes at the worst-case ratio above: 131_072 (128 KiB).
+// within_request_budget checks state plus every question's total against this, in addition to (not
+// instead of) MAX_STATE_PLUS_QUESTION_BYTES: that one bounds state plus only the single largest
+// question, so it alone cannot catch a request that is over budget only once every question is
+// summed — MAX_QUESTIONS (64) questions each within their own MAX_INSTRUCTIONS_BYTES (8 KiB) can
+// still add up to far more than this ceiling even though no single one is heavy enough to trip the
+// combined check above.
+pub const MAX_REQUEST_BYTES: usize = VENDOR_REQUEST_TOKENS * WORST_CASE_BYTES_PER_TOKEN;
 // The caller writes these and the provider bills for them, so each is bounded as well as counted: 255
 // options of arbitrary length is a large paid request. An option name is the key its answer comes back
 // under, exactly like a question id, and gets the same 64 bytes; a description, a score level and a noul's
@@ -63,6 +75,7 @@ pub fn published() -> DecisionBudget {
         max_score_levels: counted(MAX_SCORE_LEVELS),
         max_level_bytes: counted(MAX_LEVEL_BYTES),
         max_state_plus_question_bytes: counted(MAX_STATE_PLUS_QUESTION_BYTES),
+        max_request_bytes: counted(MAX_REQUEST_BYTES),
         ..Default::default()
     }
 }
@@ -92,6 +105,7 @@ pub fn validated_decision(request: DecideRequest) -> Result<Decision, ConnectErr
         within_state_and_question_budget(state_bytes, &question)?;
         questions.push(question);
     }
+    within_request_budget(state_bytes, &questions)?;
 
     Ok(Decision { state, questions })
 }
@@ -167,6 +181,24 @@ fn within_state_and_question_budget(
              bytes, over the {MAX_STATE_PLUS_QUESTION_BYTES} byte limit the vendor holds state plus one \
              question to",
             question.id
+        )));
+    }
+    Ok(())
+}
+
+// The vendor's whole-call ceiling: state plus every question together, not just the largest one.
+// within_state_and_question_budget above already refuses any single question that, combined with
+// state, is too heavy on its own; this catches the case that check cannot — many individually
+// light questions whose bytes still sum past the vendor's per-request limit.
+fn within_request_budget(state_bytes: usize, questions: &[Question]) -> Result<(), ConnectError> {
+    let question_bytes_total: usize = questions.iter().map(question_bytes).sum();
+    let total = state_bytes + question_bytes_total;
+    if total > MAX_REQUEST_BYTES {
+        return Err(ConnectError::invalid_argument(format!(
+            "state is {state_bytes} bytes and the {} questions together are {question_bytes_total} \
+             bytes; the whole request is {total} bytes, over the {MAX_REQUEST_BYTES} byte limit the \
+             vendor holds one Decide call to",
+            questions.len()
         )));
     }
     Ok(())
@@ -341,6 +373,7 @@ mod tests {
             budget.max_state_plus_question_bytes,
             counted(MAX_STATE_PLUS_QUESTION_BYTES)
         );
+        assert_eq!(budget.max_request_bytes, counted(MAX_REQUEST_BYTES));
     }
 
     // The combined check (within_state_and_question_budget) is enforced but was, until this field
@@ -469,6 +502,23 @@ mod tests {
             deciding(vec![heavy]),
             &MAX_STATE_PLUS_QUESTION_BYTES.to_string(),
         );
+    }
+
+    #[test]
+    fn many_light_questions_can_pass_every_individual_check_and_still_be_refused_for_their_total() {
+        // Every individual limit here is satisfied: MAX_QUESTIONS is the class ceiling, not over it;
+        // each question's instructions are a fraction of MAX_INSTRUCTIONS_BYTES; state plus any one
+        // question alone is a fraction of MAX_STATE_PLUS_QUESTION_BYTES, so
+        // within_state_and_question_budget never refuses any of them individually. Only the sum
+        // across all MAX_QUESTIONS of them is over budget — exactly what within_request_budget
+        // exists to catch, the defect the combined check was added to remove in the first place.
+        let instructions = "x".repeat(2_200);
+        let questions: Vec<_> = named(MAX_QUESTIONS, "q")
+            .iter()
+            .map(|id| instructed(id, json!(instructions)))
+            .collect();
+
+        assert_refused(deciding(questions), &MAX_REQUEST_BYTES.to_string());
     }
 
     #[test]

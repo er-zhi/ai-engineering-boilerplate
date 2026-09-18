@@ -20,6 +20,13 @@ pub enum ChatError {
     Db(#[from] sea_orm::DbErr),
     #[error("engine call failed: {0}")]
     Engine(String),
+    /// Engine reported the topic's execution as busy (mid-tick), not broken — see
+    /// `services/engine/src/error.rs`'s `EngineError::Busy`. `topic_turn.rs::send_turn` catches
+    /// this itself and turns it into a visible event rather than an error, so it should never
+    /// reach the `From` impl below in practice; the mapping exists so this stays honest if it ever
+    /// does.
+    #[error("topic {0} is still busy: {1}")]
+    EngineBusy(i64, String),
 }
 
 impl From<ChatError> for ConnectError {
@@ -34,6 +41,7 @@ impl From<ChatError> for ConnectError {
                 tracing::error!(%error, "a chat request failed");
                 ConnectError::internal(INTERNAL_FAILURE_MESSAGE)
             }
+            ChatError::EngineBusy(..) => ConnectError::unavailable(error.to_string()),
         }
     }
 }
@@ -60,5 +68,14 @@ mod tests {
         let connect: ConnectError = ChatError::TopicNotRunning(7).into();
         assert_eq!(connect.code, connectrpc::ErrorCode::FailedPrecondition);
         assert!(connect.message.unwrap_or_default().contains("topic 7"));
+    }
+
+    // Defensive, not load-bearing: `send_turn` catches `EngineBusy` itself (see `topic_turn.rs`)
+    // before it can ever reach this mapping, but if it ever does escape, it must stay honest —
+    // `unavailable`, never `internal`, because retrying really can succeed.
+    #[test]
+    fn an_engine_busy_error_answers_unavailable() {
+        let connect: ConnectError = ChatError::EngineBusy(7, "mid-tick".to_owned()).into();
+        assert_eq!(connect.code, connectrpc::ErrorCode::Unavailable);
     }
 }
