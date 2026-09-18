@@ -11,6 +11,12 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    /// The hit's readable text, when a prefetch (`tools::web_search::attach_prefetched_text`)
+    /// raced a fetch of it and won. Absent whenever prefetching was not attempted or did not
+    /// succeed for this hit — `None` serializes to no `text` key at all, so a hit that gained
+    /// nothing renders exactly as a search result always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 pub trait SearchProvider: Send + Sync {

@@ -76,6 +76,7 @@ impl SearchProvider for BraveSearchProvider {
                 title: r.title,
                 url: r.url,
                 snippet: r.description,
+                text: None,
             })
             .collect())
     }
@@ -158,6 +159,7 @@ mod tests {
                 title: "Async traits".to_owned(),
                 url: "https://example.com/a".to_owned(),
                 snippet: "A guide.".to_owned(),
+                text: None,
             }]
         );
     }
@@ -178,6 +180,7 @@ mod tests {
                 title: "Async traits".to_owned(),
                 url: "https://example.com/a".to_owned(),
                 snippet: "A guide.".to_owned(),
+                text: None,
             }]
         );
     }

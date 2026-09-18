@@ -99,7 +99,19 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const RENDERED_TOOL_RESULTS: usize = 4;
-const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+/// Applied to one whole rendered tool result (not per hit within it — see below), so a search that
+/// attached the text of several pages (Task C, `docs/superpowers/plans/2026-09-18-latency-round-two.md`)
+/// is not cut before the model ever sees the pages. Flat-per-result rather than a cap per hit: the
+/// engine has no notion of a "hit" — that shape belongs to the tool that produced the JSON, and
+/// giving the engine a per-hit cap would mean teaching it that shape, which is exactly the kind of
+/// subject-specific knowledge `gate-architecture`'s "Capabilities, Not Topics" forbids landing here.
+/// A flat cap needs no such knowledge and is nearly free: input tokens cost about 0.29 ms each in
+/// this deployment (r = 0.09 against total latency), so raising the ceiling by 8 000 chars (~2 000
+/// tokens) costs under 600 ms in the rare case a result actually reaches it — far less than the
+/// generative round this change exists to remove. 12 000 was chosen as comfortably above two
+/// attached pages' typical readable text (a few thousand characters each) plus the surrounding
+/// title/url/snippet JSON, while still bounding the pathological case (a very long single page).
+const MAX_TOOL_RESULT_CHARS: usize = 12_000;
 const TRUNCATION_MARK: &str = "… (truncated)";
 
 /// `Decide` gets its own deadline, separate from `CALL_TIMEOUT` (`Complete`'s). Same measurement
@@ -815,6 +827,35 @@ mod tests {
 
         assert!(user.contains(TRUNCATION_MARK), "{user}");
         assert!(user.chars().count() < MAX_TOOL_RESULT_CHARS * 2, "{user}");
+    }
+
+    // A search that attached the readable text of its top two hits (Task C: a search returns the
+    // pages it found) produces one tool result whose combined text runs well past the old 4 000
+    // char cap — raised so those pages actually reach the model instead of being cut before the
+    // model ever sees them. Two pages of 5 000 chars each (10 000 total) must survive whole.
+    #[test]
+    fn build_prompt_carries_two_attached_pages_through_the_rendering_cap() {
+        let first_page = "alpha ".repeat(900);
+        let second_page = "beta ".repeat(900);
+        let state = json!({
+            "question": "q",
+            "tool_result": [[
+                {"title": "First", "url": "https://a.example", "snippet": "s", "text": first_page},
+                {"title": "Second", "url": "https://b.example", "snippet": "s", "text": second_page},
+            ]],
+        });
+
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+
+        assert!(!user.contains(TRUNCATION_MARK), "{user}");
+        assert!(
+            user.contains(first_page.trim()),
+            "the first page's text must survive whole"
+        );
+        assert!(
+            user.contains(second_page.trim()),
+            "the second page's text must survive whole"
+        );
     }
 
     #[test]

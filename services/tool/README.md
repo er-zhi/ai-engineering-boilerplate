@@ -92,6 +92,12 @@ nothing for the guard to re-check hop by hop — `redirect_following_http_client
 redirect-following client the search providers use instead, so a vendor's routine 301/308 does not
 fail the whole tool call.
 
+A search *hit's* `url` is a different matter again: it is data the vendor returned, chosen by
+whatever page ranked well for the query, not a request this process picked either. `web_search`'s
+own prefetch (`tools/web_search.rs`) treats it exactly like a caller's `web_fetch` url — checked by
+`ensure_public_url` before any request for it goes out — because it is just as untrusted as one a
+caller sent directly; see "A search returns the pages it found" below.
+
 ## Search Providers
 
 One trait, two implementations, chosen by which key is configured — You.com first, then Brave, then
@@ -104,6 +110,27 @@ client-side.
 `YOU_SEARCH_API_KEY` and `BRAVE_SEARCH_API_KEY` sit in this service's own environment. That is
 temporary: credentials move to the Integrations Service once it exists, and no service should hold
 a provider key directly.
+
+### A search returns the pages it found
+
+`run_web_search` does not just relay a provider's `{title, url, snippet}` triples any more. Once
+the provider answers, `tools/web_search.rs`'s `attach_prefetched_text` races a fetch of its top
+`PREFETCH_CANDIDATES` hits (four, through `race` below, `take = 2`, a ~1 s per-operation cap) and
+attaches whichever succeed as a `text` field. The reason is measured, not assumed: 26% of tool
+turns took the shape search → fetch → answer, and the middle round was a generative call whose
+entire output was "fetch these URLs" — URLs the search had already returned a round earlier
+(`docs/superpowers/plans/2026-09-18-latency-round-two.md`). Attaching the readable text up front
+lets the model answer straight from the search result instead of spending a further round asking
+for the same pages back by name — the dependency between "search" and "read what it found" is
+real, but the round trip through the model to say so is not.
+
+A hit that fails `ensure_public_url`, loses the race, or was not among the top candidates keeps its
+snippet and gains nothing: prefetching only ever *adds* a `text` field, so it can never turn a
+search into an error — a slow or hostile page degrades to exactly what `web_search` returned before
+this existed. Engine's rendering cap (`MAX_TOOL_RESULT_CHARS` in
+`services/engine/src/executors/llm.rs`) was raised alongside this change, applied to the whole
+rendered tool result rather than per hit, so the attached pages actually reach the model instead of
+being cut before the model ever sees them.
 
 ## Schema (`tool`)
 
@@ -138,9 +165,10 @@ injected, and `Execute` narrows it to the tool row's own `timeout_seconds`.
 
 ## `race`
 
-`race` (`src/race.rs`) is the primitive both `web_fetch` and Declarative Tools run on: hand it a
-slice of operation *factories*, and it starts `fan_out` of them at once, keeps the first `take` that
-succeed, and drops whatever is still running the moment that quorum is reached. It knows nothing
+`race` (`src/race.rs`) is the primitive `web_fetch`, a search's own prefetch, and Declarative Tools
+all run on: hand it a slice of operation *factories*, and it starts `fan_out` of them at once, keeps
+the first `take` that succeed, and drops whatever is still running the moment that quorum is
+reached. It knows nothing
 about HTTP, URLs, or what any operation is about — it is the shape of "several ways to get the same
 thing," reused wherever that shape shows up.
 

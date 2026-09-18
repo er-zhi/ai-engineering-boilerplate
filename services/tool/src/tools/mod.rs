@@ -3,3 +3,4 @@
 pub mod declarative;
 pub mod kb_client;
 pub mod web_fetch;
+pub mod web_search;

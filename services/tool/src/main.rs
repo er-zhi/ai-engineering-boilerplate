@@ -210,7 +210,7 @@ fn system_tool_definitions() -> [SystemTool; 4] {
         SystemTool {
             slug: slugs::WEB_SEARCH,
             name: "Web search",
-            description: "Searches the public web and returns matching pages with a title, URL and snippet.",
+            description: "Searches the public web and returns matching pages with a title, URL, snippet, and where a page could be read, its text.",
             risk: Risk::ReadOnly,
             input_schema: tool::args::input_schema::<tool::args::Search>(),
         },

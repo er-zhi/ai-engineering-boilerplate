@@ -507,10 +507,16 @@ impl Service {
             Ok(limit) => limit,
             Err(error) => return Ok(ExecuteOutcome::Error(error)),
         };
-        Ok(match self.search.search(&args.query, limit).await {
-            Ok(results) => ExecuteOutcome::Ok(serde_json::to_value(results)?),
-            Err(error) => ExecuteOutcome::Error(error),
-        })
+        let mut results = match self.search.search(&args.query, limit).await {
+            Ok(results) => results,
+            Err(error) => return Ok(ExecuteOutcome::Error(error)),
+        };
+        // See docs/superpowers/plans/2026-09-18-latency-round-two.md, Task C: attaching the
+        // readable text of the top hits here removes the round a model otherwise spends asking
+        // for the same URLs back by name. This can only add a `text` field, never fail the
+        // search — see `attach_prefetched_text`'s own doc comment.
+        crate::tools::web_search::attach_prefetched_text(&self.http, &mut results).await;
+        Ok(ExecuteOutcome::Ok(serde_json::to_value(results)?))
     }
 
     async fn run_web_fetch(
