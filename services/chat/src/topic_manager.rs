@@ -215,6 +215,14 @@ impl TopicManager {
         }
     }
 
+    /// Reads `route`'s decision budget once — see `TopicIntent::load_decision_budget` — from Chat's
+    /// startup path in `main.rs`, before `recover` and before any turn is routed. Never fails: any
+    /// problem reaching or parsing `DescribeModels` is logged there and leaves routing on the "no
+    /// known cap" default, exactly as if this were never called.
+    pub async fn load_decision_budget(&self) {
+        self.intent.load_decision_budget().await;
+    }
+
     pub async fn recover(self: &Arc<Self>) -> Result<(), ChatError> {
         let running = topic::Entity::find()
             .filter(topic::Column::Status.eq(Status::Running))

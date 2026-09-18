@@ -11,16 +11,16 @@ use common::proto::engine::v1::{
 };
 use common::proto::llm_router::v1::{
     Answer, ChoiceAnswer, CompleteRequest, CompleteResponse, DecideRequest, DecideResponse,
-    DescribeModelsRequest, DescribeModelsResponse, DescribeTiersRequest, DescribeTiersResponse,
-    LlmRouterService, LlmRouterServiceRegisterMarker, NoulAnswer, SystemOneService,
-    SystemOneServiceRegisterMarker,
+    DecisionBudget, DescribeModelsRequest, DescribeModelsResponse, DescribeTiersRequest,
+    DescribeTiersResponse, LlmRouterService, LlmRouterServiceRegisterMarker, NoulAnswer,
+    SystemOneService, SystemOneServiceRegisterMarker, question,
 };
 use connectrpc::{
     RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult, ServiceStream,
 };
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
@@ -224,6 +224,13 @@ pub struct FakeLlmRouter {
     pub completions: Calls,
     route: Mutex<Option<(String, f64)>>,
     nouls: Mutex<HashMap<String, f64>>,
+    /// The `route` question's option names, exactly as decoded server-side, one entry per `Decide`
+    /// call received — so a test can assert on what actually crossed the wire, not on what a
+    /// caller merely computed. Recorded before this fake ever checks whether it was armed to
+    /// answer, so it captures even a request that this fake goes on to refuse.
+    decide_route_options: Mutex<Vec<Vec<String>>>,
+    describe_models_budget: Mutex<Option<DecisionBudget>>,
+    describe_models_fails: AtomicBool,
 }
 
 impl FakeLlmRouter {
@@ -247,6 +254,46 @@ impl FakeLlmRouter {
             .map(|(id, value)| (id.to_owned(), value))
             .collect();
     }
+
+    /// Arms the `DescribeModels` response with this budget. Unarmed, `DescribeModels` succeeds with
+    /// the zero-valued default budget, matching what an unset `budget` field decodes to on the wire.
+    pub fn answer_describe_models(&self, budget: DecisionBudget) {
+        *self.describe_models_budget.lock().expect("lock") = Some(budget);
+    }
+
+    /// Makes every `DescribeModels` call fail, for tests of the startup path that must survive it.
+    pub fn fail_describe_models(&self) {
+        self.describe_models_fails.store(true, Ordering::SeqCst);
+    }
+
+    /// The `route` option names the most recent `Decide` call carried, in the order this fake
+    /// decoded them. Empty if no `Decide` call has landed, or the last one asked no `route`
+    /// question (an empty session).
+    pub fn last_route_options(&self) -> Vec<String> {
+        self.decide_route_options
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Reads the `route` question's option names straight off a decoded `DecideRequest`, the same shape
+/// `services/chat/src/intent.rs` builds — this is what "actually sent", not "merely computed",
+/// means for a test to check.
+fn route_option_names(questions: &[common::proto::llm_router::v1::Question]) -> Vec<String> {
+    questions
+        .iter()
+        .find(|question| question.id == "route")
+        .and_then(|question| question.kind.as_ref())
+        .map(|kind| match kind {
+            question::Kind::Choice(choice) => {
+                choice.options.iter().map(|o| o.name.clone()).collect()
+            }
+            question::Kind::Noul(_) | question::Kind::Score(_) => Vec::new(),
+        })
+        .unwrap_or_default()
 }
 
 #[allow(refining_impl_trait)]
@@ -288,6 +335,10 @@ impl SystemOneService for FakeLlmRouter {
         request: ServiceRequest<'_, DecideRequest>,
     ) -> ServiceResult<DecideResponse> {
         let owned = request.to_owned_message();
+        self.decide_route_options
+            .lock()
+            .expect("lock")
+            .push(route_option_names(&owned.questions));
         let meeting = self.meeting.lock().expect("lock").clone();
         if let Some(meeting) = meeting {
             meeting.wait().await;
@@ -315,7 +366,16 @@ impl SystemOneService for FakeLlmRouter {
         _ctx: RequestContext,
         _request: ServiceRequest<'_, DescribeModelsRequest>,
     ) -> ServiceResult<DescribeModelsResponse> {
-        Response::ok(DescribeModelsResponse::default())
+        if self.describe_models_fails.load(Ordering::SeqCst) {
+            return Err(connectrpc::ConnectError::unavailable(
+                "configured fake llm-router describe_models failure",
+            ));
+        }
+        let budget = self.describe_models_budget.lock().expect("lock").clone();
+        Response::ok(DescribeModelsResponse {
+            budget: budget.map(Into::into).unwrap_or_default(),
+            ..Default::default()
+        })
     }
 }
 
@@ -416,6 +476,13 @@ fn router_service(router: Arc<FakeLlmRouter>) -> ConnectRouter {
     ConnectRouter::new()
         .add_service::<_, LlmRouterServiceRegisterMarker>(Arc::clone(&router))
         .add_service::<_, SystemOneServiceRegisterMarker>(router)
+}
+
+/// Like `served`, but hands back the `Arc<FakeLlmRouter>` itself instead of just a `Calls` counter
+/// — for tests that need to arm `DescribeModels` (`answer_describe_models` / `fail_describe_models`)
+/// or read back what a `Decide` call actually carried (`last_route_options`).
+pub async fn serve_router(router: Arc<FakeLlmRouter>) -> String {
+    serve(router_service(router)).await
 }
 
 /// Answers only the given nouls; no `route` answer, so nothing is chosen.

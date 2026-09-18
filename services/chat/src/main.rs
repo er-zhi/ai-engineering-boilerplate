@@ -326,6 +326,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &env("ENGINE_URL")?,
         &env("LLM_ROUTER_URL")?,
     )?);
+    // Read once, here, before anything is served — never lazily on a turn's own path, and never
+    // fatal: a router that is down at boot must not stop Chat from serving turns it would route by
+    // fallback anyway. See TopicManager::load_decision_budget / TopicIntent::load_decision_budget.
+    topics.load_decision_budget().await;
     topics.recover().await?;
 
     let chat_service = ChatServiceImpl {

@@ -2,14 +2,14 @@
 // question is far cheaper than a second round trip, and the whole point here is that the user sees
 // something back immediately.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use buffa::EnumValue;
 use common::proto::llm_router::v1::{
-    Answer, Choice, ChoiceAnswer, ChoiceOption, CompleteRequest, DecideRequest,
-    LlmRouterServiceClient, Noul, QualityTier, Question, ResponseFormat, Sampling,
-    SystemOneServiceClient, answer::Answer as Given,
+    Answer, Choice, ChoiceAnswer, ChoiceOption, CompleteRequest, DecideRequest, DecisionBudget,
+    DescribeModelsRequest, LlmRouterServiceClient, Noul, QualityTier, Question, ResponseFormat,
+    Sampling, SystemOneServiceClient, answer::Answer as Given,
 };
 use connectrpc::Protocol;
 use connectrpc::client::{ClientConfig, HttpClient};
@@ -187,6 +187,13 @@ fn plan_shape(actions: Vec<RawAction>) -> String {
 pub struct TopicIntent {
     llm: LlmRouterServiceClient<HttpClient>,
     decider: SystemOneServiceClient<HttpClient>,
+    /// `route`'s option ceiling, read once from `DescribeModels` — see `load_decision_budget` below
+    /// — and never refreshed after. `OnceLock` because it is written at most once, from Chat's
+    /// startup path in `main.rs` before any turn is routed, and then only ever read — concurrently,
+    /// by every turn after that, with no lock contention on the hot path. Unset (never loaded, or
+    /// `DescribeModels` failed) is handled identically to a loaded-but-zero budget: see
+    /// `route_options_cap`, which treats both as "no known cap" rather than "send no options".
+    decision_budget: OnceLock<DecisionBudget>,
 }
 
 impl TopicIntent {
@@ -208,7 +215,49 @@ impl TopicIntent {
                 HttpClient::plaintext_http2_only(),
                 base_config.with_default_timeout(DECIDE_CALL_TIMEOUT),
             ),
+            decision_budget: OnceLock::new(),
         })
+    }
+
+    /// Reads the decision budget once, called from Chat's startup path (`main.rs`) strictly before
+    /// any turn is routed — never lazily, so no turn ever pays for this call on the latency path.
+    /// Every failure — an unreachable router, an error response, a malformed reply — is logged at
+    /// `warn` and leaves the budget unset. This must never fail or panic: `Decide` is advisory (see
+    /// `route`'s doc), so the budget describing it is too, and a router that is down at boot must
+    /// not stop Chat from serving turns it would route by fallback anyway. A second call is a
+    /// silent no-op — `OnceLock::set` keeps whatever the first call wrote — matching "read once".
+    pub async fn load_decision_budget(&self) {
+        match self
+            .decider
+            .describe_models(DescribeModelsRequest::default())
+            .await
+        {
+            Ok(response) => {
+                let budget = response
+                    .into_owned()
+                    .budget
+                    .into_option()
+                    .unwrap_or_default();
+                let _ = self.decision_budget.set(budget);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not read the decision budget at startup; routing with no option cap"
+                );
+            }
+        }
+    }
+
+    /// `route`'s live option ceiling, derived from whatever `load_decision_budget` last read.
+    /// `None` — nothing was ever loaded, or what was loaded named no positive ceiling — means "no
+    /// known cap": the proto default for an absent or unset budget is zero, and a zero ceiling must
+    /// not be read as "offer nothing" (see `capped_topics`'s doc for why that is safe).
+    fn route_options_cap(&self) -> Option<usize> {
+        self.decision_budget
+            .get()
+            .and_then(|budget| usize::try_from(budget.max_choice_options).ok())
+            .filter(|cap| *cap > 0)
     }
 
     /// Routes one user turn. See the module doc for the read order of the three answers — it is
@@ -219,7 +268,7 @@ impl TopicIntent {
         focus: Option<i64>,
         message: &str,
     ) -> Routing {
-        let Some(request) = build_request(topics, focus, message) else {
+        let Some(request) = build_request(topics, focus, message, self.route_options_cap()) else {
             return Routing::Act(fallback(topics, focus, message));
         };
 
@@ -313,10 +362,11 @@ fn build_request(
     topics: &[TopicSummary],
     focus: Option<i64>,
     message: &str,
+    options_cap: Option<usize>,
 ) -> Option<DecideRequest> {
     let mut questions = Vec::new();
     if !topics.is_empty() {
-        questions.push(route_question(topics)?);
+        questions.push(route_question(topics, options_cap)?);
     }
     questions.push(actionable_question()?);
     questions.push(separate_themes_question()?);
@@ -335,8 +385,12 @@ fn instructed(id: &str, instructions: serde_json::Value) -> Option<Question> {
     Some(question)
 }
 
-fn route_question(topics: &[TopicSummary]) -> Option<Question> {
-    let mut options: Vec<ChoiceOption> = topics
+/// Builds the `route` question: one option per offered topic, plus `new`. `options_cap` — the
+/// budget's `max_choice_options`, read once at startup (see `TopicIntent::load_decision_budget`) —
+/// bounds the whole option list, `new` included; see `capped_topics` for which topics are dropped
+/// and why dropping one is safe.
+fn route_question(topics: &[TopicSummary], options_cap: Option<usize>) -> Option<Question> {
+    let mut options: Vec<ChoiceOption> = capped_topics(topics, options_cap)
         .iter()
         .map(|topic| ChoiceOption {
             name: format!("{TOPIC_OPTION_PREFIX}{}", topic.id),
@@ -356,6 +410,23 @@ fn route_question(topics: &[TopicSummary]) -> Option<Question> {
     }
     .into();
     Some(question)
+}
+
+/// Keeps at most `options_cap` topics, preferring the most recent, and always leaves one slot free
+/// for the `new` option `route_question` appends. `topics` arrives in ascending creation order
+/// (`SessionManager::get_session_view` orders by `CreatedAt` ascending), so "most recent" is the
+/// tail of the slice. `None` — no cap was ever loaded, or the router published none — returns every
+/// topic, exactly today's uncapped behaviour.
+///
+/// Dropping a topic from the options never makes it unreachable: `fallback` below continues the
+/// session's focused topic regardless of what `route` was ever asked about, so a topic left out
+/// here is only unofferable this turn, not unreachable — that is what makes the cap safe to apply.
+fn capped_topics(topics: &[TopicSummary], options_cap: Option<usize>) -> &[TopicSummary] {
+    let Some(cap) = options_cap else {
+        return topics;
+    };
+    let keep = cap.saturating_sub(1).min(topics.len());
+    &topics[topics.len() - keep..]
 }
 
 fn actionable_question() -> Option<Question> {
@@ -513,6 +584,7 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const CLARIFY_BELOW: f64 = ACTIONABLE_THRESHOLD - 0.1;
 
@@ -712,5 +784,147 @@ mod tests {
             state.is_array(),
             "an object's keys reach the model re-sorted: {state}"
         );
+    }
+
+    // `many_topics` mirrors the order `SessionManager::get_session_view` hands `route`: ascending
+    // by creation, oldest first — so the highest id here is the most recently created topic.
+    fn many_topics(count: i64) -> Vec<TopicSummary> {
+        (1..=count)
+            .map(|id| TopicSummary {
+                id,
+                title: format!("Topic {id}"),
+                status: crate::entity::topic::Status::Running,
+                result_summary: None,
+            })
+            .collect()
+    }
+
+    fn topic_option(id: i64) -> String {
+        format!("{TOPIC_OPTION_PREFIX}{id}")
+    }
+
+    fn choice_option_names(question: &Question) -> Vec<String> {
+        match question.kind.as_ref() {
+            Some(common::proto::llm_router::v1::question::Kind::Choice(choice)) => {
+                choice.options.iter().map(|o| o.name.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    // The "computed" half of the cap: route_question itself, exercised directly rather than
+    // through a network round trip, so this pins the cap arithmetic (exactly the cap, `new`
+    // included, most recent kept) independently of whether anything ever wires the cap in.
+    #[test]
+    fn route_options_are_capped_at_the_budget_keeping_the_most_recent_plus_new() {
+        let topics = many_topics(5); // ids 1..=5, 5 is the most recently created
+        let question =
+            route_question(&topics, Some(3)).expect("a route question with topics present");
+        let names = choice_option_names(&question);
+
+        assert_eq!(
+            names.len(),
+            3,
+            "a cap of 3 must yield exactly 3 options: {names:?}"
+        );
+        assert!(
+            names.contains(&NEW_TOPIC_OPTION.to_owned()),
+            "new must always be offered: {names:?}"
+        );
+        assert!(
+            names.contains(&topic_option(5)) && names.contains(&topic_option(4)),
+            "the two most recent topics must be kept: {names:?}"
+        );
+        assert!(
+            !names.contains(&topic_option(1)),
+            "the oldest topic must be the one dropped: {names:?}"
+        );
+    }
+
+    #[test]
+    fn no_cap_offers_every_topic_exactly_as_before() {
+        let topics = many_topics(5);
+        let question = route_question(&topics, None).expect("a route question");
+        assert_eq!(choice_option_names(&question).len(), 6, "5 topics plus new");
+    }
+
+    // The "actually sent" half of the cap: goes through TopicIntent::route and a real (fake)
+    // network round trip, so this catches a bug where the cap is computed and stored but the
+    // request-building path that reaches the wire never receives it.
+    #[tokio::test]
+    async fn the_route_options_cap_reaches_what_actually_leaves_the_process() {
+        let router = Arc::new(crate::fakes::FakeLlmRouter::default());
+        router.answer_decision(Some(("new", 0.9)), vec![("actionable", 0.9)]);
+        router.answer_describe_models(DecisionBudget {
+            max_choice_options: 3,
+            ..Default::default()
+        });
+        let url = crate::fakes::serve_router(Arc::clone(&router)).await;
+        let intent = TopicIntent::new(&url).expect("client");
+        intent.load_decision_budget().await;
+
+        let topics = many_topics(5);
+        let _ = intent.route(&topics, None, "hello").await;
+
+        let sent = router.last_route_options();
+        assert_eq!(
+            sent.len(),
+            3,
+            "the wire request must carry exactly the loaded cap, not the uncapped list: {sent:?}"
+        );
+        assert!(sent.contains(&NEW_TOPIC_OPTION.to_owned()), "{sent:?}");
+        assert!(
+            sent.contains(&topic_option(5)) && sent.contains(&topic_option(4)),
+            "the most recent topics must be the ones offered: {sent:?}"
+        );
+    }
+
+    // Task 3's other required test: DescribeModels being unavailable at startup must not stop
+    // Chat from working. load_decision_budget must not panic or hang, and a turn afterward must
+    // still route on the uncapped default — proving the router's Decide path is unaffected by its
+    // DescribeModels path failing.
+    #[tokio::test]
+    async fn describe_models_being_unavailable_at_startup_leaves_chat_working_on_the_defaults() {
+        let router = Arc::new(crate::fakes::FakeLlmRouter::default());
+        router.answer_decision(Some(("new", 0.9)), vec![("actionable", 0.9)]);
+        router.fail_describe_models();
+        let url = crate::fakes::serve_router(Arc::clone(&router)).await;
+        let intent = TopicIntent::new(&url).expect("client");
+
+        intent.load_decision_budget().await;
+
+        let topics = many_topics(5);
+        let Routing::Act(actions) = intent.route(&topics, None, "hello").await else {
+            panic!("a turn must still route even though the startup budget fetch failed");
+        };
+        assert_eq!(
+            actions,
+            vec![Action::New {
+                title: "hello".to_owned(),
+                question: "hello".to_owned(),
+            }]
+        );
+
+        let sent = router.last_route_options();
+        assert_eq!(
+            sent.len(),
+            topics.len() + 1,
+            "no cap was ever loaded, so nothing is trimmed: {sent:?}"
+        );
+    }
+
+    // An unreachable router at startup — not just a router that answers with an error — must be
+    // just as harmless: load_decision_budget must return normally rather than hang or panic, and
+    // routing afterward must fall back exactly as it always has.
+    #[tokio::test]
+    async fn an_unreachable_router_at_startup_still_lets_a_turn_route_by_fallback() {
+        let intent = TopicIntent::new("http://127.0.0.1:1").expect("client");
+
+        intent.load_decision_budget().await;
+
+        let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
+            panic!("a failure must never clarify");
+        };
+        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
     }
 }
