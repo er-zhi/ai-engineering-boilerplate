@@ -4,8 +4,6 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use common::extract::Extracted;
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use http::Uri;
 use serde_json::{Value, json};
 
@@ -168,27 +166,22 @@ pub async fn fetch_richest(
     urls: &[String],
     timeout: Duration,
 ) -> Result<Extracted, String> {
-    let mut running: FuturesUnordered<_> = urls
+    // The candidates are raced, but the winner is the fullest page rather than the fastest one:
+    // whoever answers first is decided by network latency, which has nothing to do with whether the
+    // page holds the answer. The race decides *when to stop waiting*; the comparison decides *what
+    // to return*, and it needs something to compare against.
+    let ops: Vec<(&str, crate::race::OpFn<'_, Extracted>)> = urls
         .iter()
-        .map(|url| async move { (url, fetch(client, url, timeout).await) })
+        .map(|url| crate::race::op(url.as_str(), move || fetch(client, url, timeout)))
         .collect();
-    let mut answered: Vec<Extracted> = Vec::new();
-    let mut errors = Vec::new();
-    while let Some((url, result)) = running.next().await {
-        match result {
-            Ok(page) => {
-                answered.push(page);
-                if answered.len() >= ANSWERS_BEFORE_CHOOSING {
-                    break;
-                }
-            }
-            Err(error) => errors.push(format!("{url}: {error}")),
-        }
-    }
-    answered
+    let outcome = crate::race::race(&ops, urls.len(), ANSWERS_BEFORE_CHOOSING, timeout).await;
+    let failures = outcome.failures.join("; ");
+    outcome
+        .taken
         .into_iter()
+        .map(|(_, page)| page)
         .max_by_key(|page| page.main_text.len())
-        .ok_or_else(|| format!("every url failed — {}", errors.join("; ")))
+        .ok_or_else(|| format!("every url failed — {failures}"))
 }
 
 #[cfg(test)]
@@ -369,6 +362,20 @@ mod tests {
 
         assert!(error.contains("127.0.0.1:1/a"), "{error}");
         assert!(error.contains("127.0.0.1:2/b"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fetch_richest_names_every_url_that_failed() {
+        let client = reqwest::Client::new();
+        let urls = vec![
+            "http://127.0.0.1:1/a".to_owned(),
+            "http://127.0.0.1:1/b".to_owned(),
+        ];
+        let error = fetch_richest(&client, &urls, TEST_TIMEOUT)
+            .await
+            .expect_err("both urls are unreachable");
+        assert!(error.contains("/a"), "{error}");
+        assert!(error.contains("/b"), "{error}");
     }
 
     const ARTICLE_PAGE: &str = "<html><head><title>Hi</title></head><body><article><p>Borrowing lets code use a value without taking ownership of it, which the borrow checker enforces.</p></article></body></html>";
