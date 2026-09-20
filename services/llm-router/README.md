@@ -56,7 +56,7 @@ Environment variables stay vendor-named (`OPENROUTER_*`, `TYPESAFE_AI_*`), becau
 
 Completion: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, and `LLM_<TIER>_PRIMARY` / `LLM_<TIER>_BACKUP` for `LOW`, `MEDIUM`, and `HIGH`.
 
-Decisions: `TYPESAFE_AI_API_KEY`, and optionally `TYPESAFE_AI_BASE_URL` (defaults to `https://api.typesafe.ai`) and `TYPESAFE_AI_MODEL` (defaults to `jev-latest`).
+Decisions: `TYPESAFE_AI_API_KEY`, and optionally `TYPESAFE_AI_BASE_URL` (defaults to `https://api.typesafe.ai`) and `TYPESAFE_AI_MODEL` (defaults to `jev-latest`). Pin a concrete version rather than the alias wherever confidence thresholds have been tuned — the vendor's own guidance, because an alias moves on its schedule and the version behind it reprices every tuned threshold at once, silently. Unlike the key, the model name is **not** verified at startup: it is passed through to the provider as given, and the startup probe checks the key alone, so a mistyped model reaches a healthy container and fails on the first `Decide`. Confirm a change by sending real traffic and reading `model_used` back out of `llm_router.decisions`, which records the version that actually answered.
 
 Also optional, completion only: `LLM_PROVIDER_ROUTING_JSON`, a JSON object that is **opaque to this service** — it is read only far enough to confirm it parses as an object, then forwarded verbatim as the `provider` field of every completion request. Left unset, the request body is unaffected. Set to something that is not valid JSON, or valid JSON that is not an object, and the container fails at startup, exactly as a rejected `OPENROUTER_API_KEY` does — a routing policy silently ignored would be worse than none. See [`.env.example`](../../.env.example) for the exact shape.
 
