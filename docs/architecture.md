@@ -13,7 +13,7 @@ flowchart LR
   crawler -->|gRPC Ingest| kb
   chat -->|gRPC| engine[Engine]
   engine -->|gRPC| tool[Tool]
-  engine -->|gRPC Complete| llm[LLM Router]
+  engine -->|gRPC Complete/Decide| llm[LLM Router]
   tool -->|gRPC Search| kb
   tool -->|gRPC Complete/Decide| llm
   kb -->|gRPC Complete| llm
@@ -44,7 +44,7 @@ Chat, Engine and Tool are the agent path, alongside Crawler and Knowledge Base's
 - Frontend is a one-shot build container. It copies static files to a volume that Gateway mounts read-only; it is not a runtime server or Cargo workspace member.
 - `native/embedder-ane` is the only host-native component. Core ML has no Linux-container equivalent, so Knowledge Base reaches it through `host.docker.internal`.
 - Provider credentials exist only in LLM Router. Callers request a quality tier for completion, or send typed questions for a decision, and never choose a provider or model slug.
-- Chat and Tool both call `SystemOneService.Decide` for a typed decision — Chat to route a turn, Tool to approve or refuse a submitted tool definition — and reach `LlmRouterService.Complete` only where the branch actually needs generated words: Chat's multi-theme split, Tool's refusal explanation. Engine calls only `LlmRouterService`, for a graph's `llm` nodes; it never calls `SystemOneService`.
+- Chat, Tool and Engine all call `SystemOneService.Decide` for a typed decision — Chat to route a turn, Tool to approve or refuse a submitted tool definition, Engine to pick a tool before an `llm` node spends a generative call — and reach `LlmRouterService.Complete` only where the branch actually needs generated words: Chat's multi-theme split, Tool's refusal explanation, Engine's answer. Both services are served by the LLM Router container, so a caller's outbound surface is that one address whichever of the two it needs; a decision is advisory everywhere it is used, and a decision that fails must never lose the turn.
 
 ## Repository Layout
 
