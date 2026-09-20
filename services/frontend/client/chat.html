@@ -22,6 +22,8 @@
   .msg { padding: .4rem 0; border-bottom: 1px solid #f4f4f4; }
   .msg.notification, .msg.ack { color: #444; font-style: italic; }
   .msg .kind { color: #999; font-size: .75em; }
+  .msg .at { color: #aaa; font-size: .75em; font-variant-numeric: tabular-nums; }
+  .msg .at .gap { color: #777; }
   .msg code { background: #f4f4f4; border-radius: 3px; padding: .1em .3em; font: 12px/1.4 ui-monospace, monospace; }
   .msg strong { font-weight: 600; }
   .msg ul, .msg ol { margin: .3em 0; padding-left: 1.4em; }
@@ -260,8 +262,44 @@
     return htmlParts.join("");
   }
 
-  function appendMessage(who, text, className, topicTitle) {
+  // The time of the previously rendered line, so each line can show the gap before it. Reset
+  // wherever the transcript is cleared: a stale cursor would print a gap measured against a line
+  // that is no longer on screen.
+  let previousAtMs = null;
+
+  function clockText(iso) {
+    const at = new Date(iso);
+    if (Number.isNaN(at.getTime())) return "";
+    const ms = String(at.getMilliseconds()).padStart(3, "0");
+    return `${at.toLocaleTimeString([], { hour12: false })}.${ms}`;
+  }
+
+  // Only ever a forward gap. Entries are sorted before rendering, but a live event can still
+  // arrive stamped behind the last rendered line, and "-0.4s" would read as a bug rather than as
+  // the clock skew it is. Two clocks reach here: server times for anything the server recorded,
+  // and the browser's own for the three lines that only ever happen locally — the optimistic echo
+  // of a message being sent and the two error lines. A browser clock running ahead therefore
+  // suppresses the gap on the next server-stamped line rather than printing a wrong one, which is
+  // the direction this should fail in.
+  function gapText(stampMs) {
+    if (previousAtMs === null || !Number.isFinite(stampMs)) return "";
+    const seconds = (stampMs - previousAtMs) / 1000;
+    return seconds > 0 ? ` +${seconds.toFixed(1)}s` : "";
+  }
+
+  function appendMessage(who, text, className, topicTitle, at) {
     const div = element("div", `msg ${className || ""}`);
+    const stamp = at || new Date().toISOString();
+    const stampMs = atMs(stamp);
+    const label = clockText(stamp);
+    if (label) {
+      const span = element("span", "at", label);
+      const gap = gapText(stampMs);
+      if (gap) span.appendChild(element("span", "gap", gap));
+      span.appendChild(document.createTextNode(" "));
+      div.appendChild(span);
+      if (Number.isFinite(stampMs)) previousAtMs = stampMs;
+    }
     if (topicTitle) div.appendChild(element("span", "topic", `[${topicTitle}]`));
     div.appendChild(element("span", "kind", `${who} `));
     if (who === "assistant") {
@@ -360,8 +398,9 @@
 
   function renderTranscript() {
     transcript.textContent = "";
+    previousAtMs = null;
     transcriptEntries(topics).forEach((entry) => {
-      appendMessage(entry.who, entry.text, entry.className, entry.topic);
+      appendMessage(entry.who, entry.text, entry.className, entry.topic, entry.at);
     });
   }
 
@@ -388,16 +427,16 @@
         // starts no topic — so it only ever reaches the transcript through this payload. Without
         // it, a reload rebuilds from `messages` and shows the assistant's reply with nothing above
         // it.
-        appendMessage("you", payload.content || "");
-        appendMessage("assistant", payload.text || "");
+        appendMessage("you", payload.content || "", undefined, undefined, event.occurredAt);
+        appendMessage("assistant", payload.text || "", undefined, undefined, event.occurredAt);
         return;
       }
       if (event.kind === NOTIFICATION) {
-        appendMessage("·", payload.text || payload.kind || "", "notification", rootTitleOf(topics, event.topicId));
+        appendMessage("·", payload.text || payload.kind || "", "notification", rootTitleOf(topics, event.topicId), event.occurredAt);
         return;
       }
       if (event.kind === TOPIC_PROGRESS) {
-        appendMessage("·", progressText(event.payloadJson), "notification", rootTitleOf(topics, event.topicId));
+        appendMessage("·", progressText(event.payloadJson), "notification", rootTitleOf(topics, event.topicId), event.occurredAt);
       }
     } catch (err) {
       debugLine("err", `render ${readable(event.kind, EVENT_KIND_PREFIX)}`, err.message);
@@ -463,6 +502,7 @@
 
   async function startOver() {
     transcript.textContent = "";
+    previousAtMs = null;
     topics = [];
     focusTopicId = null;
     await loadSession();
