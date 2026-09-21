@@ -159,6 +159,7 @@ async fn reads_and_streams_cross_the_partition_boundary_unchanged() {
     let mut stream = engine::stream::stream_events(
         test.db.clone(),
         engine::stream::Scope::Execution(execution_id),
+        engine::stream::Wakeups::none(),
     );
     let mut kinds = Vec::new();
     while let Some(event) = stream.next().await {

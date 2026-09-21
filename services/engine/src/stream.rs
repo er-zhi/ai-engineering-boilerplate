@@ -52,9 +52,13 @@ impl Scope {
 }
 
 #[must_use]
-pub fn stream_events(db: DatabaseConnection, scope: Scope) -> ServiceStream<ProtoEvent> {
+pub fn stream_events(
+    db: DatabaseConnection,
+    scope: Scope,
+    wakeups: Wakeups,
+) -> ServiceStream<ProtoEvent> {
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    tokio::spawn(async move { poll_forever(db, scope, tx).await });
+    tokio::spawn(async move { poll_forever(db, scope, tx, wakeups).await });
     Box::pin(ReceiverStream::new(rx))
 }
 
@@ -62,6 +66,7 @@ async fn poll_forever(
     db: DatabaseConnection,
     scope: Scope,
     tx: mpsc::Sender<Result<ProtoEvent, ConnectError>>,
+    wakeups: Wakeups,
 ) {
     let mut last_id: i64 = 0;
     loop {
@@ -82,7 +87,7 @@ async fn poll_forever(
             }
         };
         if rows.is_empty() {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            wakeups.wait().await;
             continue;
         }
         for row in rows {
@@ -369,7 +374,11 @@ mod tests {
         )
         .await;
 
-        let mut stream = stream_events(test.db.clone(), Scope::Execution(execution_id));
+        let mut stream = stream_events(
+            test.db.clone(),
+            Scope::Execution(execution_id),
+            Wakeups::none(),
+        );
         let first = stream.next().await.expect("first").expect("ok");
         assert_eq!(first.payload_kind, ExecutionEventKind::NodeStarted);
         let second = stream.next().await.expect("second").expect("ok");
@@ -396,8 +405,66 @@ mod tests {
         };
         event.insert(&test.db).await.expect("insert");
 
-        let mut stream = stream_events(test.db.clone(), Scope::User(user_id));
+        let mut stream = stream_events(test.db.clone(), Scope::User(user_id), Wakeups::none());
         let first = stream.next().await.expect("first").expect("ok");
         assert_eq!(first.payload_kind, ExecutionEventKind::ExecutionCompleted);
+    }
+}
+
+/// One `LISTEN` connection for the whole process, fanned out to every open stream.
+///
+/// The engine already announces its own work with `NOTIFY engine_tick` on every checkpoint commit,
+/// and `wakeup.rs` listens for it to drive ticks. This carries the same announcement to the event
+/// streams, so a client learns an execution moved on as soon as it did rather than at the next
+/// poll. One connection rather than one per stream: a session with three topics opens three.
+///
+/// The poll and its interval stay exactly as they were. A missed notification — the listener
+/// reconnecting, another process, a signal lost — costs the old latency and nothing else, which is
+/// why this can be a hint rather than a guarantee.
+#[derive(Clone)]
+pub struct Wakeups(Option<tokio::sync::broadcast::Sender<()>>);
+
+impl Wakeups {
+    /// Opens the listener and starts fanning out. A database that will not take a listener leaves
+    /// every stream on the interval, which is what they did before this existed.
+    pub async fn listening(database_url: &str) -> Self {
+        let mut listener = match sqlx::postgres::PgListener::connect(database_url).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!(%error, "event streams could not open a listener, staying on the interval");
+                return Self(None);
+            }
+        };
+        if let Err(error) = listener.listen("engine_tick").await {
+            tracing::error!(%error, "event streams could not LISTEN, staying on the interval");
+            return Self(None);
+        }
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        let sender = tx.clone();
+        tokio::spawn(async move {
+            while listener.recv().await.is_ok() {
+                // Ignored deliberately: no subscribers is the normal state between turns.
+                let _ = sender.send(());
+            }
+            tracing::warn!(
+                "the event-stream listener stopped; open streams fall back to the interval"
+            );
+        });
+        Self(Some(tx))
+    }
+
+    #[must_use]
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Waits for the next announcement, or for `POLL_INTERVAL` — whichever comes first.
+    async fn wait(&self) {
+        let Some(tx) = &self.0 else {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            return;
+        };
+        let mut rx = tx.subscribe();
+        let _ = tokio::time::timeout(POLL_INTERVAL, rx.recv()).await;
     }
 }

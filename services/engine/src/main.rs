@@ -73,6 +73,9 @@ fn events_retention_months() -> Option<u32> {
 struct EngineServiceImpl {
     service: Arc<Service>,
     db: sea_orm::DatabaseConnection,
+    /// Shared by every open event stream, so a client hears that an execution moved on when it did
+    /// rather than at the next poll. One listener for the process; see `stream::Wakeups`.
+    wakeups: stream::Wakeups,
 }
 
 fn parse_uuid(value: &str, field: &str) -> Result<Uuid, ConnectError> {
@@ -196,7 +199,11 @@ impl EngineService for EngineServiceImpl {
                     })?,
             ),
         };
-        Response::stream_ok(stream::stream_events(self.db.clone(), scope))
+        Response::stream_ok(stream::stream_events(
+            self.db.clone(),
+            scope,
+            self.wakeups.clone(),
+        ))
     }
 
     async fn create_schedule(
@@ -329,7 +336,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduler::run_forever(scheduler_db, scheduler_service, SCHEDULER_POLL_INTERVAL).await;
     });
 
-    let engine_service = EngineServiceImpl { service, db };
+    let wakeups = stream::Wakeups::listening(&database_url).await;
+    let engine_service = EngineServiceImpl {
+        service,
+        db,
+        wakeups,
+    };
     let connect = ConnectRouter::new().add_service(Arc::new(engine_service));
     let app = axum::Router::new()
         .route("/health", get(|| async { "OK" }))

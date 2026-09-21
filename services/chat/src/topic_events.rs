@@ -13,18 +13,47 @@ use crate::topic_manager::TopicManager;
 
 impl TopicManager {
     pub(crate) async fn publish(&self, event: TopicEvent) {
-        if let Err(error) = self.store_event(&event).await {
-            tracing::error!(
-                %error,
-                kind = %event.kind,
-                "failed to persist a chat event"
-            );
-        }
-        self.events.publish(event);
+        self.publish_all(vec![event]).await;
     }
 
-    async fn store_event(&self, event: &TopicEvent) -> Result<(), ChatError> {
-        event::Entity::insert(event::ActiveModel {
+    /// Tells the live subscribers first and writes the log second, and writes however many events
+    /// there are in one statement.
+    ///
+    /// Nobody rebuilds their own transcript from this log: an answer is durable once
+    /// `result_summary` is on its topic row, which a reload reads. The log is for replaying what
+    /// connected clients were told, so a subscriber hearing it a few milliseconds before it is
+    /// written is not a difference anyone can observe — while waiting for the write is
+    /// milliseconds the person spends staring at an answer the system already has.
+    ///
+    /// One statement rather than one per event, because `stored_events` replays in `Id` order: a
+    /// single multi-row insert keeps that order without the second event waiting for the first.
+    pub(crate) async fn publish_all(&self, events: Vec<TopicEvent>) {
+        for event in &events {
+            self.events.publish(event.clone());
+        }
+        if let Err(error) = self.store_events(&events).await {
+            tracing::error!(%error, count = events.len(), "failed to persist chat events");
+        }
+    }
+
+    async fn store_events(&self, events: &[TopicEvent]) -> Result<(), ChatError> {
+        let rows: Vec<event::ActiveModel> = events.iter().map(Self::row_for).collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        event::Entity::insert_many(rows)
+            .on_conflict(
+                OnConflict::columns([event::Column::OccurredAt, event::Column::EventId])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(self.db())
+            .await?;
+        Ok(())
+    }
+
+    fn row_for(event: &TopicEvent) -> event::ActiveModel {
+        event::ActiveModel {
             event_id: Set(event.event_id),
             session_id: Set(event.session_id),
             topic_id: Set(event.topic_id),
@@ -35,15 +64,7 @@ impl TopicManager {
                 Utc::now(),
             )),
             ..Default::default()
-        })
-        .on_conflict(
-            OnConflict::columns([event::Column::OccurredAt, event::Column::EventId])
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(self.db())
-        .await?;
-        Ok(())
+        }
     }
 
     pub(crate) async fn stored_events(

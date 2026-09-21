@@ -194,12 +194,11 @@ impl TopicManager {
             Status::Failed | Status::Queued | Status::Running => TopicEventKind::TopicFailed,
         };
         let outcome = status_word(status);
-        self.publish(
+        // Both at once: they are one moment for the person, and sending them together is one
+        // write rather than two waits.
+        self.publish_all(vec![
             TopicEvent::new(row.session_id, Some(row.id), kind, row.updated_at)
                 .with_payload(serde_json::json!({ "summary": summary })),
-        )
-        .await;
-        self.publish(
             TopicEvent::new(
                 row.session_id,
                 Some(row.id),
@@ -210,7 +209,7 @@ impl TopicManager {
                 "kind": outcome,
                 "text": summary,
             })),
-        )
+        ])
         .await;
     }
 }
