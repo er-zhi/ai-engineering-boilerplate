@@ -182,6 +182,20 @@ const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 const NEEDS_EXTERNAL_INFO_ID: &str = "needs_external_information";
+const PROMISE_ID: &str = "promise";
+/// Above this the reply undertakes work rather than reporting any. Set at the midpoint: the guard
+/// only ever replaces a promise with the truth, so an even split is better spent on the honest
+/// answer than on a sentence that reads like success and is not.
+const PROMISE_THRESHOLD: f64 = 0.5;
+const PROMISE_INSTRUCTIONS: &str = "Does this text undertake to do something, rather than report \
+something already done or known?";
+const PROMISE_WHEN_TRUE: &str = "it says what it is about to do, will do, or needs to do — work \
+that has not happened yet";
+const PROMISE_WHEN_FALSE: &str = "it states what is the case, gives a value, answers, asks the \
+person something, or says plainly that it could not find out";
+/// What replaces a promise. It reports the failure, because the undertaking will not be kept: the
+/// reply ends the turn.
+const PROMISE_REFUSED: &str = "I couldn't get that just now. Ask me again and I'll try.";
 const TOOL_QUESTION_ID: &str = "tool";
 const NO_TOOL_OPTION: &str = "none";
 
@@ -457,11 +471,7 @@ impl TaskExecutor for LlmTaskExecutor {
         let output = self.complete_with_retries(&request).await?;
 
         if answered_before_consulting_any_tool(&config, state, &output) {
-            tracing::info!("llm answered before using any tool, nudging once");
-            let mut nudged = request.clone();
-            nudged.system_prompt.push_str(TOOL_NUDGE);
-            let second = self.complete_with_retries(&nudged).await?;
-            return Ok(merge_usage(&output, second));
+            return self.nudged_once(&config, state, &request, output).await;
         }
         Ok(output)
     }
@@ -553,6 +563,69 @@ impl LlmTaskExecutor {
             }
             FastPath::Unavailable => None,
         }
+    }
+
+    /// The residual path's second chance: the model was offered tools and answered without calling
+    /// one, so it is told so and asked again. Whatever comes back is checked for a promise, because
+    /// this is the one route where neither the decision nor the mode could stop one.
+    async fn nudged_once(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        request: &CompleteRequest,
+        first: Value,
+    ) -> Result<Value, TaskError> {
+        tracing::info!("llm answered before using any tool, nudging once");
+        let mut nudged = request.clone();
+        nudged.system_prompt.push_str(TOOL_NUDGE);
+        let second = self.complete_with_retries(&nudged).await?;
+        let merged = merge_usage(&first, second);
+        Ok(self.without_an_empty_promise(config, state, merged).await)
+    }
+
+    /// The last thing between a promise and the person. Twice offered tools and twice answering
+    /// without calling one, the model has either answered from what it knows — which is fine — or
+    /// undertaken to do something, which is not: nothing runs after a reply, so the undertaking is
+    /// never kept and the turn ends looking like it succeeded.
+    ///
+    /// Only a typed decision can tell the two apart, and it is asked about the finished reply
+    /// rather than the question. A promise is replaced with the plain truth. An unavailable or
+    /// unconfident decision leaves the reply exactly as it was: this guard may only remove a
+    /// promise, never invent a failure.
+    async fn without_an_empty_promise(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        output: Value,
+    ) -> Value {
+        if !answered_before_consulting_any_tool(config, state, &output) {
+            return output;
+        }
+        let Some(reply) = output.get("reply").and_then(Value::as_str) else {
+            return output;
+        };
+        let Some(request) = promise_request(reply) else {
+            return output;
+        };
+        // The client already carries DECIDE_CALL_TIMEOUT, so a slow decider costs the same bounded
+        // wait here as anywhere else, and a failure leaves the reply untouched.
+        let decided = match self.decider.decide(request).await {
+            Ok(response) => response.into_owned(),
+            Err(error) => {
+                tracing::warn!(%error, "could not check the reply for a promise, leaving it as it is");
+                return output;
+            }
+        };
+        if !find_noul(&decided.answers, PROMISE_ID).is_some_and(|value| value > PROMISE_THRESHOLD) {
+            return output;
+        }
+        tracing::info!("the reply undertook work that never ran, answering plainly instead");
+        let usage = decide_usage_value(&decided);
+        let mut replaced = output;
+        if let Some(object) = replaced.as_object_mut() {
+            object.insert("reply".to_owned(), json!(PROMISE_REFUSED));
+        }
+        merge_usage(&usage, replaced)
     }
 
     /// One `Complete` in compose-only mode, then the dispatch the decision already committed to.
@@ -978,6 +1051,21 @@ fn instructed(id: &str, instructions: Value) -> Option<Question> {
         serde_json::from_value(json!({ "instructions": instructions })).ok()?;
     question.id = id.to_owned();
     Some(question)
+}
+
+/// Asked of the finished reply, never of the question. Phrased about what the sentence does, so it
+/// names no subject and no tool — the `gate-architecture` rule holds here as everywhere.
+fn promise_request(reply: &str) -> Option<DecideRequest> {
+    let mut request: DecideRequest = serde_json::from_value(json!({ "state": reply })).ok()?;
+    let mut question = instructed(PROMISE_ID, json!(PROMISE_INSTRUCTIONS))?;
+    question.kind = Noul {
+        when_true: Some(PROMISE_WHEN_TRUE.to_owned()),
+        when_false: Some(PROMISE_WHEN_FALSE.to_owned()),
+        ..Default::default()
+    }
+    .into();
+    request.questions = vec![question];
+    Some(request)
 }
 
 fn needs_external_information_question() -> Option<Question> {
@@ -1511,6 +1599,7 @@ mod tests {
         /// is asked about: `(choice, confidence, stated, one_only)`.
         decide_span: Mutex<Option<(String, f64, f64, f64)>>,
         decide_needs_external_info: Mutex<Option<f64>>,
+        decide_promise: Mutex<Option<f64>>,
         decide_calls: Mutex<usize>,
         decide_hangs: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     }
@@ -1524,6 +1613,7 @@ mod tests {
                 decide_tool: Mutex::new(None),
                 decide_span: Mutex::new(None),
                 decide_needs_external_info: Mutex::new(None),
+                decide_promise: Mutex::new(None),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
             }
@@ -1537,6 +1627,7 @@ mod tests {
                 decide_tool: Mutex::new(None),
                 decide_span: Mutex::new(None),
                 decide_needs_external_info: Mutex::new(None),
+                decide_promise: Mutex::new(None),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
             }
@@ -1571,6 +1662,11 @@ mod tests {
 
         fn answer_decide_needs_external_info(&self, noul: f64) {
             *self.decide_needs_external_info.lock().expect("lock") = Some(noul);
+        }
+
+        /// Arms the guard's verdict over a finished reply.
+        fn answer_decide_promise(&self, noul: f64) {
+            *self.decide_promise.lock().expect("lock") = Some(noul);
         }
 
         /// Accepts a `Decide` call and then never answers it, so a test can observe it abandoned
@@ -1628,7 +1724,8 @@ mod tests {
             let tool = self.decide_tool.lock().expect("lock").clone();
             let needs_info = *self.decide_needs_external_info.lock().expect("lock");
             let span = self.decide_span.lock().expect("lock").clone();
-            if tool.is_none() && needs_info.is_none() {
+            let promise = *self.decide_promise.lock().expect("lock");
+            if tool.is_none() && needs_info.is_none() && promise.is_none() {
                 return Err(connectrpc::ConnectError::unavailable(
                     "configured fake decider failure",
                 ));
@@ -1637,7 +1734,12 @@ mod tests {
             let answers = owned
                 .questions
                 .iter()
-                .filter_map(|question| scripted_answer(&question.id, &tool, needs_info, &span))
+                .filter_map(|question| {
+                    if question.id == PROMISE_ID {
+                        return promise.map(|noul| noul_answer(PROMISE_ID, noul));
+                    }
+                    scripted_answer(&question.id, &tool, needs_info, &span)
+                })
                 .collect();
             Response::ok(DecideResponse {
                 answers,
@@ -1653,6 +1755,18 @@ mod tests {
             _request: ServiceRequest<'_, DescribeModelsRequest>,
         ) -> ServiceResult<DescribeModelsResponse> {
             Response::ok(DescribeModelsResponse::default())
+        }
+    }
+
+    fn noul_answer(id: &str, noul: f64) -> Answer {
+        Answer {
+            id: id.to_owned(),
+            answer: NoulAnswer {
+                noul,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
         }
     }
 
@@ -2628,6 +2742,91 @@ mod tests {
             "the Decide call this path spends must be charged too, the same as the nudge's \
              second Complete call already is via merge_usage"
         );
+    }
+
+    /// The failure the whole change exists to remove, in the one place the three branches cannot
+    /// reach: the decision was unconfident, the loop ran, the nudge ran, and the model still
+    /// answered with an undertaking. Nothing runs after a reply, so the undertaking is never kept.
+    #[tokio::test]
+    async fn a_reply_that_only_undertakes_work_is_replaced_with_the_plain_truth() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "Bishkek. I'll look up the weather there and the NASDAQ."}"#,
+        ));
+        fake.answer_decide_promise(0.9);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            output["reply"],
+            json!(PROMISE_REFUSED),
+            "a promise the turn cannot keep must never reach the person"
+        );
+    }
+
+    /// The guard may only ever remove a promise. An answer given from what the model knows is a
+    /// finished answer, however few tools it called getting there.
+    #[tokio::test]
+    async fn a_reply_that_answers_is_left_alone_even_though_no_tool_ran() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "Bishkek."}"#,
+        ));
+        fake.answer_decide_promise(0.05);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!("Bishkek."));
+    }
+
+    /// A decider that cannot answer must not cost the person their reply. The guard removes a
+    /// promise; it never invents a failure.
+    #[tokio::test]
+    async fn an_unavailable_guard_leaves_the_reply_exactly_as_it_was() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "I'll look that up."}"#,
+        ));
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!("I'll look that up."));
     }
 
     /// When the decision says no tool is needed, none is listed. A model cannot promise a lookup
