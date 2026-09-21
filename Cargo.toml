@@ -21,6 +21,18 @@ too_many_lines = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
 
+# Debug builds carried full debug info, and nothing ever removed the artefacts of dependency
+# versions that had moved on: one long session of rebuilds grew `target/` to 129 GB across 458k
+# files and filled the disk. `line-tables-only` keeps what a panic backtrace actually reads — file
+# and line — and drops the variable and type tables a debugger would want, which is the bulk of it.
+# Reach for `debug = true` in a profile of your own on the day you attach a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
+# Tests are built in their own profile and are most of the binaries in the workspace.
+[profile.test]
+debug = "line-tables-only"
+
 [workspace.dependencies]
 connectrpc = "0.9"
 connectrpc-build = "0.9"

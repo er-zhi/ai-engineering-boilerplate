@@ -58,6 +58,22 @@ toolchain is bumped, bump both.
 
 Run the AI review workflow only after deterministic checks pass. Its entry point and required evidence format are in [the code-review skill](../.agents/skills/code-review/SKILL.md).
 
+## Build Footprint
+
+`target/` grows without bound if nothing is done about it: Cargo never removes the artefacts of a
+dependency version that has moved on, and every rebuild adds more. A long session of rebuilds grew
+it to **129 GB across 458 000 files** and filled the disk, at which point nothing could run — not
+the tests, not Docker, not even a shell command, because the shell could no longer write its own
+output.
+
+Two things keep it down. `[profile.dev]` and `[profile.test]` in the root `Cargo.toml` set
+`debug = "line-tables-only"`, which keeps the file and line a panic backtrace prints and drops the
+variable and type tables only a debugger reads; a full workspace build is **3 GB** rather than 93.
+And `cargo clean` remains the answer when it creeps up anyway — it costs one full rebuild, about
+three minutes here.
+
+If you attach a debugger, put `debug = true` in a profile of your own rather than changing these.
+
 ## Running Rust Services on the Host
 
 Keep PostgreSQL in Compose:

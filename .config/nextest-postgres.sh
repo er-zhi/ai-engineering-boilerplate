@@ -11,8 +11,10 @@ fi
 container_name="ai-engineering-test-${NEXTEST_RUN_ID}"
 parent_pid="$PPID"
 
+# `-v` because the image declares a volume for its data directory: removing the container without
+# it leaves the volume behind, and one run per commit fills a disk in a week.
 cleanup() {
-  docker rm -f "$container_name" >/dev/null 2>&1 || true
+  docker rm -f -v "$container_name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -68,5 +70,5 @@ nohup sh -c '
   parent_pid="$1"
   container_name="$2"
   while kill -0 "$parent_pid" 2>/dev/null; do sleep 1; done
-  docker rm -f "$container_name" >/dev/null 2>&1 || true
+  docker rm -f -v "$container_name" >/dev/null 2>&1 || true
 ' sh "$parent_pid" "$container_name" >/dev/null 2>&1 &
