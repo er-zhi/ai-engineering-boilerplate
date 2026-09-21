@@ -262,10 +262,16 @@
     return htmlParts.join("");
   }
 
-  // The time of the previously rendered line, so each line can show the gap before it. Reset
-  // wherever the transcript is cleared: a stale cursor would print a gap measured against a line
-  // that is no longer on screen.
-  let previousAtMs = null;
+  // When the turn being answered was sent. Every answer's gap is measured from here rather than
+  // from the line above it, because what anyone actually wants to know is how long *they* waited —
+  // and with themes answering in parallel, a gap measured against the previous line charges the
+  // second answer only for the time after the first, which flatters it.
+  //
+  // A live send anchors on the browser's own clock at the moment of sending, which is the true
+  // start. A rebuilt transcript can only anchor on the stored message time, and that row is written
+  // after the turn has been routed and split — so a reloaded page under-reports by that much.
+  // Reset wherever the transcript is cleared.
+  let turnAnchorMs = null;
 
   function clockText(iso) {
     const at = new Date(iso);
@@ -274,16 +280,14 @@
     return `${at.toLocaleTimeString([], { hour12: false })}.${ms}`;
   }
 
-  // Only ever a forward gap. Entries are sorted before rendering, but a live event can still
-  // arrive stamped behind the last rendered line, and "-0.4s" would read as a bug rather than as
-  // the clock skew it is. Two clocks reach here: server times for anything the server recorded,
-  // and the browser's own for the three lines that only ever happen locally — the optimistic echo
-  // of a message being sent and the two error lines. A browser clock running ahead therefore
-  // suppresses the gap on the next server-stamped line rather than printing a wrong one, which is
-  // the direction this should fail in.
+  // Only ever a forward gap. A live event can arrive stamped behind the anchor, and "-0.4s" would
+  // read as a bug rather than as the clock skew it is. Two clocks reach here: server times for
+  // anything the server recorded, and the browser's own for the lines that only ever happen
+  // locally. A browser clock running ahead therefore suppresses the gap rather than printing a
+  // wrong one, which is the direction this should fail in.
   function gapText(stampMs) {
-    if (previousAtMs === null || !Number.isFinite(stampMs)) return "";
-    const seconds = (stampMs - previousAtMs) / 1000;
+    if (turnAnchorMs === null || !Number.isFinite(stampMs)) return "";
+    const seconds = (stampMs - turnAnchorMs) / 1000;
     return seconds > 0 ? ` +${seconds.toFixed(1)}s` : "";
   }
 
@@ -292,13 +296,16 @@
     const stamp = at || new Date().toISOString();
     const stampMs = atMs(stamp);
     const label = clockText(stamp);
+    // A line from the person starts a new turn and becomes the point every answer is measured
+    // from; it carries no gap of its own.
+    const startsTurn = who === "you";
+    if (startsTurn && Number.isFinite(stampMs)) turnAnchorMs = stampMs;
     if (label) {
       const span = element("span", "at", label);
-      const gap = gapText(stampMs);
+      const gap = startsTurn ? "" : gapText(stampMs);
       if (gap) span.appendChild(element("span", "gap", gap));
       span.appendChild(document.createTextNode(" "));
       div.appendChild(span);
-      if (Number.isFinite(stampMs)) previousAtMs = stampMs;
     }
     if (topicTitle) div.appendChild(element("span", "topic", `[${topicTitle}]`));
     div.appendChild(element("span", "kind", `${who} `));
@@ -398,7 +405,7 @@
 
   function renderTranscript() {
     transcript.textContent = "";
-    previousAtMs = null;
+    turnAnchorMs = null;
     transcriptEntries(topics).forEach((entry) => {
       appendMessage(entry.who, entry.text, entry.className, entry.topic, entry.at);
     });
@@ -502,7 +509,7 @@
 
   async function startOver() {
     transcript.textContent = "";
-    previousAtMs = null;
+    turnAnchorMs = null;
     topics = [];
     focusTopicId = null;
     await loadSession();
