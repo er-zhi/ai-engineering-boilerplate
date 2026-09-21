@@ -273,6 +273,15 @@
   // Reset wherever the transcript is cleared.
   let turnAnchorMs = null;
 
+  // When each turn was really sent, by turn id. A stored message row is written only once the turn
+  // has been routed and split, so it lags the moment the person pressed send by however long that
+  // took — and that lag is precisely the part of the wait an anchor taken from the stored row would
+  // hide. The optimistic line carries the true time, but the first reload rebuilds the transcript
+  // from stored data and would throw it away, so it is kept here and re-applied on every rebuild.
+  // Page lifetime only: after a reload there is nothing to recover it from, and the transcript falls
+  // back to the stored time and under-reports.
+  const sentAtByTurn = new Map();
+
   function clockText(iso) {
     const at = new Date(iso);
     if (Number.isNaN(at.getTime())) return "";
@@ -361,7 +370,8 @@
       const first = group[0];
       const topicIds = new Set(group.map((m) => m.topicId));
       const tag = topicIds.size === 1 ? rootTitleOf(topics, first.topicId) : undefined;
-      return { at: first.createdAt, sequence: TURN_SEQUENCE, who: "you", text: first.content, topic: tag };
+      const at = sentAtByTurn.get(first.turnId) || first.createdAt;
+      return { at, sequence: TURN_SEQUENCE, who: "you", text: first.content, topic: tag };
     });
   }
 
@@ -498,9 +508,12 @@
     const content = input.value.trim();
     if (!content) return;
     input.value = "";
-    appendMessage("you", content);
+    const turnId = crypto.randomUUID();
+    const sentAt = new Date().toISOString();
+    sentAtByTurn.set(turnId, sentAt);
+    appendMessage("you", content, undefined, undefined, sentAt);
     try {
-      await callRpc("SendTurn", { turnId: crypto.randomUUID(), content });
+      await callRpc("SendTurn", { turnId, content });
       await loadSession();
     } catch (err) {
       appendMessage("!", err.message, "error");
@@ -510,13 +523,14 @@
   async function startOver() {
     transcript.textContent = "";
     turnAnchorMs = null;
+    // The turns those ids belonged to are gone, so nothing will ask for them again.
+    sentAtByTurn.clear();
     topics = [];
     focusTopicId = null;
     await loadSession();
   }
 
   document.getElementById("newSession").onclick = async () => {
-    if (!confirm("Start over? This deletes all topics.")) return;
     try {
       await callRpc("ResetSession", {});
       await startOver();

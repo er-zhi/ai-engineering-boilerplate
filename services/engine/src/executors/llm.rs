@@ -661,9 +661,17 @@ fn fits_fast_dispatch(question: &str) -> bool {
 }
 
 /// `Some(field)` when `input_schema_json` is a JSON Schema object whose `required` names exactly
-/// one field, and that field's own schema is `"type": "string"`. A tool needing structured
-/// arguments — two required fields, a non-string field, or a schema this cannot parse — is `None`,
-/// so it never takes the fast path regardless of how confidently it was chosen.
+/// one field, that field's own schema is `"type": "string"`, and it is annotated as taking free
+/// text. A tool needing structured arguments — two required fields, a non-string field, or a schema
+/// this cannot parse — is `None`, so it never takes the fast path regardless of how confidently it
+/// was chosen.
+///
+/// The annotation is the load-bearing part, and it is read from the tool's own declaration rather
+/// than decided here, so a new capability is still a file the operator writes and not a branch in
+/// this function. Without it, an argument that wants a value — a place, a pair, a code — is handed
+/// the user's whole sentence, and the request was never going to work: measured at ~850 ms spent
+/// reaching a third party that rejects it, against ~321 ms for the generative call that composes
+/// the argument properly. See `common::tool_schema::ACCEPTS_FREE_TEXT` for why absent means no.
 fn single_required_string_field(input_schema_json: &str) -> Option<String> {
     let schema: Value = serde_json::from_str(input_schema_json).ok()?;
     let required = schema.get("required")?.as_array()?;
@@ -671,13 +679,9 @@ fn single_required_string_field(input_schema_json: &str) -> Option<String> {
         return None;
     };
     let field = only.as_str()?;
-    let is_string = schema
-        .get("properties")
-        .and_then(|properties| properties.get(field))
-        .and_then(|field_schema| field_schema.get("type"))
-        .and_then(Value::as_str)
-        == Some("string");
-    is_string.then(|| field.to_owned())
+    let property = schema.get("properties")?.get(field)?;
+    let is_string = property.get("type").and_then(Value::as_str) == Some("string");
+    (is_string && common::tool_schema::accepts_free_text(property)).then(|| field.to_owned())
 }
 
 fn find_noul(answers: &[Answer], id: &str) -> Option<f64> {
@@ -1275,7 +1279,24 @@ mod tests {
         format!("http://{address}")
     }
 
+    /// A tool whose one required argument is the asking words themselves — the only shape that may
+    /// be handed a message verbatim, and the only shape the fast path accepts.
     fn single_field_tool(name: &str, field: &str) -> CatalogEntry {
+        CatalogEntry {
+            name: name.to_owned(),
+            description: "does a thing".to_owned(),
+            input_schema_json: json!({
+                "type": "object",
+                "required": [field],
+                "properties": {field: {"type": "string", "x-accepts-free-text": true}},
+            })
+            .to_string(),
+        }
+    }
+
+    /// The same shape but for an argument that wants a value rather than a query. It qualifies on
+    /// every count the fast path used to check, and must still not be dispatched verbatim.
+    fn single_value_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
             description: "does a thing".to_owned(),
@@ -1487,7 +1508,7 @@ mod tests {
         let schema = json!({
             "type": "object",
             "required": ["query"],
-            "properties": {"query": {"type": "string"}},
+            "properties": {"query": {"type": "string", "x-accepts-free-text": true}},
         })
         .to_string();
         assert_eq!(
@@ -1506,7 +1527,7 @@ mod tests {
             "type": "object",
             "required": ["query"],
             "properties": {
-                "query": {"type": "string"},
+                "query": {"type": "string", "x-accepts-free-text": true},
                 "limit": {"type": ["integer", "null"]},
             },
         })
@@ -1523,6 +1544,32 @@ mod tests {
             "type": "object",
             "required": ["a", "b"],
             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        })
+        .to_string();
+        assert_eq!(single_required_string_field(&schema), None);
+    }
+
+    // The shape the whole annotation exists for: one required string field that wants a *value* —
+    // a place, a pair, a code — not the asking words. Handing it the message verbatim produces a
+    // request that was never going to work, so it must not qualify however confidently the tool
+    // was chosen. Absent is the default, which is why this schema says nothing at all.
+    #[test]
+    fn single_required_string_field_rejects_a_string_that_does_not_take_free_text() {
+        let schema = json!({
+            "type": "object",
+            "required": ["place"],
+            "properties": {"place": {"type": "string"}},
+        })
+        .to_string();
+        assert_eq!(single_required_string_field(&schema), None);
+    }
+
+    #[test]
+    fn single_required_string_field_rejects_free_text_declared_as_anything_but_true() {
+        let schema = json!({
+            "type": "object",
+            "required": ["place"],
+            "properties": {"place": {"type": "string", "x-accepts-free-text": "yes"}},
         })
         .to_string();
         assert_eq!(single_required_string_field(&schema), None);
@@ -1616,6 +1663,48 @@ mod tests {
             .await
             .expect("execute");
         (output, fake, tool)
+    }
+
+    /// The counterpart, end to end: a tool whose one required string argument wants a value rather
+    /// than the asking words is *not* dispatched verbatim, however confidently it was chosen. It
+    /// satisfies every other condition the fast path checks, so only the annotation stands between
+    /// the turn and a request that was never going to work.
+    #[tokio::test]
+    async fn a_tool_whose_argument_is_a_value_is_not_dispatched_with_the_question_verbatim() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "sixty-eight"}"#,
+        ));
+        fake.answer_decide_tool("some_tool", 0.9);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"answer": "sixty-eight"}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_value_field_tool("some_tool", "place")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute(
+                "llm",
+                &config,
+                &json!({"question": "what is the weather in Bishkek today?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            tool.calls(),
+            0,
+            "no tool may be reached before the model has composed its arguments"
+        );
+        assert!(
+            output.get("fast_tool_call").is_none(),
+            "nothing was fast-dispatched: {output}"
+        );
     }
 
     #[tokio::test]

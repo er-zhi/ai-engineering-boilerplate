@@ -24,6 +24,11 @@ pub fn parse<T: DeserializeOwned>(input: &Value) -> Result<T, String> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Search {
+    /// A search takes the asking words themselves, so this is the one argument shape that may be
+    /// handed a message verbatim. The annotation is spelled out here because a derive attribute
+    /// takes a literal; `a_searchs_query_is_annotated_as_free_text` holds it to
+    /// `common::tool_schema::ACCEPTS_FREE_TEXT` so the two cannot drift.
+    #[schemars(extend("x-accepts-free-text" = true))]
     pub query: String,
     pub limit: Option<u8>,
 }
@@ -138,5 +143,41 @@ mod tests {
             .expect_err("over the cap");
 
         assert!(error.contains(&MAX_URLS.to_string()), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+
+    /// The derive takes a string literal, so the annotation's spelling lives in two crates. This
+    /// holds them together: Engine reads the catalog looking for exactly this key.
+    #[test]
+    fn a_searchs_query_is_annotated_as_free_text() {
+        let schema = input_schema::<Search>();
+        let query = &schema["properties"]["query"];
+        assert!(
+            common::tool_schema::accepts_free_text(query),
+            "query must carry {}: {query}",
+            common::tool_schema::ACCEPTS_FREE_TEXT
+        );
+    }
+
+    /// Everything else takes a value rather than a query, and must not be handed a whole message.
+    #[test]
+    fn no_other_system_argument_claims_to_take_free_text() {
+        for schema in [input_schema::<Fetch>(), input_schema::<ReadDocument>()] {
+            let properties = schema["properties"].as_object().expect("properties");
+            for (name, property) in properties {
+                assert!(
+                    !common::tool_schema::accepts_free_text(property),
+                    "{name} must not claim free text"
+                );
+            }
+        }
+        let search = input_schema::<Search>();
+        assert!(!common::tool_schema::accepts_free_text(
+            &search["properties"]["limit"]
+        ));
     }
 }

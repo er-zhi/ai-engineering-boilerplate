@@ -6,6 +6,7 @@ pub mod logging;
 pub mod principal;
 #[cfg(feature = "test-support")]
 pub mod test_db;
+pub mod tool_schema;
 
 #[allow(clippy::too_many_lines)]
 pub mod proto {
