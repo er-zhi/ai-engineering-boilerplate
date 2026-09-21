@@ -12,6 +12,10 @@ const PLACEHOLDER_OPEN: char = '{';
 const PLACEHOLDER_CLOSE: char = '}';
 /// What `pick_value` splits a path on, and therefore what a filled `pick` may not smuggle in.
 const PATH_SEPARATOR: char = '.';
+/// What turns `{NAME}` into a secret read from the environment rather than an argument.
+const SECRET_MARKER: char = '$';
+/// What a substituted secret is replaced by before any message carrying it is passed on.
+const REDACTED: &str = "***";
 
 #[derive(Debug, Deserialize)]
 pub struct SourceSet {
@@ -40,6 +44,22 @@ pub struct Source {
 /// too (Task 5) and refuses to write a row it rejects — otherwise the first user to reach the tool
 /// is the one who finds out.
 pub fn parse_sources(raw: &Value, input_schema: &Value) -> Result<SourceSet, String> {
+    checked(raw, input_schema, &from_environment)
+}
+
+/// The environment, as the one lookup the running service uses. Split out so a test can hand these
+/// checks a lookup of its own: setting a process-wide variable is `unsafe` in this edition, this
+/// crate forbids `unsafe`, and a test that mutated the environment would reach every other test
+/// running beside it.
+fn from_environment(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn checked(
+    raw: &Value,
+    input_schema: &Value,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<SourceSet, String> {
     let set: SourceSet =
         serde_json::from_value(raw.clone()).map_err(|error| format!("sources: {error}"))?;
     if set.sources.is_empty() {
@@ -82,6 +102,30 @@ pub fn parse_sources(raw: &Value, input_schema: &Value) -> Result<SourceSet, Str
                 ));
             }
         }
+        // A missing credential is a seeding mistake, so it refuses the file here rather than
+        // reaching a third party as an unauthenticated request whose reply nobody vouches for.
+        for name in secret_placeholders(&source.url)
+            .map_err(|error| format!("source {:?}: {error}", source.name))?
+        {
+            if lookup(&name).is_none() {
+                return Err(format!(
+                    "source {:?} needs {name:?} from the environment, which is not set",
+                    source.name
+                ));
+            }
+        }
+        // A pick addresses the reply, never the request, so nothing about it is secret — and
+        // `fill_path` would leave a `${...}` standing, which would silently look for a key that is
+        // not there rather than failing.
+        if !secret_placeholders(&source.pick)
+            .map_err(|error| format!("source {:?}: {error}", source.name))?
+            .is_empty()
+        {
+            return Err(format!(
+                "source {:?} puts a ${{...}} in its pick, where nothing is substituted from the environment",
+                source.name
+            ));
+        }
     }
     Ok(set)
 }
@@ -97,20 +141,69 @@ fn declared_fields(input_schema: &Value) -> Vec<String> {
 /// Scans out every `{field}` placeholder. An unclosed `{` is refused rather than silently
 /// dropped — otherwise the literal brace reaches the HTTP layer unsubstituted, and only the
 /// first caller who trips it finds out.
+///
+/// A `{` written straight after a `$` opens a secret instead — see `secret_placeholders` — and is
+/// skipped here, so `${SOME_KEY}` is not mistaken for an argument the input schema forgot to
+/// declare.
 fn placeholders(template: &str) -> Result<Vec<String>, String> {
+    scan(template, false)
+}
+
+/// Scans out every `${SOME_KEY}` placeholder: a value the operator keeps in the environment rather
+/// than in the file, because a file listing an endpoint is not a place to keep a credential.
+fn secret_placeholders(template: &str) -> Result<Vec<String>, String> {
+    scan(template, true)
+}
+
+fn scan(template: &str, secrets: bool) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
-    let mut rest = template;
-    while let Some(start) = rest.find(PLACEHOLDER_OPEN) {
-        let after = &rest[start + PLACEHOLDER_OPEN.len_utf8()..];
-        match after.find(PLACEHOLDER_CLOSE) {
-            Some(end) => {
-                found.push(after[..end].to_owned());
-                rest = &after[end + PLACEHOLDER_CLOSE.len_utf8()..];
-            }
-            None => return Err(format!("{template:?} has a {{ with no closing }}")),
+    let mut at = 0;
+    while let Some(offset) = template[at..].find(PLACEHOLDER_OPEN) {
+        let open = at + offset;
+        let is_secret = template[..open].ends_with(SECRET_MARKER);
+        let after = &template[open + PLACEHOLDER_OPEN.len_utf8()..];
+        let Some(end) = after.find(PLACEHOLDER_CLOSE) else {
+            return Err(format!("{template:?} has a {{ with no closing }}"));
+        };
+        if is_secret == secrets {
+            found.push(after[..end].to_owned());
         }
+        at = open + PLACEHOLDER_OPEN.len_utf8() + end + PLACEHOLDER_CLOSE.len_utf8();
     }
     Ok(found)
+}
+
+/// Replaces every `${SOME_KEY}` with what the environment holds, and reports what it substituted so
+/// the caller can keep those values out of anything it goes on to say. A name the environment does
+/// not carry is an error rather than an empty string: a URL silently missing its credential reaches
+/// a third party as an unauthenticated request, and the reply to *that* is what the model would be
+/// asked to believe.
+fn fill_secrets(
+    template: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    let mut filled = template.to_owned();
+    let mut used = Vec::new();
+    for name in secret_placeholders(template)? {
+        let value =
+            lookup(&name).ok_or_else(|| format!("the environment does not carry {name:?}"))?;
+        filled = filled.replace(
+            &format!("{SECRET_MARKER}{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}"),
+            &value,
+        );
+        if !value.is_empty() {
+            used.push(value);
+        }
+    }
+    Ok((filled, used))
+}
+
+/// Takes every substituted secret back out of a message. A source's failure text reaches the model's
+/// prompt and the request audit, and a URL is the one thing a failure is most likely to quote.
+fn without_secrets(message: String, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .fold(message, |text, secret| text.replace(secret, REDACTED))
 }
 
 /// Substitutes every `{field}` from `input`, percent-encoding the value. A field the caller did not
@@ -201,10 +294,16 @@ where
 {
     let mut ready: Vec<(&Source, String, String)> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
+    // Every secret this call substitutes, so nothing that goes on to be said can quote one back.
+    let mut secrets: Vec<String> = Vec::new();
     for source in &set.sources {
-        match fill(&source.url, input)
-            .and_then(|url| fill_path(&source.pick, input).map(|pick| (url, pick)))
-        {
+        let prepared = fill_secrets(&source.url, &from_environment).and_then(|(url, used)| {
+            secrets.extend(used);
+            let url = fill(&url, input)?;
+            let pick = fill_path(&source.pick, input)?;
+            Ok((url, pick))
+        });
+        match prepared {
             Ok((url, pick)) => match guard(url.clone()).await {
                 Ok(()) => ready.push((source, url, pick)),
                 Err(reason) => refused.push(format!("{}: {reason}", source.name)),
@@ -227,7 +326,12 @@ where
     if outcome.taken.is_empty() {
         let mut reasons = refused;
         reasons.extend(outcome.failures);
-        return Err(format!("every source failed — {}", reasons.join("; ")));
+        // A failure quotes the URL it failed on, and that URL may carry a credential. This is the
+        // one place every source's failure text passes through, so it is the place to take them out.
+        return Err(without_secrets(
+            format!("every source failed — {}", reasons.join("; ")),
+            &secrets,
+        ));
     }
     Ok(serde_json::json!({
         "values": outcome
@@ -347,6 +451,79 @@ mod tests {
             fill_path("rates.{name}", &input).expect("fill"),
             "rates.euro zone"
         );
+    }
+
+    fn holding(name: &'static str, value: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |asked: &str| (asked == name).then(|| value.to_owned())
+    }
+
+    fn holding_nothing(_: &str) -> Option<String> {
+        None
+    }
+
+    /// `${NAME}` reads the environment; `{name}` reads the caller's input. The two must not be
+    /// confused, or a credential's name would be refused as an argument nobody declared.
+    #[test]
+    fn a_secret_placeholder_is_not_mistaken_for_an_argument() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://e.test/?key=${SOME_KEY}&q={place}", "pick": "value"}]
+        });
+        checked(
+            &raw,
+            &schema_with(json!({"place": {"type": "string"}})),
+            &holding("SOME_KEY", "s3cret"),
+        )
+        .expect("a secret is not an undeclared argument");
+    }
+
+    #[test]
+    fn a_secret_the_environment_does_not_carry_refuses_the_row() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://e.test/?key=${SOME_KEY}", "pick": "value"}]
+        });
+        let error = checked(&raw, &schema_with(json!({})), &holding_nothing)
+            .expect_err("the key is not set");
+        assert!(error.contains("SOME_KEY"), "{error}");
+    }
+
+    /// A pick addresses the reply, where nothing is substituted from the environment. Left to
+    /// stand, a `${...}` there would quietly look for a key that is not in the reply.
+    #[test]
+    fn a_secret_in_a_pick_is_refused() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://e.test/", "pick": "rates.${SOME_KEY}"}]
+        });
+        let error = checked(
+            &raw,
+            &schema_with(json!({})),
+            &holding("SOME_KEY", "s3cret"),
+        )
+        .expect_err("a pick takes no secrets");
+        assert!(error.contains("pick"), "{error}");
+    }
+
+    #[test]
+    fn a_secret_is_substituted_into_the_url_and_reported_so_it_can_be_taken_back_out() {
+        let (url, used) = fill_secrets(
+            "https://e.test/?key=${SOME_KEY}",
+            &holding("SOME_KEY", "s3cret"),
+        )
+        .expect("substitutes");
+        assert_eq!(url, "https://e.test/?key=s3cret");
+        assert_eq!(used, vec!["s3cret".to_owned()]);
+    }
+
+    /// The reason the substituted values are reported at all: a source's failure text quotes the
+    /// URL it failed on, and that text reaches the model's prompt and the request audit.
+    #[test]
+    fn a_failure_quoting_the_url_does_not_carry_the_key_out_with_it() {
+        let message = "fetch https://e.test/?key=s3cret failed: timed out".to_owned();
+        let cleaned = without_secrets(message, &["s3cret".to_owned()]);
+        assert!(!cleaned.contains("s3cret"), "{cleaned}");
+        assert!(cleaned.contains("timed out"), "{cleaned}");
     }
 
     #[test]
