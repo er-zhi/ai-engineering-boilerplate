@@ -207,7 +207,12 @@ shape `crate::tools::declarative::parse_sources` checks — `fan_out`, `take`, a
 `{name, url, pick}` sources. `{field}` in a `url` is filled from the tool's input, percent-encoded,
 and only from fields `input_schema` declares — a placeholder naming anything else is refused when
 the file is read, not on a caller's first request. `pick` is a dotted path into the source's JSON
-reply (`"current.value"` reaches into `{"current": {"value": …}}`). A slug already reserved for a
+reply (`"current.value"` reaches into `{"current": {"value": …}}`), and it takes the same
+placeholders under the same check, because a reply's shape often depends on what was asked for: a
+source told to report one named thing commonly keys the answer by that name, so `"rates.{to}"`
+reaches into `{"rates": {"EUR": …}}` when `to` is `EUR`. A `pick` is filled **verbatim** where a
+`url` is percent-encoded — it addresses JSON, not a host, and a key with a space in it would
+otherwise be sought as `%20` and never found. A slug already reserved for a
 system tool (`slugs::RESERVED_FOR_SYSTEM_TOOLS`) or repeated within the file is refused.
 
 A minimal row, with a placeholder subject and endpoints that do not exist:

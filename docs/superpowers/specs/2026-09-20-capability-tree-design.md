@@ -158,6 +158,53 @@ and costs only the tokens for the extra questions."
 A second round is reserved for the one case the vendor does show — re-ranking the top few
 capabilities against richer descriptions than the first round could afford. We do not build it now.
 
+### R9. The knowledge base is not a candidate source — cancelled, with the condition that would revive it
+
+R2 ruled out the vendor's `pre_parsed_value_extraction` recipe because it uses a regular expression
+to find candidate values. The recipe's mechanism, though, is a `choice` over candidates; the regex
+is only one way to produce them. So the question was reopened: let the knowledge base produce the
+candidates, Jev pick one, and code copy it verbatim. No regex, and the app's knowledge coming from
+the KB is this project's original framing.
+
+**It does not pay, and it is cancelled.** Counting generative calls the way R1 does:
+
+| route | generative calls |
+|---|---|
+| today, through the `llm` node | 2 — compose the argument, then answer |
+| the existing single-string fast path | 1 — the answer |
+| KB candidates → `choice` → dispatch | 1 — the answer, plus retrieval latency |
+
+Against the fast path it removes nothing. It only pays where the fast path is *impossible* — where
+the endpoint takes a typed value rather than a free-text query, so handing it the user's whole
+message is simply wrong. That is a property of an operator's endpoint, not of this design, and no
+such row exists to point at. Building it now would be machinery for a case that is already covered,
+bought with retrieval latency, a dependency on KB coverage, and a new attack surface.
+
+Three findings are worth keeping, because they are what would have to be true to revive it:
+
+- **The KB here holds no world entities.** 472 documents, all crawled from one course site. It could
+  not name a city if asked. A KB is a candidate source only for entities it is *about*, and the
+  original suggestion — that it could supply a location — was wrong on this deployment's own data.
+- **Retrieval returns passages, arguments need values.** Unless the KB exposes an index whose keys
+  *are* the values, something must extract a value from the picked passage — and that step is
+  exactly what there is no non-generative tool for. Doing it with further questions is the chained-
+  choice misuse `model-jaggedness/jev-1.13.md` warns about: "you can force it to by chaining choices, this will not
+  work well and will be very slow."
+- **Candidates from crawled pages are attacker-controlled.** `model-jaggedness/jev-1.13.md` is
+  explicit that state is not treated as hostile: "Content written to adversarially steer the model… can move the answer."
+  A candidate drawn from a third-party page is a steering surface that a span of the user's own
+  message is not. If this is ever revived: bare keys as options with no passage text, `state`
+  holding the user's message only, a `none` option, and an absolute `noul` asked about the message
+  alone so an attacker-supplied option cannot influence the gate.
+
+**The condition to revive it:** a declarative row exists whose endpoint rejects a free-text query,
+*and* the KB holds an entity index whose keys are the argument's values. Both, not either.
+
+One sentence from the same documentation cuts the other way and is worth recording, because it
+supports the project's direction even though it does not save this mechanism —
+`concepts/how-to-build-with-system-one.md`: "Do not rely on knowledge stored in model weights when
+current information can come from your own knowledge base."
+
 ---
 
 ## Open questions, held deliberately

@@ -10,6 +10,8 @@ use serde_json::Value;
 
 const PLACEHOLDER_OPEN: char = '{';
 const PLACEHOLDER_CLOSE: char = '}';
+/// What `pick_value` splits a path on, and therefore what a filled `pick` may not smuggle in.
+const PATH_SEPARATOR: char = '.';
 
 #[derive(Debug, Deserialize)]
 pub struct SourceSet {
@@ -26,7 +28,11 @@ pub struct Source {
     /// `{field}` placeholders are filled from the tool's input, and only from fields its
     /// `input_schema` declares.
     pub url: String,
-    /// Dotted path to the value in the source's JSON reply.
+    /// Dotted path to the value in the source's JSON reply. Takes the same `{field}` placeholders a
+    /// `url` does, because a reply's shape often depends on what was asked for — a source told to
+    /// report one thing commonly keys the answer by the name of that thing. Filled verbatim rather
+    /// than percent-encoded — this is a path into JSON, not a URL — except that a value carrying
+    /// the path separator is refused, so an argument cannot walk deeper than the template says.
     pub pick: String,
 }
 
@@ -61,12 +67,17 @@ pub fn parse_sources(raw: &Value, input_schema: &Value) -> Result<SourceSet, Str
         if source.pick.is_empty() {
             return Err(format!("source {:?} has an empty pick", source.name));
         }
-        let fields = placeholders(&source.url)
-            .map_err(|error| format!("source {:?}: {error}", source.name))?;
-        for field in fields {
-            if !declared.contains(&field) {
+        for template in [&source.url, &source.pick] {
+            let undeclared = placeholders(template)
+                .map_err(|error| format!("source {:?}: {error}", source.name))?
+                .into_iter()
+                .find(|field| !declared.contains(field));
+            // Naming the template, not just the field: a row using the same undeclared name in both
+            // its url and its pick would otherwise get the identical sentence twice, and the
+            // operator who fixed one reads it as "my edit did not take".
+            if let Some(field) = undeclared {
                 return Err(format!(
-                    "source {:?} uses {{{field}}}, which input_schema does not declare",
+                    "source {:?} uses {{{field}}} in {template:?}, which input_schema does not declare",
                     source.name
                 ));
             }
@@ -106,6 +117,37 @@ fn placeholders(template: &str) -> Result<Vec<String>, String> {
 /// supply is an error rather than an empty string, because a URL missing a coordinate would still
 /// return a plausible-looking answer about somewhere else.
 pub fn fill(template: &str, input: &Value) -> Result<String, String> {
+    substitute(template, input, |_, plain| {
+        let encoded: String =
+            url::form_urlencoded::byte_serialize(plain.as_bytes()).collect::<String>();
+        Ok(encoded.replace('+', "%20"))
+    })
+}
+
+/// Substitutes every `{field}` from `input` verbatim. A `pick` is a path into a JSON reply rather
+/// than a URL, so percent-encoding it would go looking for a key that is not there — a value with a
+/// space in it would be sought as `%20` and simply not found.
+///
+/// A value carrying the path separator is refused instead. Percent-encoding was what kept a `url`'s
+/// arguments from reaching into its structure, and a `pick` has structure too: unchecked, an
+/// argument of `a.b` turns `rates.{to}` into a two-step walk the operator never wrote, letting
+/// whoever supplies the arguments choose where in a third party's reply the answer is read from.
+pub fn fill_path(template: &str, input: &Value) -> Result<String, String> {
+    substitute(template, input, |field, plain| {
+        if plain.contains(PATH_SEPARATOR) {
+            return Err(format!(
+                "{field:?} carries {PATH_SEPARATOR:?}, which would read deeper into the reply than the pick describes"
+            ));
+        }
+        Ok(plain.to_owned())
+    })
+}
+
+fn substitute(
+    template: &str,
+    input: &Value,
+    render: impl Fn(&str, &str) -> Result<String, String>,
+) -> Result<String, String> {
     let mut filled = template.to_owned();
     for field in placeholders(template)? {
         let value = input
@@ -115,11 +157,9 @@ pub fn fill(template: &str, input: &Value) -> Result<String, String> {
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
-        let encoded: String =
-            url::form_urlencoded::byte_serialize(plain.as_bytes()).collect::<String>();
         filled = filled.replace(
             &format!("{PLACEHOLDER_OPEN}{field}{PLACEHOLDER_CLOSE}"),
-            &encoded.replace('+', "%20"),
+            &render(&field, &plain)?,
         );
     }
     Ok(filled)
@@ -128,7 +168,7 @@ pub fn fill(template: &str, input: &Value) -> Result<String, String> {
 /// Follows a dotted path into a reply. Absent is `None`, and so is a path that runs into a scalar.
 pub fn pick_value(body: &Value, path: &str) -> Option<Value> {
     let mut here = body;
-    for segment in path.split('.') {
+    for segment in path.split(PATH_SEPARATOR) {
         here = here.get(segment)?;
     }
     Some(here.clone())
@@ -150,12 +190,14 @@ where
     G: Fn(String) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = Result<(), String>> + Send,
 {
-    let mut ready: Vec<(&Source, String)> = Vec::new();
+    let mut ready: Vec<(&Source, String, String)> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     for source in &set.sources {
-        match fill(&source.url, input) {
-            Ok(url) => match guard(url.clone()).await {
-                Ok(()) => ready.push((source, url)),
+        match fill(&source.url, input)
+            .and_then(|url| fill_path(&source.pick, input).map(|pick| (url, pick)))
+        {
+            Ok((url, pick)) => match guard(url.clone()).await {
+                Ok(()) => ready.push((source, url, pick)),
                 Err(reason) => refused.push(format!("{}: {reason}", source.name)),
             },
             Err(reason) => refused.push(format!("{}: {reason}", source.name)),
@@ -165,9 +207,9 @@ where
     // declarative tool, so a leak here grows with traffic.
     let ops: Vec<(&str, crate::race::OpFn<'_, Value>)> = ready
         .iter()
-        .map(|(source, url)| {
+        .map(|(source, url, pick)| {
             crate::race::op(source.name.as_str(), move || async move {
-                ask(client, url, &source.pick, per_source_timeout).await
+                ask(client, url, pick, per_source_timeout).await
             })
         })
         .collect();
@@ -256,6 +298,46 @@ mod tests {
         let error = parse_sources(&raw, &schema_with(json!({"place": {"type": "string"}})))
             .expect_err("elsewhere is not an input field");
         assert!(error.contains("elsewhere"), "{error}");
+    }
+
+    #[test]
+    fn a_pick_naming_a_field_the_input_schema_does_not_declare_is_refused() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://example.com/", "pick": "rates.{elsewhere}"}]
+        });
+        let error = parse_sources(&raw, &schema_with(json!({"place": {"type": "string"}})))
+            .expect_err("a pick gets the same check a url does");
+        assert!(error.contains("elsewhere"), "{error}");
+        // Naming the template is the point: a row with the same bad field in both would otherwise
+        // give the operator the identical sentence after they fixed one of them.
+        assert!(error.contains("rates.{elsewhere}"), "{error}");
+    }
+
+    /// The path separator is to a `pick` what percent-encoding kept out of a `url`: without this,
+    /// whoever supplies the arguments chooses where in a third party's reply the answer is read.
+    #[test]
+    fn an_argument_carrying_the_path_separator_is_refused_by_a_pick_but_not_by_a_url() {
+        let input = json!({"to": "a.b"});
+        let error = fill_path("rates.{to}", &input).expect_err("a dot would walk a level deeper");
+        assert!(error.contains("to"), "{error}");
+        assert_eq!(
+            fill("https://e.test/?q={to}", &input).expect("a url encodes it instead"),
+            "https://e.test/?q=a.b"
+        );
+    }
+
+    #[test]
+    fn a_pick_is_filled_verbatim_while_a_url_is_encoded() {
+        let input = json!({"name": "euro zone"});
+        assert_eq!(
+            fill("https://e.test/{name}", &input).expect("fill"),
+            "https://e.test/euro%20zone"
+        );
+        assert_eq!(
+            fill_path("rates.{name}", &input).expect("fill"),
+            "rates.euro zone"
+        );
     }
 
     #[test]
@@ -423,6 +505,76 @@ mod tests {
             names.contains(&"one") && names.contains(&"two"),
             "{names:?}"
         );
+    }
+
+    /// A source told to report one named thing commonly keys the answer by that name, so the path to
+    /// the value is not knowable until the argument is. Before `pick` took placeholders such a
+    /// source could not be expressed as a row at all.
+    #[tokio::test]
+    async fn a_pick_whose_path_depends_on_the_argument_reaches_the_value() {
+        let url = serve(json!({"rates": {"EUR": 0.87, "JPY": 147.0}})).await;
+        let set = set_of(vec![source("one", &url, "rates.{to}")], 1, 1);
+        let out = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({"to": "EUR"}),
+            SOURCE_TIMEOUT,
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("the source answers");
+        assert_eq!(out["values"][0]["value"], json!(0.87));
+    }
+
+    /// The break-and-observe half of the rule above: run this against `fill` instead of `fill_path`
+    /// and the key is sought as `euro%20zone`, which is not in the reply, so the source fails.
+    #[tokio::test]
+    async fn a_picked_key_carrying_a_space_is_not_percent_encoded() {
+        let url = serve(json!({"rates": {"euro zone": 1.5}})).await;
+        let set = set_of(vec![source("one", &url, "rates.{to}")], 1, 1);
+        let out = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({"to": "euro zone"}),
+            SOURCE_TIMEOUT,
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("the source answers");
+        assert_eq!(out["values"][0]["value"], json!(1.5));
+    }
+
+    /// `parse_sources` proves a pick's fields are *declared*; nothing makes them *required*, so a
+    /// caller can still omit one. That source is named as refused and no request goes out — the
+    /// guard is the only thing that ever sees a URL, and it is never reached.
+    #[tokio::test]
+    async fn a_pick_whose_field_the_caller_omitted_refuses_that_source_without_asking_anyone() {
+        let set = set_of(vec![source("one", "https://e.test/", "rates.{to}")], 1, 1);
+        let error = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({}),
+            SOURCE_TIMEOUT,
+            |_| async { panic!("no request may be prepared for a source that cannot be filled") },
+        )
+        .await
+        .expect_err("the only source cannot be filled");
+        assert!(error.contains("one") && error.contains("\"to\""), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_pick_argument_carrying_the_path_separator_refuses_that_source_through_run() {
+        let set = set_of(vec![source("one", "https://e.test/", "rates.{to}")], 1, 1);
+        let error = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({"to": "a.b"}),
+            SOURCE_TIMEOUT,
+            |_| async { panic!("a pick that walks too deep is refused before any request") },
+        )
+        .await
+        .expect_err("a dot in the argument is refused");
+        assert!(error.contains("one") && error.contains('.'), "{error}");
     }
 
     #[tokio::test]

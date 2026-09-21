@@ -224,6 +224,38 @@ git commit -m "llm-router: pin the decision model, because a moving alias silent
 
 ---
 
+### Task 3a: A source's `pick` takes the same placeholders its `url` already does — DONE
+
+**Why.** Found while choosing the capability for Task 3, and it blocks it. `fill` substitutes `{field}` into a source's `url`; `pick` was passed through raw. But the path to a value routinely *depends on the argument* — a source told to report one named thing keys the answer by that name — so the executor could build a request from the arguments and then not reach what came back. It had never surfaced because no declarative row existed. Constraining Task 3's sources to fixed reply paths would have been testing the executor's limits instead of the shape the tree is about.
+
+This is a capability, not a subject: no endpoint, no domain, no slug.
+
+**Files:** modified `services/tool/src/tools/declarative.rs`, `services/tool/README.md`.
+
+- [x] `parse_sources` checks a `pick`'s placeholders against `input_schema` exactly as it checks a `url`'s, so a bad one is refused when the file is read rather than on a caller's first request.
+- [x] `fill` and the new `fill_path` share one `substitute`, differing only in their encoder. A `pick` is filled **verbatim**: it addresses JSON rather than a host, and a key holding a space would otherwise be sought as `%20`.
+- [x] A filled value carrying the path separator is refused. Percent-encoding was what kept a `url`'s arguments out of its structure, and a `pick` has structure too: unchecked, an argument of `a.b` turns `rates.{to}` into a two-step walk the operator never wrote, letting whoever supplies the arguments choose where in a third party's reply the answer is read from. Found by the code-quality gate.
+- [x] Seven tests. Review ran mutation testing over them — five mutations, each killed by exactly the intended test and no other, including the one that matters most: removing `pick` substitution entirely is caught, and swapping `fill_path` back to `fill` fails with `reply carries no "rates.euro%20zone"`.
+
+### Task 3b: What runs on the low tier decides what the low tier should be — DONE
+
+**Why.** Measured while answering "where does a 1.8 s turn go?". Chat spends one generative `Complete` rewriting a multi-theme message into separate self-contained questions, and it runs on the low tier. The vendor's own smart-home demo uses exactly this shape — a `noul` detects a compound request, a generative model splits it, each part is then evaluated typed — so the call is correct; what was wrong was the model under it.
+
+The low tier was still pointed at a model this project had already benchmarked and rejected for the medium tier. Its only work in this flow is short and on a user-facing critical path, so the cheaper token price bought fractions of a cent and cost most of a second.
+
+**Measured, three runs each, same prompt (310 tokens in, ~50 out), sessions reset between runs so each turn is independent:**
+
+| | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| before | 1405 ms | 1305 ms | 1232 ms | 1305 ms |
+| after | 444 ms | 539 ms | 550 ms | **539 ms** |
+
+**~770 ms off every multi-theme turn.** End-to-end medians moved 6.0 s → 2.9 s, but the number of generative calls per turn ranged from 6 to 14, so that swing is not attributable to this change and is not claimed as its result. The split measurement is like-for-like and is.
+
+**Files:** `.env` (operator), `.env.example` (why the low tier is not automatically the cheap tier).
+
+**The measurement mistake worth not repeating:** the first attempt sent the same question three times into one session. Each turn was routed into the topic the previous turn had created, so no split ever fired and the numbers described something else entirely. Routing state grows with the topic list — `tokens_in` climbed 553 → 700 across those runs and route confidence fell to 0.37, below its own threshold. **Reset the session between runs, or measure a different thing than you think.**
+
 ### Task 3: One real capability, and the measurement that decides whether the tree gets built
 
 **Why.** This is the gate. Spec R1 says the tree pays only for capabilities whose arguments are all closed sets, and today **no declarative row exists at all** — the set of capabilities that would benefit is empty, so the tree would be machinery serving nothing. Before building it we establish, against real endpoints, (a) whether a capability with two closed arguments exists and behaves, and (b) whether a capability with an open-ended argument can be served at all by the existing single-string fast path, which passes the user's whole message as the argument. Answer (b) is one request to find out and it decides whether open-argument capabilities have any typed path.
