@@ -606,7 +606,7 @@ fn decide_request(question: &str, available_tools: &[CatalogEntry]) -> Option<De
     ];
     request
         .questions
-        .extend(span_questions(question, available_tools));
+        .extend(decidable_questions(question, available_tools));
     Some(request)
 }
 
@@ -635,7 +635,31 @@ fn spans(message: &str) -> Vec<String> {
 /// that field says its value appears among the words of the message. The description is the
 /// field's own, so the question asks about the meaning the operator wrote rather than about the
 /// parameter's name — a question named after its parameter gives the message nothing to match.
-fn span_valued_field(input_schema_json: &str) -> Option<(String, String)> {
+/// The field and its description, when a typed decision can settle its value at all — whichever
+/// kind of options it turns out to have.
+fn decidable_argument(input_schema_json: &str) -> Option<(String, String)> {
+    let (field, description, _) = decidable_field(input_schema_json)?;
+    Some((field, description))
+}
+
+/// Where a decidable argument's options come from. A closed list is the stronger claim of the two:
+/// the schema itself says what the endpoint will accept, so whatever comes back is a value it
+/// accepts. A span is the weaker one: the value is a word of the message, which the message might
+/// not contain at all.
+enum Options {
+    /// A closed list, optionally with a line per value — `oneOf` entries of `{const, description}`,
+    /// or a bare `enum` of strings.
+    Closed(Vec<(String, Option<String>)>),
+    /// Built per message, from its own words.
+    Spans,
+}
+
+/// `Some((field, description, options))` when a tool's schema names exactly one required string
+/// field whose value a typed decision can settle: either because the schema lists what it may be,
+/// or because the field says it appears among the words of the message. The description is the
+/// field's own, so the question asks about the meaning the operator wrote rather than about the
+/// parameter's name — a question named after its parameter gives the message nothing to match.
+fn decidable_field(input_schema_json: &str) -> Option<(String, String, Options)> {
     let schema: Value = serde_json::from_str(input_schema_json).ok()?;
     let required = schema.get("required")?.as_array()?;
     let [only] = required.as_slice() else {
@@ -643,50 +667,84 @@ fn span_valued_field(input_schema_json: &str) -> Option<(String, String)> {
     };
     let field = only.as_str()?;
     let property = schema.get("properties")?.get(field)?;
-    if property.get("type").and_then(Value::as_str) != Some("string")
-        || !common::tool_schema::value_in_message(property)
-    {
+    if property.get("type").and_then(Value::as_str) != Some("string") {
         return None;
     }
+    let options = closed_list(property).map_or_else(
+        || common::tool_schema::value_in_message(property).then_some(Options::Spans),
+        |listed| Some(Options::Closed(listed)),
+    )?;
     let description = property
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or(field);
-    Some((field.to_owned(), description.to_owned()))
+    Some((field.to_owned(), description.to_owned(), options))
+}
+
+/// A property's closed list, if it has one. `oneOf` of `{const, description}` is preferred because
+/// it carries a line per value, which is what lets the decision tell two near-identical symbols
+/// apart; a bare `enum` of strings works and simply offers no such line.
+fn closed_list(property: &Value) -> Option<Vec<(String, Option<String>)>> {
+    if let Some(variants) = property.get("oneOf").and_then(Value::as_array) {
+        let listed: Vec<(String, Option<String>)> = variants
+            .iter()
+            .filter_map(|variant| {
+                let value = variant.get("const")?.as_str()?.to_owned();
+                let line = variant
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                Some((value, line))
+            })
+            .collect();
+        return (!listed.is_empty()).then_some(listed);
+    }
+    let listed: Vec<(String, Option<String>)> = property
+        .get("enum")?
+        .as_array()?
+        .iter()
+        .filter_map(|value| Some((value.as_str()?.to_owned(), None)))
+        .collect();
+    (!listed.is_empty()).then_some(listed)
 }
 
 /// Three questions per eligible argument, all over the same message and all in the one request the
 /// turn already sends: which span is the value, whether the message states it at all, and whether
 /// it states only one. The first is relative and will rank something regardless; the other two are
 /// absolute and are what make a wrong pick visible.
-fn span_questions(message: &str, available_tools: &[CatalogEntry]) -> Vec<Question> {
+fn decidable_questions(message: &str, available_tools: &[CatalogEntry]) -> Vec<Question> {
     let candidates = spans(message);
-    if candidates.is_empty() || candidates.len() > MAX_SPAN_OPTIONS {
-        return Vec::new();
-    }
     available_tools
         .iter()
         .filter_map(|tool| {
-            let (_, description) = span_valued_field(&tool.input_schema_json)?;
-            Some((tool.name.as_str(), description))
+            let (_, description, options) = decidable_field(&tool.input_schema_json)?;
+            let listed = match options {
+                Options::Closed(listed) => listed,
+                Options::Spans => candidates.iter().map(|span| (span.clone(), None)).collect(),
+            };
+            (!listed.is_empty() && listed.len() <= MAX_SPAN_OPTIONS).then_some((
+                tool.name.as_str(),
+                description,
+                listed,
+            ))
         })
         .take(MAX_SPAN_ARGUMENTS)
-        .flat_map(|(name, description)| {
-            span_question_set(name, &description, &candidates).unwrap_or_default()
+        .flat_map(|(name, description, listed)| {
+            question_set_for(name, &description, &listed).unwrap_or_default()
         })
         .collect()
 }
 
-fn span_question_set(
+fn question_set_for(
     tool: &str,
     description: &str,
-    candidates: &[String],
+    candidates: &[(String, Option<String>)],
 ) -> Option<Vec<Question>> {
     let mut options: Vec<ChoiceOption> = candidates
         .iter()
-        .map(|span| ChoiceOption {
-            name: span.clone(),
-            description: None,
+        .map(|(value, line)| ChoiceOption {
+            name: value.clone(),
+            description: line.clone(),
             ..Default::default()
         })
         .collect();
@@ -739,7 +797,7 @@ fn span_question_set(
 /// use: the choice is confident and is not the escape, the message states the value outright, and
 /// it states only one. Any of those failing leaves the argument to be composed generatively, which
 /// costs one call and nothing else.
-fn picked_span(answers: &[Answer], tool: &str) -> Option<String> {
+fn picked_value(answers: &[Answer], tool: &str) -> Option<String> {
     let choice = find_choice(answers, &format!("{VALUE_QUESTION_PREFIX}{tool}"))?;
     if choice.choice == NO_VALUE_OPTION
         || choice.confidence < VALUE_CHOICE_CONFIDENCE_THRESHOLD
@@ -824,8 +882,8 @@ fn fast_dispatchable_tool_call(
 
     // An argument that takes a word or two of the message is tried first: it is the narrower claim
     // of the two, and the same decision already carries its answer.
-    if let Some((field, _)) = span_valued_field(&tool.input_schema_json)
-        && let Some(value) = picked_span(answers, &tool.name)
+    if let Some((field, _)) = decidable_argument(&tool.input_schema_json)
+        && let Some(value) = picked_value(answers, &tool.name)
     {
         return Some(ToolCall {
             name: tool.name.clone(),
@@ -1839,12 +1897,12 @@ mod tests {
             "properties": {"place": {"type": "string"}},
         })
         .to_string();
-        assert_eq!(span_valued_field(&plain), None);
+        assert_eq!(decidable_argument(&plain), None);
     }
 
     #[test]
     fn the_questions_carry_the_fields_own_description_rather_than_its_name() {
-        let questions = span_questions(
+        let questions = decidable_questions(
             "weather in Bishkek?",
             &[span_field_tool("some_tool", "place")],
         );
@@ -1864,12 +1922,101 @@ mod tests {
     /// not contain the value at all.
     #[test]
     fn the_pick_offers_a_way_to_say_none_of_these() {
-        let questions = span_questions(
+        let questions = decidable_questions(
             "weather in Bishkek?",
             &[span_field_tool("some_tool", "place")],
         );
         let rendered = serde_json::to_string(&questions[0]).expect("serialize");
         assert!(rendered.contains(NO_VALUE_OPTION), "{rendered}");
+    }
+
+    /// A schema that lists what the endpoint accepts is the stronger claim of the two: whatever the
+    /// decision returns is a value the endpoint takes, because it could only choose from that list.
+    /// No annotation is needed — JSON Schema already has the vocabulary.
+    fn listed_field_tool(name: &str, field: &str) -> CatalogEntry {
+        CatalogEntry {
+            name: name.to_owned(),
+            description: "does a thing".to_owned(),
+            input_schema_json: json!({
+                "type": "object",
+                "required": [field],
+                "properties": {field: {
+                    "type": "string",
+                    "description": "the thing being priced",
+                    "oneOf": [
+                        {"const": "^AAA", "description": "the first index"},
+                        {"const": "^BBB", "description": "the second index"},
+                    ],
+                }},
+            })
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn a_listed_argument_offers_the_schemas_values_not_the_messages_words() {
+        let questions = decidable_questions(
+            "how is the first index doing",
+            &[listed_field_tool("some_tool", "symbol")],
+        );
+        let rendered = serde_json::to_string(&questions[0]).expect("serialize");
+
+        assert!(
+            rendered.contains("^AAA") && rendered.contains("^BBB"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("the first index"),
+            "a line per value: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"how\""),
+            "the message's own words are not the options here: {rendered}"
+        );
+    }
+
+    /// A bare `enum` works too and simply offers no line per value.
+    #[test]
+    fn a_bare_enum_is_a_closed_list_as_well() {
+        let schema = json!({
+            "type": "object",
+            "required": ["symbol"],
+            "properties": {"symbol": {"type": "string", "enum": ["^AAA", "^BBB"]}},
+        })
+        .to_string();
+        assert!(decidable_argument(&schema).is_some());
+    }
+
+    /// The listed values win over the message's words when a schema says both: the schema knows
+    /// what the endpoint accepts, and the message only knows what was typed.
+    #[test]
+    fn a_listed_argument_is_preferred_to_the_messages_words() {
+        let schema = json!({
+            "type": "object",
+            "required": ["symbol"],
+            "properties": {"symbol": {
+                "type": "string",
+                "enum": ["^AAA"],
+                "x-value-in-message": true,
+            }},
+        })
+        .to_string();
+        let Some((_, _, options)) = decidable_field(&schema) else {
+            panic!("decidable");
+        };
+        assert!(matches!(options, Options::Closed(_)));
+    }
+
+    /// A field that says neither is left alone, and its argument is composed as before.
+    #[test]
+    fn a_field_with_neither_a_list_nor_the_annotation_is_not_decided() {
+        let schema = json!({
+            "type": "object",
+            "required": ["place"],
+            "properties": {"place": {"type": "string"}},
+        })
+        .to_string();
+        assert_eq!(decidable_argument(&schema), None);
     }
 
     fn span_answers(choice: &str, confidence: f64, stated: f64, one_only: f64) -> Vec<Answer> {
@@ -1909,7 +2056,7 @@ mod tests {
     fn a_confident_pick_that_both_gates_agree_with_is_used() {
         let answers = span_answers("Bishkek", 0.99, 0.99, 0.9);
         assert_eq!(
-            picked_span(&answers, "some_tool"),
+            picked_value(&answers, "some_tool"),
             Some("Bishkek".to_owned())
         );
     }
@@ -1938,7 +2085,7 @@ mod tests {
                 span_answers(NO_VALUE_OPTION, 0.99, 0.99, 0.9),
             ),
         ] {
-            assert_eq!(picked_span(&answers, "some_tool"), None, "{label}");
+            assert_eq!(picked_value(&answers, "some_tool"), None, "{label}");
         }
     }
 
