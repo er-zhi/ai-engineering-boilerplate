@@ -110,12 +110,16 @@ Rules:
 - Open one new topic per genuinely separate theme. Do not split a single theme into multiple \
 topics just because it has several parts.
 - For every topic, `question` must be the user's OWN request for that theme, first person, \
-near-verbatim — copy their wording for that part of the message. Do not resolve what one part \
-refers to by looking at another: if a theme says \"there\" or \"it\", copy that. Working out what \
-it meant is the answering step's job, which has the whole message and can check itself. Never \
-write a paraphrased instruction about \"the user\" (e.g. never \"the user asked about X, please \
-answer it\") — `question` is what the user themselves would have typed, not a description of \
-their request.
+near-verbatim — copy their wording for that part of the message.
+- A topic is answered on its own, with nothing but its `question`, so a theme that says \"there\", \
+\"it\" or \"that one\" must say instead what the rest of the message says it is. Take those words \
+from the message and no further: \"the capital of Kyrgyzstan, and the weather there\" gives \"what \
+is the weather in the capital of Kyrgyzstan?\" — never \"in Bishkek\", which the message does not \
+say. Answering the other theme is not your job and guessing its answer wrongly would be invisible \
+from here.
+- Never write a paraphrased instruction about \"the user\" (e.g. never \"the user asked about X, \
+please answer it\") — `question` is what the user themselves would have typed, not a description \
+of their request.
 ";
 
 static SPLIT_PROMPT_EXAMPLES: LazyLock<String> = LazyLock::new(|| {
