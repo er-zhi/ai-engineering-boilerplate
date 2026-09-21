@@ -205,6 +205,31 @@ supports the project's direction even though it does not save this mechanism —
 `concepts/how-to-build-with-system-one.md`: "Do not rely on knowledge stored in model weights when
 current information can come from your own knowledge base."
 
+### R10. What the decision has settled, the generative call is not asked again
+
+A light model handed the choice "call a tool or answer" answers, because answering is cheaper. It
+answers with a promise — "I will get back to you about the weather" — and the promise ends the turn,
+because nothing runs after a reply. Measured on gemini-2.5-flash-lite: on the bad turns no tool was
+called at all.
+
+The decision before the call already knows which of the two the turn needs. So the generative call
+is given one job, never the pair:
+
+| the decision says | the call is asked for | tools listed | a plain reply |
+| --- | --- | --- | --- |
+| a tool is needed, arguments settled | nothing — the call is dispatched from the decision | — | — |
+| a tool is needed, arguments open | the call | yes | refused, retried once, then a stated failure |
+| no tool is needed | the answer | **no** | the only outcome |
+| neither, confidently | either | yes | accepted, with the nudge |
+
+The third row is the load-bearing one: a tool the model cannot see is a tool it cannot promise. The
+fourth is the residual — an unconfident or unavailable decision still falls to today's loop, because
+a decision that fails must never lose the turn (R6).
+
+The failure answer in the second row reports the failure rather than forwarding the model's promise.
+A promise made there is never kept, and a wrong answer that sounds like a plan is worse than an
+honest one.
+
 ---
 
 ## Open questions, held deliberately

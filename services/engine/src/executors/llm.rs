@@ -25,6 +25,52 @@ const TOOL_SLUG_PLACEHOLDER: &str = "<tool slug>";
 const ARGUMENT_NAME_PLACEHOLDER: &str = "<argument name>";
 const ARGUMENT_VALUE_PLACEHOLDER: &str = "<argument value>";
 const ANSWER_PLACEHOLDER: &str = "<your answer>";
+/// What the node is being asked for on this call. The typed decision before it has already settled
+/// whether a tool is needed; offering the model that choice again is how a light model comes back
+/// with "I will look that up" and ends the turn having done nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Both outcomes are open and the model picks. The residual case: the decision reached neither
+    /// conclusion confidently.
+    Loop,
+    /// A tool is needed and only its arguments are missing. Tools are offered; a reply is refused.
+    ComposeOnly,
+    /// No tool is needed. No tools are offered, so none can be promised.
+    AnswerOnly,
+}
+
+static COMPOSE_ONLY_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"
+Call one of the tools below. Respond with exactly this JSON and nothing else:
+{}
+Do not answer from your own knowledge, and do not describe what you are about to do — a reply
+without a tool call is not accepted here.
+"#,
+        shape_of(LlmOutput {
+            tool_call: serde_json::to_value(ToolCall {
+                name: TOOL_SLUG_PLACEHOLDER.to_owned(),
+                args: json!({ARGUMENT_NAME_PLACEHOLDER: ARGUMENT_VALUE_PLACEHOLDER}),
+            })
+            .expect("a ToolCall always serializes"),
+            reply: Value::Null,
+        }),
+    )
+});
+
+static ANSWER_ONLY_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"
+Answer from what you already have. Respond with exactly this JSON and nothing else:
+{}
+"#,
+        shape_of(LlmOutput {
+            tool_call: Value::Null,
+            reply: Value::String(ANSWER_PLACEHOLDER.to_owned()),
+        }),
+    )
+});
+
 static TOOL_CALLING_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"
@@ -242,23 +288,40 @@ impl LlmNodeConfig {
 
 #[must_use]
 pub fn build_prompt(config: &LlmNodeConfig, state: &Value) -> (String, String) {
+    build_prompt_for(config, state, Mode::Loop)
+}
+
+pub fn build_prompt_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> (String, String) {
     let mut system = config
         .system_prompt
         .clone()
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
     if config.tool_calling {
-        system.push_str(&TOOL_CALLING_INSTRUCTIONS);
+        system.push_str(match mode {
+            Mode::Loop => &TOOL_CALLING_INSTRUCTIONS,
+            Mode::ComposeOnly => &COMPOSE_ONLY_INSTRUCTIONS,
+            Mode::AnswerOnly => &ANSWER_ONLY_INSTRUCTIONS,
+        });
     }
-    if !config.available_tools.is_empty() {
+    // Not listed in answer-only: a tool the model cannot see is a tool it cannot promise.
+    if !config.available_tools.is_empty() && mode != Mode::AnswerOnly {
         system.push_str("\n\nAvailable tools:\n");
         for tool in &config.available_tools {
             system.push_str(&format!("- {}: {}\n", tool.name, tool.description));
         }
     }
-    if config.tool_calling {
+    // The policy tells the model to prefer a listed tool over its memory. In answer-only nothing is
+    // listed, so it would be pointing at an empty table — and a model told to call something it
+    // cannot see names one from memory, which is the promise this mode exists to prevent.
+    if config.tool_calling && mode != Mode::AnswerOnly {
         system.push_str(TOOL_USE_POLICY);
     }
-    system.push_str(FINAL_ANSWER_STYLE);
+    // The style block is about a reply, and it is the last thing the model reads. In compose-only
+    // there is no reply to style, and closing with "a bare value is a complete answer" undoes the
+    // instruction the mode opened with.
+    if mode != Mode::ComposeOnly {
+        system.push_str(FINAL_ANSWER_STYLE);
+    }
 
     let mut user = ExecutionInput::in_state(state).question;
     for (index, result) in rendered_tool_results(state) {
@@ -297,15 +360,35 @@ fn truncated(text: &str) -> String {
 #[must_use]
 pub fn parse_llm_output(content: &str) -> Value {
     let parsed = serde_json::from_str::<LlmOutput>(content).unwrap_or_default();
-    let output = if parsed.is_blank() {
-        LlmOutput {
+    let output = match (parsed.is_blank(), first_envelope(content)) {
+        (false, _) => parsed,
+        (true, Some(recovered)) => recovered,
+        (true, None) => LlmOutput {
             tool_call: Value::Null,
             reply: Value::String(content.to_owned()),
-        }
-    } else {
-        parsed
+        },
     };
     serde_json::to_value(output).expect("an LlmOutput always serializes")
+}
+
+/// The first `{tool_call, reply}` object in `content`, when the whole of `content` would not parse
+/// as one. A light model sometimes writes a sentence before the envelope, or two envelopes in a
+/// row; whole-string parsing fails on both and the fallback then shows the person the machine text
+/// verbatim — observed live as `Bishkek. {"tool_call": {...}, "reply": null}` in a chat window.
+///
+/// Only a parse succeeding from a `{` counts, so ordinary prose containing a brace is untouched and
+/// still becomes the reply.
+fn first_envelope(content: &str) -> Option<LlmOutput> {
+    content
+        .char_indices()
+        .filter(|(_, c)| *c == '{')
+        .find_map(|(at, _)| -> Option<LlmOutput> {
+            let parsed = serde_json::Deserializer::from_str(&content[at..])
+                .into_iter::<LlmOutput>()
+                .next()?
+                .ok()?;
+            (!parsed.is_blank()).then_some(parsed)
+        })
 }
 
 #[must_use]
@@ -385,7 +468,11 @@ impl TaskExecutor for LlmTaskExecutor {
 }
 
 fn complete_request(config: &LlmNodeConfig, state: &Value) -> CompleteRequest {
-    let (system_prompt, user_prompt) = build_prompt(config, state);
+    complete_request_for(config, state, Mode::Loop)
+}
+
+fn complete_request_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> CompleteRequest {
+    let (system_prompt, user_prompt) = build_prompt_for(config, state, mode);
     let response_format = config
         .tool_calling
         .then_some(EnumValue::Known(ResponseFormat::JsonObject));
@@ -414,9 +501,14 @@ enum FastPath {
     /// one required string field, and the question is shaped like something safe to send
     /// verbatim: call it with the question verbatim.
     ToolCall { call: ToolCall, decide_usage: Value },
+    /// `tool` came back confident and named a live catalog entry, but its arguments could not be
+    /// settled by the decision alone. The model is asked for the call and nothing else — it is
+    /// not offered the choice of answering, because that is the choice it gets wrong: given both,
+    /// a light model replies "I will look that up" and the turn ends having called nothing.
+    ComposeOnly { tool: String, decide_usage: Value },
     /// No typed decision was reached (an error or a timeout), or the decision reached is neither
-    /// of the above — including a confident tool pick that failed the schema or question-shape
-    /// gate, which vetoes `NoToolNeeded` too: the decider has said a tool is needed, and that
+    /// of the above — including a confident tool pick naming a tool the live catalog does not
+    /// have, which vetoes `NoToolNeeded` too: the decider has said a tool is needed, and that
     /// outranks a separate, independently-evaluated "no information needed". Today's flow,
     /// unchanged, nudge included.
     Unavailable,
@@ -446,16 +538,80 @@ impl LlmTaskExecutor {
                 self.run_fast_tool_call(config, state, &call, &decide_usage, idempotency_key)
                     .await,
             ),
+            FastPath::ComposeOnly { tool, decide_usage } => Some(
+                self.compose_tool_call(config, state, &tool, &decide_usage, idempotency_key)
+                    .await,
+            ),
             FastPath::NoToolNeeded { decide_usage } => {
-                let request = complete_request(config, state);
+                // Answer-only: no tools are listed, so none can be promised.
+                let request = complete_request_for(config, state, Mode::AnswerOnly);
                 let outcome = self
                     .complete_with_retries(&request)
                     .await
-                    .map(|output| merge_usage(&decide_usage, output));
+                    .map(|output| merge_usage(&decide_usage, without_tool_call(output)));
                 Some(outcome)
             }
             FastPath::Unavailable => None,
         }
+    }
+
+    /// One `Complete` in compose-only mode, then the dispatch the decision already committed to.
+    /// A response carrying no `tool_call` is refused and asked again once with the refusal stated;
+    /// a second refusal is answered honestly rather than with the promise the model wanted to
+    /// make, because a promise ends the turn and nothing keeps it.
+    async fn compose_tool_call(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        tool: &str,
+        decide_usage: &Value,
+        idempotency_key: &str,
+    ) -> Result<Value, TaskError> {
+        let request = complete_request_for(config, state, Mode::ComposeOnly);
+        let mut spent = self.complete_with_retries(&request).await?;
+        if composed_call(&spent).is_none() {
+            tracing::info!(
+                tool,
+                "compose-only reply carried no tool call, asking once more"
+            );
+            let mut again = request.clone();
+            again.system_prompt.push_str(COMPOSE_REFUSAL);
+            let second = self.complete_with_retries(&again).await?;
+            spent = merge_usage(&spent, second);
+        }
+        let Some(call) = composed_call(&spent).filter(|call| {
+            let known = config
+                .available_tools
+                .iter()
+                .any(|entry| entry.name == call.name);
+            if !known {
+                tracing::warn!(
+                    composed = call.name,
+                    "compose-only named a tool not in this node's catalog"
+                );
+            }
+            known
+        }) else {
+            tracing::warn!(
+                tool,
+                "compose-only produced no tool call twice, answering plainly"
+            );
+            return Ok(merge_usage(
+                decide_usage,
+                merge_usage(
+                    &spent,
+                    json!({ "tool_call": Value::Null, "reply": COMPOSE_FAILURE }),
+                ),
+            ));
+        };
+        let result = self.dispatch_tool_fast(&call, idempotency_key).await;
+        let state_with_result = state_with_extra_tool_result(state, result.clone());
+        // Loop, not answer-only: a failed call is shown as an ERROR result, and only the loop's
+        // instructions say that this means call again rather than that the task is over.
+        let request = complete_request(config, &state_with_result);
+        let output = self.complete_with_retries(&request).await?;
+        let output = merge_usage(decide_usage, merge_usage(&spent, output));
+        Ok(attach_fast_tool_call(output, &call, result))
     }
 
     /// Dispatches the fast-chosen tool, folds its result into the prompt for one `Complete` call,
@@ -509,6 +665,14 @@ impl LlmTaskExecutor {
                 &decided.answers,
             ) {
                 Some(call) => FastPath::ToolCall { call, decide_usage },
+                // The tool is needed and it exists; only its arguments are open. That is a
+                // composing job, not a decision to revisit.
+                None if names_a_live_tool(choice, &config.available_tools) => {
+                    FastPath::ComposeOnly {
+                        tool: choice.choice.clone(),
+                        decide_usage,
+                    }
+                }
                 None => FastPath::Unavailable,
             };
         }
@@ -984,6 +1148,44 @@ fn merge_usage(first: &Value, mut second: Value) -> Value {
     second
 }
 
+/// Appended when a compose-only response came back without a call. It states the refusal rather
+/// than repeating the instruction: the model has already read the instruction once.
+const COMPOSE_REFUSAL: &str = r#"
+
+Your previous response was refused: it carried no tool call. Saying that you will look something
+up does nothing — nothing runs after your reply. Call the tool now.
+"#;
+
+/// What the turn says when the model would not compose the call twice. It reports the failure
+/// instead of promising the work, because a promise is what the model was trying to send and no
+/// promise made here is ever kept.
+const COMPOSE_FAILURE: &str = "I couldn't work out what to look up for that. Could you say it \
+                               again with the name in it?";
+
+/// Whether `choice` names a tool the live catalog actually carries. A pick for something absent is
+/// not a composing job — there is nothing to compose arguments for.
+fn names_a_live_tool(choice: &ChoiceAnswer, available_tools: &[CatalogEntry]) -> bool {
+    available_tools
+        .iter()
+        .any(|tool| tool.name == choice.choice)
+}
+
+/// Clears any `tool_call` an answer-only response carried. The graph edges `llm -> tool` on that
+/// field being truthy, so leaving it would run a tool the typed decision said was not needed, named
+/// by a model that was shown no catalog to name it from.
+fn without_tool_call(mut output: Value) -> Value {
+    if let Some(object) = output.as_object_mut() {
+        object.insert("tool_call".to_owned(), Value::Null);
+    }
+    output
+}
+
+/// The `tool_call` a compose-only response carries, if it carries one.
+fn composed_call(output: &Value) -> Option<ToolCall> {
+    let written: LlmOutput = serde_json::from_value(output.clone()).ok()?;
+    serde_json::from_value(written.tool_call).ok()
+}
+
 #[must_use]
 pub fn answered_before_consulting_any_tool(
     config: &LlmNodeConfig,
@@ -1223,6 +1425,35 @@ mod tests {
         assert!(system.contains("call a different tool"), "{system}");
     }
 
+    /// Observed live: the model wrote a sentence and then the envelope, and the person was shown
+    /// `Bishkek. {"tool_call": {...}, "reply": null}` as the answer. The call is what it meant.
+    #[test]
+    fn parse_llm_output_recovers_an_envelope_written_after_a_sentence() {
+        let output = parse_llm_output(
+            r#"Bishkek. {"tool_call": {"name": "weather_now", "args": {"place": "Bishkek"}}, "reply": null}"#,
+        );
+        assert_eq!(output["tool_call"]["name"], json!("weather_now"));
+    }
+
+    /// Two envelopes in a row parse as neither. The first is the one that was asked for.
+    #[test]
+    fn parse_llm_output_takes_the_first_of_two_envelopes() {
+        let output = parse_llm_output(
+            r#"{"tool_call": {"name": "weather_now", "args": {}}, "reply": null}
+{"tool_call": {"name": "currency_rate", "args": {}}, "reply": null}"#,
+        );
+        assert_eq!(output["tool_call"]["name"], json!("weather_now"));
+    }
+
+    /// Prose that merely contains a brace is still prose, and is still the reply.
+    #[test]
+    fn parse_llm_output_leaves_prose_containing_a_brace_alone() {
+        let content = "Write {name} where the placeholder is.";
+        let output = parse_llm_output(content);
+        assert_eq!(output["reply"], json!(content));
+        assert_eq!(output["tool_call"], Value::Null);
+    }
+
     #[test]
     fn parse_llm_output_reads_a_tool_call() {
         let output = parse_llm_output(r#"{"tool_call": {"name": "web_search", "args": {}}}"#);
@@ -1317,6 +1548,13 @@ mod tests {
 
         fn decide_calls(&self) -> usize {
             *self.decide_calls.lock().expect("lock")
+        }
+
+        /// The system prompt of the nth `Complete`, so a test can check what a mode offered.
+        fn system_prompt(&self, nth: usize) -> String {
+            self.received.lock().expect("lock")[nth]
+                .system_prompt
+                .clone()
         }
 
         /// Arms `Decide`'s `tool` answer. Leaving both this and
@@ -1510,6 +1748,14 @@ mod tests {
 
         fn calls(&self) -> usize {
             self.received.lock().expect("lock").len()
+        }
+
+        /// The arguments the first dispatch carried, so a test can tell a composed call from one
+        /// that was handed the question verbatim.
+        fn first_args(&self) -> Value {
+            let received = self.received.lock().expect("lock");
+            let first = received.first().expect("a dispatch");
+            serde_json::from_str(&first.input_json).expect("argument json")
         }
     }
 
@@ -2384,10 +2630,96 @@ mod tests {
         );
     }
 
+    /// When the decision says no tool is needed, none is listed. A model cannot promise a lookup
+    /// with a tool it was never shown, and that promise is how a turn ends having done nothing.
     #[tokio::test]
-    async fn a_tool_needing_two_fields_is_not_taken_on_the_fast_path_even_when_confidently_chosen()
-    {
+    async fn the_answer_only_branch_lists_no_tools_so_none_can_be_promised() {
         let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "Bishkek."}"#,
+        ));
+        fake.answer_decide_needs_external_info(0.02);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("some_tool", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute(
+                "llm",
+                &config,
+                &json!({"question": "capital of Kyrgyzstan?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        let prompt = fake.system_prompt(0);
+        assert!(
+            !prompt.contains("some_tool") && !prompt.contains("Available tools"),
+            "no tool is offered on the answer-only branch: {prompt}"
+        );
+        assert_eq!(output["reply"], json!("Bishkek."));
+        assert_eq!(fake.calls(), 1, "and one Complete settles the turn");
+    }
+
+    /// A tool whose schema needs two fields cannot be handed the question verbatim, but the
+    /// decision that a tool is needed still stands. The model composes the arguments; what it must
+    /// not be given back is the choice of whether to call at all.
+    #[tokio::test]
+    async fn a_tool_needing_two_fields_is_composed_rather_than_dispatched_verbatim() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": {"name": "two_field_tool", "args": {"a": "x", "b": "y"}}}"#,
+        ));
+        fake.answer_decide_tool("two_field_tool", 0.95);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![two_field_tool("two_field_tool")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            tool.calls(),
+            1,
+            "the tool the decision chose is still called"
+        );
+        assert_eq!(
+            tool.first_args(),
+            json!({"a": "x", "b": "y"}),
+            "with the arguments the model composed, never the question verbatim"
+        );
+        assert_eq!(
+            output[FAST_TOOL_CALL_FIELD]["name"],
+            json!("two_field_tool"),
+            "and the call is recorded, so it is event-logged and budget-charged like any other"
+        );
+        assert!(
+            fake.system_prompt(0).contains("not accepted here"),
+            "the composing call refuses a plain reply"
+        );
+    }
+
+    /// The whole point of the compose-only mode: a light model handed both options answers "I will
+    /// look that up", which runs nothing and ends the turn. Refused and asked again, it calls.
+    #[tokio::test]
+    async fn a_compose_only_reply_without_a_call_is_refused_and_asked_again() {
+        let fake = Arc::new(FakeLlmRouter::then(
+            r#"{"tool_call": null, "reply": "Sure, I will look that up for you."}"#,
             r#"{"tool_call": {"name": "two_field_tool", "args": {"a": "x", "b": "y"}}}"#,
         ));
         fake.answer_decide_tool("two_field_tool", 0.95);
@@ -2409,23 +2741,23 @@ mod tests {
 
         assert_eq!(
             tool.calls(),
-            0,
-            "a tool whose schema needs two fields must never be dispatched on the fast path, \
-             however confidently it was chosen"
+            1,
+            "the promise is refused and the second response's call is dispatched"
+        );
+        assert!(
+            fake.system_prompt(1).contains("was refused"),
+            "and the second ask states the refusal rather than repeating the instruction"
         );
     }
 
-    // The vendor evaluates `tool` and `needs_external_information` independently, so a confident
-    // tool pick that the schema gate disqualifies and a confidently-false need-for-information can
-    // co-occur. A confident tool pick must veto NoToolNeeded too, not just block ToolCall.
+    /// Twice refused, the turn says so. It must not send the promise instead: nothing runs after a
+    /// reply, so a promise made here is never kept.
     #[tokio::test]
-    async fn a_confident_schema_disqualified_tool_pick_vetoes_no_tool_needed_too() {
-        let fake = Arc::new(FakeLlmRouter::then(
-            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
-            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
+    async fn a_compose_only_reply_refused_twice_answers_plainly_instead_of_promising() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "Sure, I will look that up for you."}"#,
         ));
         fake.answer_decide_tool("two_field_tool", 0.95);
-        fake.answer_decide_needs_external_info(0.02); // confidently false — must not be enough
         let llm_url = serve(Arc::clone(&fake)).await;
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
@@ -2442,13 +2774,47 @@ mod tests {
             .await
             .expect("execute");
 
-        assert_eq!(output["tool_call"]["name"], json!("some_search"));
-        assert_eq!(tool.calls(), 0, "schema-disqualified, so never dispatched");
+        assert_eq!(tool.calls(), 0, "there was never a call to dispatch");
+        assert_eq!(output["tool_call"], Value::Null);
         assert_eq!(
-            fake.calls(),
-            2,
-            "a confident tool pick vetoes NoToolNeeded, so today's flow — nudge included — runs"
+            output["reply"],
+            json!(COMPOSE_FAILURE),
+            "the turn reports the failure; it never forwards the promise"
         );
+        assert_eq!(fake.calls(), 2, "asked twice, not a third time");
+    }
+
+    // The vendor evaluates `tool` and `needs_external_information` independently, so a confident
+    // tool pick that the schema gate disqualifies and a confidently-false need-for-information can
+    // co-occur. A confident tool pick must veto NoToolNeeded too, not just block ToolCall.
+    #[tokio::test]
+    async fn a_confident_schema_disqualified_tool_pick_vetoes_no_tool_needed_too() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": {"name": "two_field_tool", "args": {"a": "x", "b": "y"}}}"#,
+        ));
+        fake.answer_decide_tool("two_field_tool", 0.95);
+        fake.answer_decide_needs_external_info(0.02); // confidently false — must not be enough
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![two_field_tool("two_field_tool")],
+            ..Default::default()
+        }
+        .to_json();
+
+        executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert!(
+            fake.system_prompt(0).contains("not accepted here"),
+            "the confident pick sends the turn to compose the call, never to answer without one"
+        );
+        assert_eq!(tool.calls(), 1, "and the tool the decision named is called");
     }
 
     #[tokio::test]
@@ -2547,9 +2913,8 @@ mod tests {
     // question itself is multi-line, and must still veto NoToolNeeded (today's flow decides).
     #[tokio::test]
     async fn a_multi_line_question_is_not_fast_dispatched_even_when_the_tool_otherwise_qualifies() {
-        let fake = Arc::new(FakeLlmRouter::then(
-            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
-            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": {"name": "some_tool", "args": {"query": "population of Paris"}}}"#,
         ));
         fake.answer_decide_tool("some_tool", 0.9);
         fake.answer_decide_needs_external_info(0.02);
@@ -2565,15 +2930,19 @@ mod tests {
         .to_json();
         let question = "Earlier answer:\nParis\n\nFollow-up: what is its population?";
 
-        let output = executor
+        executor
             .execute("llm", &config, &json!({"question": question}), "e:llm:0")
             .await
             .expect("execute");
 
-        assert_eq!(output["tool_call"]["name"], json!("some_search"));
         assert_eq!(
             tool.calls(),
-            0,
+            1,
+            "the tool the decision chose is still called"
+        );
+        assert_ne!(
+            tool.first_args()["query"],
+            json!(question),
             "a multi-line question must never be fast-dispatched verbatim into a tool's query"
         );
         assert_eq!(
