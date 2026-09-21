@@ -166,10 +166,19 @@ fn substitute(
 }
 
 /// Follows a dotted path into a reply. Absent is `None`, and so is a path that runs into a scalar.
+///
+/// A segment that is all digits indexes an array. Without it a whole class of real endpoints is
+/// unreachable — returning a list of readings and expecting you to take the first is one of the
+/// commonest shapes there is — and a row could describe the request but never the answer. An
+/// all-digit segment against an object still reads it as a key first, so a reply that genuinely
+/// uses numeric keys keeps working.
 pub fn pick_value(body: &Value, path: &str) -> Option<Value> {
     let mut here = body;
     for segment in path.split(PATH_SEPARATOR) {
-        here = here.get(segment)?;
+        here = match here.get(segment) {
+            Some(found) => found,
+            None => here.get(segment.parse::<usize>().ok()?)?,
+        };
     }
     Some(here.clone())
 }
@@ -433,6 +442,25 @@ mod tests {
     fn a_path_that_is_not_there_is_none_rather_than_null() {
         let body = json!({"reading": {"value": 14.2}});
         assert_eq!(pick_value(&body, "reading.other"), None);
+    }
+
+    /// Returning a list of readings and expecting the caller to take the first is one of the
+    /// commonest reply shapes there is; without this a row could describe such a request but never
+    /// reach its answer.
+    #[test]
+    fn a_numeric_segment_indexes_an_array() {
+        let body = json!({"readings": [{"value": 14.2}, {"value": 9.9}]});
+        assert_eq!(pick_value(&body, "readings.0.value"), Some(json!(14.2)));
+        assert_eq!(pick_value(&body, "readings.1.value"), Some(json!(9.9)));
+        assert_eq!(pick_value(&body, "readings.2.value"), None);
+    }
+
+    /// An object is still read as an object first, so a reply that genuinely keys by a number is
+    /// not silently reinterpreted as a list.
+    #[test]
+    fn a_numeric_key_on_an_object_still_wins_over_array_indexing() {
+        let body = json!({"by_hour": {"0": {"value": 1.0}}});
+        assert_eq!(pick_value(&body, "by_hour.0.value"), Some(json!(1.0)));
     }
 
     async fn serve(body: serde_json::Value) -> String {
