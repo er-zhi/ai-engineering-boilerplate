@@ -235,6 +235,8 @@ impl Calls {
 #[derive(Default)]
 pub struct FakeLlmRouter {
     pub answer: Mutex<Option<String>>,
+    /// Armed by `answer_again_with`: what a second ask gets, and what the check over it says.
+    second_answer: Mutex<Option<(String, f64)>>,
     pub prompts: Mutex<Vec<String>>,
     pub meeting: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     pub completions: Calls,
@@ -252,6 +254,13 @@ pub struct FakeLlmRouter {
 impl FakeLlmRouter {
     pub fn answer_with(&self, content: &str) {
         *self.answer.lock().expect("lock") = Some(content.to_owned());
+    }
+
+    /// What `Complete` returns from its second call on, and what `covers_everything` becomes from
+    /// its second `Decide` on. Both change together because they describe one thing: the split was
+    /// refused, asked for again, and the second answer covers the message.
+    pub fn answer_again_with(&self, content: &str, covers: f64) {
+        *self.second_answer.lock().expect("lock") = Some((content.to_owned(), covers));
     }
 
     pub fn hold_every_call_until(&self, meeting: Arc<tokio::sync::Barrier>) {
@@ -320,8 +329,18 @@ impl LlmRouterService for FakeLlmRouter {
         request: ServiceRequest<'_, CompleteRequest>,
     ) -> ServiceResult<CompleteResponse> {
         let owned = request.to_owned_message();
+        let asked_before = self.prompts.lock().expect("lock").len();
         self.prompts.lock().expect("lock").push(owned.user_prompt);
         self.completions.record();
+        let second = self.second_answer.lock().expect("lock").clone();
+        if let Some((content, _)) = second
+            && asked_before > 0
+        {
+            return Response::ok(CompleteResponse {
+                content,
+                ..Default::default()
+            });
+        }
         match self.answer.lock().expect("lock").clone() {
             Some(content) => Response::ok(CompleteResponse {
                 content,
@@ -360,7 +379,13 @@ impl SystemOneService for FakeLlmRouter {
             meeting.wait().await;
         }
         let route = self.route.lock().expect("lock").clone();
-        let nouls = self.nouls.lock().expect("lock").clone();
+        let mut nouls = self.nouls.lock().expect("lock").clone();
+        let second = self.second_answer.lock().expect("lock").clone();
+        if let Some((_, covers)) = second
+            && self.prompts.lock().expect("lock").len() > 1
+        {
+            nouls.insert("covers_everything".to_owned(), covers);
+        }
         if route.is_none() && nouls.is_empty() {
             return Err(connectrpc::ConnectError::unavailable(
                 "configured fake llm-router failure",
@@ -525,6 +550,55 @@ pub async fn serve_decider_choosing_with(
     served(router).await
 }
 
+/// Every verdict a split is judged by, said separately, so a test can fail one of them.
+pub async fn serve_decider_split_verdicts(
+    separate: f64,
+    covers: f64,
+    stands_alone: f64,
+    plan: &'static str,
+) -> (String, Calls) {
+    let router = Arc::new(FakeLlmRouter::default());
+    let mut nouls = vec![("separate_themes", separate), ("covers_everything", covers)];
+    let ids = stands_alone_ids(plan);
+    nouls.extend(ids.iter().map(|id| (id.as_str(), stands_alone)));
+    router.answer_decision(None, nouls);
+    router.answer_with(plan);
+    served(router).await
+}
+
+/// One `stands_alone_<n>` id per new topic the plan opens. An unanswered id reads as `false` and
+/// would quietly rewrite that question to the whole message, so the arming is derived from the plan
+/// rather than fixed at some number a future fixture could exceed without saying so.
+fn stands_alone_ids(plan: &str) -> Vec<String> {
+    (0..plan.matches("\"new\"").count())
+        .map(|at| format!("stands_alone_{at}"))
+        .collect()
+}
+
+/// A split refused for leaving a theme behind, then asked for again and covering the message.
+/// `first` is what the splitter returns to begin with and is judged short; `second` is what the
+/// second ask returns, and it is judged complete.
+pub async fn serve_decider_split_asked_again(
+    first: &'static str,
+    second: &'static str,
+) -> (String, Calls) {
+    let router = Arc::new(FakeLlmRouter::default());
+    router.answer_decision(
+        None,
+        vec![("separate_themes", 0.9), ("covers_everything", 0.1)]
+            .into_iter()
+            .chain(
+                stands_alone_ids(second)
+                    .iter()
+                    .map(|id| (id.as_str(), 0.95)),
+            )
+            .collect(),
+    );
+    router.answer_with(first);
+    router.answer_again_with(second, 0.95);
+    served(router).await
+}
+
 /// `separate_themes` high, and `covers_everything` at whatever the test wants to say about the
 /// split it returns.
 pub async fn serve_decider_themes_covering(
@@ -535,7 +609,14 @@ pub async fn serve_decider_themes_covering(
     let router = Arc::new(FakeLlmRouter::default());
     router.answer_decision(
         None,
-        vec![("separate_themes", separate), ("covers_everything", covers)],
+        vec![("separate_themes", separate), ("covers_everything", covers)]
+            .into_iter()
+            .chain(
+                stands_alone_ids(plan)
+                    .iter()
+                    .map(|id| (id.as_str(), covers)),
+            )
+            .collect(),
     );
     router.answer_with(plan);
     served(router).await
@@ -548,7 +629,10 @@ pub async fn serve_decider_splitting(plan: &'static str) -> (String, Calls) {
     // theme, so a fixture that stays silent about it is refusing its own split.
     router.answer_decision(
         None,
-        vec![("separate_themes", 0.9), ("covers_everything", 0.95)],
+        vec![("separate_themes", 0.9), ("covers_everything", 0.95)]
+            .into_iter()
+            .chain(stands_alone_ids(plan).iter().map(|id| (id.as_str(), 0.95)))
+            .collect(),
     );
     router.answer_with(plan);
     served(router).await

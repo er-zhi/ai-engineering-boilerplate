@@ -826,7 +826,13 @@ mod tests {
         let user_id = Uuid::new_v4();
         router.answer_decision(
             None,
-            vec![("separate_themes", 0.9), ("covers_everything", 0.95)],
+            vec![
+                ("separate_themes", 0.9),
+                ("covers_everything", 0.95),
+                ("stands_alone_0", 0.95),
+                ("stands_alone_1", 0.95),
+                ("stands_alone_2", 0.95),
+            ],
         );
         router.answer_with(
             r#"{"actions":[

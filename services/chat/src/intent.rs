@@ -66,6 +66,15 @@ const SEPARATE_THEMES_THRESHOLD: f64 = 0.75;
 /// each part are three judgements in one generative call, and a lighter model makes them worse. The
 /// rewriting genuinely needs a generative model; noticing that a part went missing does not.
 const COVERS_EVERYTHING_THRESHOLD: f64 = 0.5;
+/// Below this a question was left leaning on the rest of the message, which the topic answering it
+/// will never see: each topic is executed with its own `question` and nothing more, so "what is the
+/// weather there?" reaches an agent that answers by asking where.
+///
+/// Such a question is repaired rather than refused: it becomes the whole message, and its topic
+/// title still says which part of it that topic is for. The split — themes answered separately,
+/// each arriving as it is ready — is what the person asked for, and it survives one theme having
+/// been written carelessly.
+const STANDS_ALONE_THRESHOLD: f64 = 0.5;
 
 pub const CLARIFICATION_TEXT: &str =
     "I didn't catch a request in that — what would you like me to find out?";
@@ -84,6 +93,8 @@ const ROUTE_ID: &str = "route";
 const ACTIONABLE_ID: &str = "actionable";
 const SEPARATE_THEMES_ID: &str = "separate_themes";
 const COVERS_EVERYTHING_ID: &str = "covers_everything";
+/// One per question the split produced, suffixed with its position.
+const STANDS_ALONE_PREFIX: &str = "stands_alone_";
 
 const ROUTE_INSTRUCTIONS: &str = "Which of these should the new message go to: one of the named \
 existing topics it continues, or a new topic?";
@@ -105,6 +116,12 @@ const COVERS_EVERYTHING_WHEN_TRUE: &str =
     "every distinct thing the message asks about is asked for by one of the questions";
 const COVERS_EVERYTHING_WHEN_FALSE: &str = "the message asks about something none of the \
 questions asks for, so answering all of them would leave part of the message unanswered";
+const STANDS_ALONE_INSTRUCTIONS: &str = "Could this question be answered by someone shown only \
+it, who had never seen the message it came from?";
+const STANDS_ALONE_WHEN_TRUE: &str =
+    "it names in full what it is about, and needs nothing else to be understood";
+const STANDS_ALONE_WHEN_FALSE: &str = "it leans on something outside itself — \"there\", \"it\", \
+\"that one\", \"the same\" — so alone nobody could tell what it asks about";
 
 const EXAMPLE_QUESTION_1: &str = "What is Claude Code?";
 const EXAMPLE_QUESTION_2: &str = "Which Academy courses exist?";
@@ -129,10 +146,12 @@ topics just because it has several parts.
 near-verbatim — copy their wording for that part of the message.
 - A topic is answered on its own, with nothing but its `question`, so a theme that says \"there\", \
 \"it\" or \"that one\" must say instead what the rest of the message says it is. Take those words \
-from the message and no further: \"the capital of Kyrgyzstan, and the weather there\" gives \"what \
-is the weather in the capital of Kyrgyzstan?\" — never \"in Bishkek\", which the message does not \
-say. Answering the other theme is not your job and guessing its answer wrongly would be invisible \
-from here.
+from the message and no further — never \"in Bishkek\", which the message does not say. Answering \
+the other theme is not your job and guessing its answer wrongly would be invisible from here.
+- Resolving a reference this way never consumes the theme it points at. That theme was asked for \
+too and still gets its own topic. \"the capital of Kyrgyzstan, and the weather there\" is two \
+topics — \"what is the capital of Kyrgyzstan?\" and \"what is the weather in the capital of \
+Kyrgyzstan?\" — never the second one alone.
 - Never write a paraphrased instruction about \"the user\" (e.g. never \"the user asked about X, \
 please answer it\") — `question` is what the user themselves would have typed, not a description \
 of their request.
@@ -174,6 +193,21 @@ pub enum Action {
     Continue { topic_id: i64 },
     New { title: String, question: String },
 }
+
+/// What the check over a split found. `Missing` and `Unavailable` are both failures, but only one
+/// of them is worth asking about again: a split that left a theme behind can be asked for properly,
+/// while a decision that never arrived would only fail the same way twice.
+enum Verdict {
+    Keeps(Vec<Action>),
+    Missing,
+    Unavailable,
+}
+
+/// What the second ask adds. It names the failure without naming the missing theme — the model has
+/// the message and can see for itself, and telling it what to add invites it to add only that.
+const SPLIT_RETRY_NOTE: &str = "\nYour previous split was refused: between them, the questions did \
+not ask for everything this message asks for. Something in it was left with no topic of its own. \
+Split it again, covering all of it.\n";
 
 /// What one turn is routed to. `Clarify` is reached only when nothing existing was chosen and the
 /// message itself carried no actionable request — see `TopicIntent::route`.
@@ -341,13 +375,42 @@ impl TopicIntent {
 
     // The one branch that still needs generated text: several themes in one message, each becoming
     // its own topic. Every other outcome is read straight off the typed decision.
+    //
+    // A split that leaves a theme behind is asked for again, once, with the omission stated, rather
+    // than dropped. Dropping it answers the whole message as one topic, and one topic carrying
+    // three separate errands is the shape that gets promised rather than done — the cost of the
+    // fallback is the failure it was meant to avoid. The second ask is spent only on the turns that
+    // needed it; a split that covers the message the first time pays nothing.
     async fn split(&self, topics: &[TopicSummary], message: &str) -> Option<Vec<Action>> {
+        let actions = self.ask_split(topics, message, "").await?;
+        match self.judge_split(message, actions).await {
+            Verdict::Keeps(actions) => Some(actions),
+            Verdict::Unavailable => None,
+            Verdict::Missing => {
+                tracing::info!("a split left a theme behind, asking once more");
+                let again = self.ask_split(topics, message, SPLIT_RETRY_NOTE).await?;
+                match self.judge_split(message, again).await {
+                    Verdict::Keeps(actions) => Some(actions),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// One generative split. `note` is appended to the message the model is shown, and is empty on
+    /// the first ask.
+    async fn ask_split(
+        &self,
+        topics: &[TopicSummary],
+        message: &str,
+        note: &str,
+    ) -> Option<Vec<Action>> {
         let response = self
             .llm
             .complete(CompleteRequest {
                 tier: EnumValue::Known(QualityTier::Low),
                 system_prompt: SPLIT_SYSTEM_PROMPT.clone(),
-                user_prompt: format!("New user message:\n{message}\n"),
+                user_prompt: format!("New user message:\n{message}\n{note}"),
                 sampling: Sampling {
                     response_format: Some(EnumValue::Known(ResponseFormat::JsonObject)),
                     ..Default::default()
@@ -357,16 +420,22 @@ impl TopicIntent {
             })
             .await
             .ok()?;
-        let actions = parse_actions(&response.into_owned().content, topics)?;
-        self.keeps_everything(message, &actions)
-            .await
-            .then_some(actions)
+        parse_actions(&response.into_owned().content, topics)
     }
 
-    /// Whether a split left anything behind. Asked of the decider, over the message and the
-    /// questions the split produced, and answered `false` when the decision is unavailable — a
-    /// split nobody vouched for is not worth the answer it might lose.
-    async fn keeps_everything(&self, message: &str, actions: &[Action]) -> bool {
+    /// Judges a split and repairs what it can. One request over the message and the questions it
+    /// produced asks two different things: whether the questions between them still ask for
+    /// everything the message asked for, and — separately, for each question — whether it could be
+    /// answered by someone shown only that question.
+    ///
+    /// The two failures are not the same and are not treated the same. A theme that went missing
+    /// is `Missing`, which the caller asks about again — the split itself is what the person asked
+    /// for. A question left saying "there" is repaired here and now: it becomes the message, and
+    /// its topic title still says which part of it that topic is for.
+    ///
+    /// A decision that does not arrive is `Unavailable` and drops the split, because a split nobody
+    /// vouched for is not worth the answer it might lose.
+    async fn judge_split(&self, message: &str, actions: Vec<Action>) -> Verdict {
         let questions: Vec<&str> = actions
             .iter()
             .filter_map(|action| match action {
@@ -374,34 +443,90 @@ impl TopicIntent {
                 Action::Continue { .. } => None,
             })
             .collect();
-        if questions.len() < 2 {
-            return true;
+        // One question is checked too. Getting here means the decision said the message raises
+        // several themes, so a split that came back with a single topic has collapsed the rest into
+        // it — the failure this check exists for, in its most complete form.
+        if questions.is_empty() {
+            return Verdict::Keeps(actions);
         }
-        let Some(question) = covers_everything_question() else {
-            return false;
+        let Some(mut asked) = covers_everything_question().map(|first| vec![first]) else {
+            return Verdict::Unavailable;
         };
+        for at in 0..questions.len() {
+            let Some(question) = stands_alone_question(at) else {
+                return Verdict::Unavailable;
+            };
+            asked.push(question);
+        }
         let state = serde_json::json!({ "message": message, "questions": questions });
-        let Ok(request) =
+        let Ok(base) =
             serde_json::from_value::<DecideRequest>(serde_json::json!({ "state": state }))
         else {
-            return false;
+            return Verdict::Unavailable;
         };
         let request = DecideRequest {
-            questions: vec![question],
-            ..request
+            questions: asked,
+            ..base
         };
-        match self.decider.decide(request).await {
-            Ok(response) => noul_above(
-                &response.into_owned().answers,
-                COVERS_EVERYTHING_ID,
-                COVERS_EVERYTHING_THRESHOLD,
-            ),
+        let answers = match self.decider.decide(request).await {
+            Ok(response) => response.into_owned().answers,
             Err(error) => {
-                tracing::warn!(%error, "could not check that a split kept every theme");
-                false
+                tracing::warn!(%error, "could not judge a split, so it was dropped");
+                return Verdict::Unavailable;
             }
+        };
+        if !noul_above(&answers, COVERS_EVERYTHING_ID, COVERS_EVERYTHING_THRESHOLD) {
+            return Verdict::Missing;
         }
+        let mut at = 0;
+        Verdict::Keeps(
+            actions
+                .into_iter()
+                .map(|action| match action {
+                    Action::New { title, question } => {
+                        let id = format!("{STANDS_ALONE_PREFIX}{at}");
+                        at += 1;
+                        let alone = noul_above(&answers, &id, STANDS_ALONE_THRESHOLD);
+                        let repaired = scoped_to(message, &title);
+                        Action::New {
+                            title,
+                            question: if alone { question } else { repaired },
+                        }
+                    }
+                    other => other,
+                })
+                .collect(),
+        )
     }
+}
+
+/// A question that could not stand alone, made to stand: the whole message, so the reference it
+/// leans on is there to be resolved, and a line saying which part of it this topic answers — the
+/// topic's own title, which the agent never sees otherwise, because a topic is executed with its
+/// `question` and nothing else. Without the second line the agent tries to answer the whole
+/// message and promises rather than does.
+fn scoped_to(message: &str, title: &str) -> String {
+    format!("{message}\n\nAnswer only this part of it: {title}")
+}
+
+/// An array, not an object: `Question.instructions` says outright that an object's keys reach the
+/// model re-sorted alphabetically, which would put the subject after the thing asked about it. The
+/// order here is the whole meaning — which question, then what to judge about it.
+fn stands_alone_question(at: usize) -> Option<Question> {
+    let mut question = instructed(
+        &format!("{STANDS_ALONE_PREFIX}{at}"),
+        serde_json::json!([
+            format!("About `questions[{at}]`, and nothing else:"),
+            STANDS_ALONE_INSTRUCTIONS,
+        ]),
+    )?;
+    question.kind = Noul {
+        when_true: Some(STANDS_ALONE_WHEN_TRUE.to_owned()),
+        when_false: Some(STANDS_ALONE_WHEN_FALSE.to_owned()),
+        ..Default::default()
+    }
+    .into();
+    Some(question)
 }
 
 fn covers_everything_question() -> Option<Question> {
@@ -782,6 +907,74 @@ mod tests {
         };
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
         assert_eq!(question, &long);
+    }
+
+    /// A topic is executed with its own `question` and nothing else, so a question left saying
+    /// "there" reaches an agent that cannot know where. The themes stay split — that is what was
+    /// asked for — and the question that cannot stand alone is given the whole message instead.
+    #[tokio::test]
+    async fn a_question_that_cannot_stand_alone_is_given_the_whole_message() {
+        let (url, _calls) = crate::fakes::serve_decider_split_verdicts(
+            0.9,
+            0.95,
+            0.05,
+            r#"{"actions":[{"kind":"new","title":"A","question":"what is the capital?"},
+                           {"kind":"new","title":"B","question":"what is the weather there?"}]}"#,
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let message = "capital of Kyrgyzstan and what the weather there";
+
+        let Routing::Act(actions) = intent.route(&[], None, message).await else {
+            panic!("expected actions");
+        };
+
+        assert_eq!(actions.len(), 2, "the themes stay split: {actions:?}");
+        for action in &actions {
+            let Action::New { title, question } = action else {
+                panic!("expected new topics");
+            };
+            assert!(
+                question.starts_with(message),
+                "the reference it leans on has to be there to resolve: {question:?}"
+            );
+            assert!(
+                question.contains(&format!("Answer only this part of it: {title}")),
+                "and it has to say which part is its own, or it answers all of them: {question:?}"
+            );
+        }
+    }
+
+    /// A split that leaves a theme behind is asked for again rather than dropped. Dropping it puts
+    /// the whole message on one topic, and one topic carrying three errands is what gets promised
+    /// instead of done — the fallback would cost exactly the failure it was meant to avoid.
+    #[tokio::test]
+    async fn a_split_that_leaves_a_theme_behind_is_asked_for_again() {
+        let (url, calls) = crate::fakes::serve_decider_split_asked_again(
+            r#"{"actions":[{"kind":"new","title":"Weather","question":"what is the weather in the capital of Kyrgyzstan?"}]}"#,
+            r#"{"actions":[{"kind":"new","title":"Capital","question":"what is the capital of Kyrgyzstan?"},
+                           {"kind":"new","title":"Weather","question":"what is the weather in the capital of Kyrgyzstan?"}]}"#,
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+
+        let Routing::Act(actions) = intent
+            .route(
+                &[],
+                None,
+                "capital of Kyrgyzstan and what the weather there",
+            )
+            .await
+        else {
+            panic!("expected actions");
+        };
+
+        assert_eq!(
+            actions.len(),
+            2,
+            "the second ask's split is the one that is used: {actions:?}"
+        );
+        assert_eq!(calls.completions(), 2, "and it cost exactly one extra ask");
     }
 
     /// A split that loses a theme is not a faster answer, it is a missing one. When the decider
