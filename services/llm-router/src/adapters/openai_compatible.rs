@@ -111,6 +111,14 @@ fn read_completion(body: &Value) -> Result<Completion, CallError> {
         return Err(CallError::WorthRetrying(detail.to_owned()));
     };
 
+    // A provider that fails partway through generation still answers 200, with the text it had got
+    // to and the failure carried inside the choice. Measured: a 429 from Google returned
+    // `{"tool_call":null` and `finish_reason: "error"`, and the caller showed that to the person as
+    // the answer. Whatever is in `content` here was cut off mid-token, so it is not a reply.
+    if let Some(detail) = choice_error(choice) {
+        return Err(CallError::WorthRetrying(detail));
+    }
+
     let content = choice["message"]["content"].as_str().unwrap_or_default();
     if content.is_empty() {
         let reasoning_tokens = as_count(
@@ -132,6 +140,25 @@ fn read_completion(body: &Value) -> Result<Completion, CallError> {
         tokens_out: usage_count(body, "completion_tokens"),
         finish_reason: finish_reason_from(choice["finish_reason"].as_str().unwrap_or_default()),
         reply: body.clone(),
+    })
+}
+
+/// Why this choice is not an answer, when the provider reports a failure inside it. Both signals
+/// are checked: some providers set `finish_reason` to `"error"`, some attach an `error` object, and
+/// a provider may send either alone.
+fn choice_error(choice: &Value) -> Option<String> {
+    let reported = choice["finish_reason"].as_str().unwrap_or_default();
+    let error = &choice["error"];
+    if reported != "error" && !error.is_object() {
+        return None;
+    }
+    let detail = error["message"]
+        .as_str()
+        .unwrap_or("the provider stopped partway through generating");
+    let code = error["code"].as_i64();
+    Some(match code {
+        Some(code) => format!("{detail} (provider code {code})"),
+        None => detail.to_owned(),
     })
 }
 
@@ -505,6 +532,46 @@ mod tests {
         assert_eq!(completion.tokens_in, 10);
         assert_eq!(completion.tokens_out, 2);
         assert_eq!(completion.finish_reason, FinishReason::Stop);
+    }
+
+    /// Measured against a live 429 from Google: the HTTP reply was 200, `finish_reason` was
+    /// `"error"`, and `content` held `{"tool_call":null` — half a JSON object, which the caller
+    /// could not parse and showed to the person as the answer.
+    #[test]
+    fn a_choice_that_reports_an_error_is_not_an_answer_however_much_text_it_carries() {
+        let body = json!({
+            "choices": [{
+                "message": {"content": "{\"tool_call\":null"},
+                "finish_reason": "error",
+                "error": {"code": 429, "message": "rate limit"},
+            }],
+        });
+
+        let error = read_completion(&body).expect_err("a cut-off generation is not a completion");
+
+        let CallError::WorthRetrying(detail) = error else {
+            panic!("a provider that gave up partway is worth asking again: {error:?}");
+        };
+        assert!(
+            detail.contains("rate limit") && detail.contains("429"),
+            "{detail}"
+        );
+    }
+
+    /// Some providers attach the error without touching `finish_reason`.
+    #[test]
+    fn a_choice_carrying_an_error_object_alone_is_still_not_an_answer() {
+        let body = json!({
+            "choices": [{
+                "message": {"content": "partial"},
+                "error": {"message": "upstream closed the connection"},
+            }],
+        });
+
+        assert!(matches!(
+            read_completion(&body),
+            Err(CallError::WorthRetrying(_))
+        ));
     }
 
     #[test]
