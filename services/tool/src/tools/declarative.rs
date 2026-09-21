@@ -2,7 +2,7 @@
 // question, raced through `crate::race`. Nothing here knows what any of them is about — the subject
 // lives in the row's description, the same place a user-created tool's does.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -38,6 +38,12 @@ pub struct Source {
     /// than percent-encoded — this is a path into JSON, not a URL — except that a value carrying
     /// the path separator is refused, so an argument cannot walk deeper than the template says.
     pub pick: String,
+    /// Headers this source needs, taking the same `{argument}` and `${SECRET}` placeholders a url
+    /// does. Some endpoints refuse a request that does not introduce itself, and an credential
+    /// belongs in a header rather than in a query string wherever the endpoint accepts it there.
+    /// Ordered so what is sent is the same on every call.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 /// Reads and checks a row's `sources`. Every failure here is a seeding mistake, so seeding calls it
@@ -84,50 +90,59 @@ fn checked(
                 source.name
             ));
         }
-        if source.pick.is_empty() {
-            return Err(format!("source {:?} has an empty pick", source.name));
-        }
-        for template in [&source.url, &source.pick] {
-            let undeclared = placeholders(template)
-                .map_err(|error| format!("source {:?}: {error}", source.name))?
-                .into_iter()
-                .find(|field| !declared.contains(field));
-            // Naming the template, not just the field: a row using the same undeclared name in both
-            // its url and its pick would otherwise get the identical sentence twice, and the
-            // operator who fixed one reads it as "my edit did not take".
-            if let Some(field) = undeclared {
-                return Err(format!(
-                    "source {:?} uses {{{field}}} in {template:?}, which input_schema does not declare",
-                    source.name
-                ));
-            }
-        }
-        // A missing credential is a seeding mistake, so it refuses the file here rather than
-        // reaching a third party as an unauthenticated request whose reply nobody vouches for.
-        for name in secret_placeholders(&source.url)
-            .map_err(|error| format!("source {:?}: {error}", source.name))?
-        {
-            if lookup(&name).is_none() {
-                return Err(format!(
-                    "source {:?} needs {name:?} from the environment, which is not set",
-                    source.name
-                ));
-            }
-        }
-        // A pick addresses the reply, never the request, so nothing about it is secret — and
-        // `fill_path` would leave a `${...}` standing, which would silently look for a key that is
-        // not there rather than failing.
-        if !secret_placeholders(&source.pick)
-            .map_err(|error| format!("source {:?}: {error}", source.name))?
-            .is_empty()
+        check_source(source, &declared, lookup)
+            .map_err(|problem| format!("source {:?} {problem}", source.name))?;
+    }
+    Ok(set)
+}
+
+/// Everything one source must satisfy before the file is accepted. Every message here is written
+/// to follow the source's name, which the caller puts in front of it.
+fn check_source(
+    source: &Source,
+    declared: &[String],
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    if source.pick.is_empty() {
+        return Err("has an empty pick".to_owned());
+    }
+    for template in [&source.url, &source.pick]
+        .into_iter()
+        .chain(source.headers.values())
+    {
+        // Naming the template, not just the field: a row using the same undeclared name in two of
+        // them would otherwise get the identical sentence twice, and the operator who fixed one
+        // reads it as "my edit did not take".
+        if let Some(field) = placeholders(template)?
+            .into_iter()
+            .find(|field| !declared.contains(field))
         {
             return Err(format!(
-                "source {:?} puts a ${{...}} in its pick, where nothing is substituted from the environment",
-                source.name
+                "uses {{{field}}} in {template:?}, which input_schema does not declare"
             ));
         }
     }
-    Ok(set)
+    // A missing credential is a seeding mistake, so it refuses the file here rather than reaching a
+    // third party as an unauthenticated request whose reply nobody vouches for.
+    for template in std::iter::once(&source.url).chain(source.headers.values()) {
+        for name in secret_placeholders(template)? {
+            if lookup(&name).is_none() {
+                return Err(format!(
+                    "needs {name:?} from the environment, which is not set"
+                ));
+            }
+        }
+    }
+    // A pick addresses the reply, never the request, so nothing about it is secret — and
+    // `fill_path` would leave a `${...}` standing, which would silently look for a key that is not
+    // there rather than failing.
+    if !secret_placeholders(&source.pick)?.is_empty() {
+        return Err(
+            "puts a ${...} in its pick, where nothing is substituted from the environment"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn declared_fields(input_schema: &Value) -> Vec<String> {
@@ -292,20 +307,14 @@ where
     G: Fn(String) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = Result<(), String>> + Send,
 {
-    let mut ready: Vec<(&Source, String, String)> = Vec::new();
+    let mut ready: Vec<Prepared<'_>> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     // Every secret this call substitutes, so nothing that goes on to be said can quote one back.
     let mut secrets: Vec<String> = Vec::new();
     for source in &set.sources {
-        let prepared = fill_secrets(&source.url, &from_environment).and_then(|(url, used)| {
-            secrets.extend(used);
-            let url = fill(&url, input)?;
-            let pick = fill_path(&source.pick, input)?;
-            Ok((url, pick))
-        });
-        match prepared {
-            Ok((url, pick)) => match guard(url.clone()).await {
-                Ok(()) => ready.push((source, url, pick)),
+        match prepare(source, input, &mut secrets) {
+            Ok(prepared) => match guard(prepared.url.clone()).await {
+                Ok(()) => ready.push(prepared),
                 Err(reason) => refused.push(format!("{}: {reason}", source.name)),
             },
             Err(reason) => refused.push(format!("{}: {reason}", source.name)),
@@ -315,9 +324,16 @@ where
     // declarative tool, so a leak here grows with traffic.
     let ops: Vec<(&str, crate::race::OpFn<'_, Value>)> = ready
         .iter()
-        .map(|(source, url, pick)| {
-            crate::race::op(source.name.as_str(), move || async move {
-                ask(client, url, pick, per_source_timeout).await
+        .map(|ready| {
+            crate::race::op(ready.source.name.as_str(), move || async move {
+                ask(
+                    client,
+                    &ready.url,
+                    &ready.pick,
+                    &ready.headers,
+                    per_source_timeout,
+                )
+                .await
             })
         })
         .collect();
@@ -342,16 +358,54 @@ where
     }))
 }
 
+/// One source with everything its request needs already filled in. Named rather than a tuple of
+/// same-typed parts: `url` and `pick` would otherwise be two `String`s in a row that compile
+/// perfectly when swapped and fail only at runtime.
+struct Prepared<'a> {
+    source: &'a Source,
+    url: String,
+    pick: String,
+    headers: Vec<(String, String)>,
+}
+
+/// Fills one source's url, pick and headers from the environment and the caller's input, in that
+/// order, collecting every secret substituted so the caller can keep them out of what it says.
+fn prepare<'a>(
+    source: &'a Source,
+    input: &Value,
+    secrets: &mut Vec<String>,
+) -> Result<Prepared<'a>, String> {
+    let (url, used) = fill_secrets(&source.url, &from_environment)?;
+    secrets.extend(used);
+    let url = fill(&url, input)?;
+    let pick = fill_path(&source.pick, input)?;
+    let mut headers = Vec::with_capacity(source.headers.len());
+    for (name, template) in &source.headers {
+        let (value, used) = fill_secrets(template, &from_environment)?;
+        secrets.extend(used);
+        // A header carries a credential or a name for ourselves, never a path, so it is filled the
+        // way a url is — nothing about it addresses JSON.
+        headers.push((name.clone(), fill(&value, input)?));
+    }
+    Ok(Prepared {
+        source,
+        url,
+        pick,
+        headers,
+    })
+}
+
 async fn ask(
     client: &reqwest::Client,
     url: &str,
     pick: &str,
+    headers: &[(String, String)],
     timeout: Duration,
 ) -> Result<Value, String> {
     // `get_guarded` re-checks every redirect hop through the same SSRF guard `run` already applied
     // to this URL's first hop — a public source that answers 302 with a private `Location` must not
     // be able to walk past the guard just because the check only ever saw the URL it started with.
-    let mut response = crate::tools::web_fetch::get_guarded(client, url, timeout).await?;
+    let mut response = crate::tools::web_fetch::get_guarded(client, url, headers, timeout).await?;
     if !response.status().is_success() {
         return Err(format!("returned {}", response.status()));
     }
@@ -717,6 +771,7 @@ mod tests {
             name: name.to_owned(),
             url: url.to_owned(),
             pick: pick.to_owned(),
+            headers: BTreeMap::new(),
         }
     }
 
@@ -845,6 +900,88 @@ mod tests {
         assert_eq!(out["values"][0]["value"], json!(14.2));
     }
 
+    /// Some endpoints refuse a request that does not introduce itself. This one answers only when
+    /// the header is there, so the test cannot pass if headers stop being sent.
+    async fn serve_only_with_header(name: &'static str, value: &'static str) -> String {
+        use axum::response::IntoResponse;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                let sent = headers
+                    .get(name)
+                    .and_then(|header| header.to_str().ok())
+                    .is_some_and(|header| header == value);
+                if !sent {
+                    return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
+                }
+                axum::Json(json!({"reading": {"value": 14.2}})).into_response()
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}/")
+    }
+
+    fn source_with_headers(name: &str, url: &str, pick: &str, headers: &[(&str, &str)]) -> Source {
+        Source {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            pick: pick.to_owned(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_answers_only_to_a_named_caller_is_given_the_header() {
+        let url = serve_only_with_header("x-caller", "something/1.0").await;
+        let set = set_of(
+            vec![source_with_headers(
+                "one",
+                &url,
+                "reading.value",
+                &[("x-caller", "something/1.0")],
+            )],
+            1,
+            1,
+        );
+        let out = run(
+            &reqwest::Client::new(),
+            &set,
+            &json!({}),
+            SOURCE_TIMEOUT,
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("the header is sent, so the source answers");
+        assert_eq!(out["values"][0]["value"], json!(14.2));
+    }
+
+    /// A header takes the same placeholders a url does, and its secrets are checked the same way.
+    #[test]
+    fn a_header_naming_a_secret_the_environment_lacks_refuses_the_row() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{
+                "name": "one",
+                "url": "https://e.test/",
+                "pick": "value",
+                "headers": {"authorization": "Bearer ${SOME_KEY}"}
+            }]
+        });
+        let error = checked(&raw, &schema_with(json!({})), &holding_nothing)
+            .expect_err("the key is not set");
+        assert!(error.contains("SOME_KEY"), "{error}");
+    }
+
     #[tokio::test]
     async fn a_private_address_is_refused_before_any_request_goes_out() {
         let set = set_of(vec![source("local", "http://127.0.0.1:9/", "t")], 1, 1);
@@ -935,7 +1072,13 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(30),
-            ask(&client, &format!("http://{address}/"), "t", SOURCE_TIMEOUT),
+            ask(
+                &client,
+                &format!("http://{address}/"),
+                "t",
+                &[],
+                SOURCE_TIMEOUT,
+            ),
         )
         .await
         .expect("a body that never ends must not be buffered whole")

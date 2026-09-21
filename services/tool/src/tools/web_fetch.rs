@@ -138,13 +138,18 @@ const MAX_REDIRECT_HOPS: usize = 10;
 pub async fn get_guarded(
     client: &reqwest::Client,
     url: &str,
+    headers: &[(String, String)],
     timeout: Duration,
 ) -> Result<reqwest::Response, String> {
     let mut here = url.to_owned();
     for _ in 0..=MAX_REDIRECT_HOPS {
-        let response = client
-            .get(&here)
-            .timeout(timeout)
+        let mut request = client.get(&here).timeout(timeout);
+        // Carried across every hop: a source that needs to introduce itself needs to do so again
+        // after a redirect, and the guard has already checked where each hop leads.
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| readable_send_failure(&here, &e))?;
@@ -185,7 +190,7 @@ pub async fn fetch(
     url: &str,
     timeout: Duration,
 ) -> Result<Extracted, String> {
-    let mut response = get_guarded(client, url, timeout).await?;
+    let mut response = get_guarded(client, url, &[], timeout).await?;
     if !response.status().is_success() {
         return Err(format!("fetch {url} returned {}", response.status()));
     }
@@ -370,7 +375,7 @@ mod tests {
         // A public host that answers 302 with a private Location is the whole attack: the first URL
         // passes the guard, and without a per-hop check reqwest walks the rest of the way itself.
         let redirector = serve_redirect("http://127.0.0.1:9/secrets").await;
-        let error = get_guarded(&guarded_client(), &redirector, TEST_TIMEOUT)
+        let error = get_guarded(&guarded_client(), &redirector, &[], TEST_TIMEOUT)
             .await
             .expect_err("the hop target must be refused");
         // Both substrings matter: "public host" proves the *guard* is why this failed (a plain
@@ -396,9 +401,14 @@ mod tests {
         );
 
         let redirector = serve_redirect("http://203.0.113.5/").await;
-        let error = get_guarded(&guarded_client(), &redirector, Duration::from_millis(300))
-            .await
-            .expect_err("this sandbox cannot route to the real internet, so the hop still fails");
+        let error = get_guarded(
+            &guarded_client(),
+            &redirector,
+            &[],
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("this sandbox cannot route to the real internet, so the hop still fails");
         assert!(
             !error.contains("public host"),
             "the guard, not connectivity, must not be why this failed: {error}"
@@ -414,7 +424,7 @@ mod tests {
         // a scenario this sandbox cannot construct locally (see the report for why), so its own
         // arithmetic isn't exercised by this test. What this test does prove: the loop never spins.
         let looping = serve_self_redirect().await;
-        let error = get_guarded(&guarded_client(), &looping, TEST_TIMEOUT)
+        let error = get_guarded(&guarded_client(), &looping, &[], TEST_TIMEOUT)
             .await
             .expect_err("a loop must end");
         assert!(error.contains("redirect"), "{error}");
@@ -429,7 +439,7 @@ mod tests {
         // path into the full (still correctly refused, since this server is loopback) URL the guard
         // actually judged.
         let destination = serve_relative_redirect("/landing").await;
-        let error = get_guarded(&guarded_client(), &destination, TEST_TIMEOUT)
+        let error = get_guarded(&guarded_client(), &destination, &[], TEST_TIMEOUT)
             .await
             .expect_err("the resolved hop is still a private address");
         assert!(
@@ -466,7 +476,7 @@ mod tests {
 
         let redirector = serve_redirect(&format!("http://{secret_address}/secret")).await;
 
-        let error = get_guarded(&guarded_client(), &redirector, TEST_TIMEOUT)
+        let error = get_guarded(&guarded_client(), &redirector, &[], TEST_TIMEOUT)
             .await
             .expect_err("the private listener must be refused");
 
