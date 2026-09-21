@@ -824,7 +824,10 @@ mod tests {
     async fn a_message_naming_two_themes_opens_two_topics_and_focuses_the_first() {
         let (_test, manager, fake, router) = manager_with_router().await;
         let user_id = Uuid::new_v4();
-        router.answer_decision(None, vec![("separate_themes", 0.9)]);
+        router.answer_decision(
+            None,
+            vec![("separate_themes", 0.9), ("covers_everything", 0.95)],
+        );
         router.answer_with(
             r#"{"actions":[
                 {"kind":"new","title":"Claude Code","question":"What is Claude Code?"},

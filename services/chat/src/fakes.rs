@@ -525,10 +525,31 @@ pub async fn serve_decider_choosing_with(
     served(router).await
 }
 
+/// `separate_themes` high, and `covers_everything` at whatever the test wants to say about the
+/// split it returns.
+pub async fn serve_decider_themes_covering(
+    separate: f64,
+    covers: f64,
+    plan: &'static str,
+) -> (String, Calls) {
+    let router = Arc::new(FakeLlmRouter::default());
+    router.answer_decision(
+        None,
+        vec![("separate_themes", separate), ("covers_everything", covers)],
+    );
+    router.answer_with(plan);
+    served(router).await
+}
+
 /// Answers `separate_themes` high, and returns `plan` from `Complete`.
 pub async fn serve_decider_splitting(plan: &'static str) -> (String, Calls) {
     let router = Arc::new(FakeLlmRouter::default());
-    router.answer_decision(None, vec![("separate_themes", 0.9)]);
+    // `covers_everything` too: a split is refused unless the decider vouches that it kept every
+    // theme, so a fixture that stays silent about it is refusing its own split.
+    router.answer_decision(
+        None,
+        vec![("separate_themes", 0.9), ("covers_everything", 0.95)],
+    );
     router.answer_with(plan);
     served(router).await
 }

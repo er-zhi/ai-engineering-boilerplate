@@ -57,6 +57,15 @@ const ROUTE_CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Splitting a message that holds one theme costs a completion and produces two half-topics, so
 /// this asks for real certainty.
 const SEPARATE_THEMES_THRESHOLD: f64 = 0.75;
+/// Below this the split dropped something, and the turn is answered as one topic carrying the whole
+/// message instead. A split is a convenience — themes answered separately, each arriving as it is
+/// ready — while a dropped theme is an answer the person never gets, so the two are not traded off
+/// against each other: the split is kept only when it is known to have kept everything.
+///
+/// Why a check rather than a better prompt: counting the themes, cutting the message and rewriting
+/// each part are three judgements in one generative call, and a lighter model makes them worse. The
+/// rewriting genuinely needs a generative model; noticing that a part went missing does not.
+const COVERS_EVERYTHING_THRESHOLD: f64 = 0.5;
 
 pub const CLARIFICATION_TEXT: &str =
     "I didn't catch a request in that — what would you like me to find out?";
@@ -74,6 +83,7 @@ const TOPIC_OPTION_PREFIX: &str = "topic_";
 const ROUTE_ID: &str = "route";
 const ACTIONABLE_ID: &str = "actionable";
 const SEPARATE_THEMES_ID: &str = "separate_themes";
+const COVERS_EVERYTHING_ID: &str = "covers_everything";
 
 const ROUTE_INSTRUCTIONS: &str = "Which of these should the new message go to: one of the named \
 existing topics it continues, or a new topic?";
@@ -89,6 +99,12 @@ const SEPARATE_THEMES_INSTRUCTIONS: &str =
 const SEPARATE_THEMES_WHEN_TRUE: &str =
     "the message names two or more unrelated subjects, each a separate task on its own";
 const SEPARATE_THEMES_WHEN_FALSE: &str = "the message is about one subject, however long";
+const COVERS_EVERYTHING_INSTRUCTIONS: &str = "Between them, do the questions in `questions` ask \
+for everything `message` asks for?";
+const COVERS_EVERYTHING_WHEN_TRUE: &str =
+    "every distinct thing the message asks about is asked for by one of the questions";
+const COVERS_EVERYTHING_WHEN_FALSE: &str = "the message asks about something none of the \
+questions asks for, so answering all of them would leave part of the message unanswered";
 
 const EXAMPLE_QUESTION_1: &str = "What is Claude Code?";
 const EXAMPLE_QUESTION_2: &str = "Which Academy courses exist?";
@@ -341,8 +357,65 @@ impl TopicIntent {
             })
             .await
             .ok()?;
-        parse_actions(&response.into_owned().content, topics)
+        let actions = parse_actions(&response.into_owned().content, topics)?;
+        self.keeps_everything(message, &actions)
+            .await
+            .then_some(actions)
     }
+
+    /// Whether a split left anything behind. Asked of the decider, over the message and the
+    /// questions the split produced, and answered `false` when the decision is unavailable — a
+    /// split nobody vouched for is not worth the answer it might lose.
+    async fn keeps_everything(&self, message: &str, actions: &[Action]) -> bool {
+        let questions: Vec<&str> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::New { question, .. } => Some(question.as_str()),
+                Action::Continue { .. } => None,
+            })
+            .collect();
+        if questions.len() < 2 {
+            return true;
+        }
+        let Some(question) = covers_everything_question() else {
+            return false;
+        };
+        let state = serde_json::json!({ "message": message, "questions": questions });
+        let Ok(request) =
+            serde_json::from_value::<DecideRequest>(serde_json::json!({ "state": state }))
+        else {
+            return false;
+        };
+        let request = DecideRequest {
+            questions: vec![question],
+            ..request
+        };
+        match self.decider.decide(request).await {
+            Ok(response) => noul_above(
+                &response.into_owned().answers,
+                COVERS_EVERYTHING_ID,
+                COVERS_EVERYTHING_THRESHOLD,
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "could not check that a split kept every theme");
+                false
+            }
+        }
+    }
+}
+
+fn covers_everything_question() -> Option<Question> {
+    let mut question = instructed(
+        COVERS_EVERYTHING_ID,
+        serde_json::json!(COVERS_EVERYTHING_INSTRUCTIONS),
+    )?;
+    question.kind = Noul {
+        when_true: Some(COVERS_EVERYTHING_WHEN_TRUE.to_owned()),
+        when_false: Some(COVERS_EVERYTHING_WHEN_FALSE.to_owned()),
+        ..Default::default()
+    }
+    .into();
+    Some(question)
 }
 
 /// The JSON `Decide` reads the topics and message about. An array, not an object, because a
@@ -709,6 +782,32 @@ mod tests {
         };
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
         assert_eq!(question, &long);
+    }
+
+    /// A split that loses a theme is not a faster answer, it is a missing one. When the decider
+    /// will not vouch that the questions cover the message, the turn becomes one topic carrying the
+    /// whole message — slower, and complete.
+    #[tokio::test]
+    async fn a_split_that_drops_a_theme_is_refused_and_the_whole_message_is_answered() {
+        let (url, _calls) = crate::fakes::serve_decider_themes_covering(
+            0.9,
+            0.05,
+            r#"{"actions":[{"kind":"new","title":"A","question":"first theme?"},
+                           {"kind":"new","title":"B","question":"second theme?"}]}"#,
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let message = "first theme? and second theme? and a third one nobody wrote down";
+
+        let Routing::Act(actions) = intent.route(&[], None, message).await else {
+            panic!("expected actions");
+        };
+
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let Action::New { question, .. } = &actions[0] else {
+            panic!("expected a new topic");
+        };
+        assert_eq!(question, message, "the whole message, so nothing is lost");
     }
 
     #[tokio::test]
