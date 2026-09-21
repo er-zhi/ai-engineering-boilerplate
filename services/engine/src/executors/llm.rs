@@ -169,6 +169,37 @@ const TOOL_CHOICE_CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// through to today's flow, where the model composes its own query instead.
 const MAX_FAST_DISPATCH_QUESTION_CHARS: usize = 200;
 
+/// Question ids for an argument whose value is a span of the message. Each carries the tool's own
+/// name, because the catalog may offer several such arguments and all of them are asked
+/// speculatively in the one request — the candidate spans depend on the message, not on which tool
+/// turns out to win, so there is nothing to wait for.
+const VALUE_QUESTION_PREFIX: &str = "value::";
+const VALUE_STATED_PREFIX: &str = "stated::";
+const VALUE_ONE_ONLY_PREFIX: &str = "one_only::";
+/// The escape every closed set gets: the options are spans of one message, and the message may
+/// simply not contain the value.
+const NO_VALUE_OPTION: &str = "none";
+/// A pick that loses to its neighbours — "York" against "New York" — lands here rather than being
+/// dispatched, and the turn composes the argument generatively as it does today.
+const VALUE_CHOICE_CONFIDENCE_THRESHOLD: f64 = 0.6;
+/// Absolute, and asked about the message alone: a relative choice ranks *something* first even when
+/// the message names nothing. Measured, this is what catches "the weather in the capital of
+/// Kyrgyzstan" (0.15) and "the weather here" (0.05), where the choice itself is confident and wrong.
+const VALUE_STATED_THRESHOLD: f64 = 0.5;
+/// Also absolute, and the one that catches "weather in Paris and Berlin" (0.08), where the value is
+/// stated outright — twice. Two literal questions combined in code, rather than one question
+/// carrying both judgements.
+const VALUE_ONE_ONLY_THRESHOLD: f64 = 0.5;
+/// How many adjacent words may form one candidate, so a value of more than one word — "New York",
+/// "Rio de Janeiro" — is among the options rather than only its parts.
+const MAX_SPAN_WORDS: usize = 3;
+/// Kept under the decision vendor's 255-option ceiling with room to spare. A message long enough to
+/// exceed it is not one where a single argument is being named anyway, so it falls through.
+const MAX_SPAN_OPTIONS: usize = 200;
+/// How many message-valued arguments are asked about speculatively in one request. Extra questions
+/// are nearly free, but a catalog is not a licence to send an unbounded number of them.
+const MAX_SPAN_ARGUMENTS: usize = 4;
+
 fn shape_of(output: LlmOutput) -> String {
     serde_json::to_string(&output).expect("an LlmOutput always serializes")
 }
@@ -471,7 +502,12 @@ impl LlmTaskExecutor {
         let decide_usage = decide_usage_value(&decided);
 
         if let Some(choice) = confident_tool_choice(&decided.answers) {
-            return match fast_dispatchable_tool_call(choice, &config.available_tools, question) {
+            return match fast_dispatchable_tool_call(
+                choice,
+                &config.available_tools,
+                question,
+                &decided.answers,
+            ) {
                 Some(call) => FastPath::ToolCall { call, decide_usage },
                 None => FastPath::Unavailable,
             };
@@ -568,7 +604,151 @@ fn decide_request(question: &str, available_tools: &[CatalogEntry]) -> Option<De
         needs_external_information_question()?,
         tool_question(available_tools)?,
     ];
+    request
+        .questions
+        .extend(span_questions(question, available_tools));
     Some(request)
+}
+
+/// The message's own words, and every run of up to `MAX_SPAN_WORDS` adjacent words, deduplicated.
+/// Trailing punctuation is trimmed so `Bishkek?` offers `Bishkek`, which is the normalisation step
+/// the pattern expects of the code around the pick, not a rule about what a value looks like.
+fn spans(message: &str) -> Vec<String> {
+    let words: Vec<&str> = message
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut found: Vec<String> = Vec::new();
+    for size in 1..=MAX_SPAN_WORDS {
+        for run in words.windows(size) {
+            let candidate = run.join(" ");
+            if !found.contains(&candidate) {
+                found.push(candidate);
+            }
+        }
+    }
+    found
+}
+
+/// `Some((field, description))` when a tool's schema names exactly one required string field and
+/// that field says its value appears among the words of the message. The description is the
+/// field's own, so the question asks about the meaning the operator wrote rather than about the
+/// parameter's name — a question named after its parameter gives the message nothing to match.
+fn span_valued_field(input_schema_json: &str) -> Option<(String, String)> {
+    let schema: Value = serde_json::from_str(input_schema_json).ok()?;
+    let required = schema.get("required")?.as_array()?;
+    let [only] = required.as_slice() else {
+        return None;
+    };
+    let field = only.as_str()?;
+    let property = schema.get("properties")?.get(field)?;
+    if property.get("type").and_then(Value::as_str) != Some("string")
+        || !common::tool_schema::value_in_message(property)
+    {
+        return None;
+    }
+    let description = property
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or(field);
+    Some((field.to_owned(), description.to_owned()))
+}
+
+/// Three questions per eligible argument, all over the same message and all in the one request the
+/// turn already sends: which span is the value, whether the message states it at all, and whether
+/// it states only one. The first is relative and will rank something regardless; the other two are
+/// absolute and are what make a wrong pick visible.
+fn span_questions(message: &str, available_tools: &[CatalogEntry]) -> Vec<Question> {
+    let candidates = spans(message);
+    if candidates.is_empty() || candidates.len() > MAX_SPAN_OPTIONS {
+        return Vec::new();
+    }
+    available_tools
+        .iter()
+        .filter_map(|tool| {
+            let (_, description) = span_valued_field(&tool.input_schema_json)?;
+            Some((tool.name.as_str(), description))
+        })
+        .take(MAX_SPAN_ARGUMENTS)
+        .flat_map(|(name, description)| {
+            span_question_set(name, &description, &candidates).unwrap_or_default()
+        })
+        .collect()
+}
+
+fn span_question_set(
+    tool: &str,
+    description: &str,
+    candidates: &[String],
+) -> Option<Vec<Question>> {
+    let mut options: Vec<ChoiceOption> = candidates
+        .iter()
+        .map(|span| ChoiceOption {
+            name: span.clone(),
+            description: None,
+            ..Default::default()
+        })
+        .collect();
+    options.push(ChoiceOption {
+        name: NO_VALUE_OPTION.to_owned(),
+        description: Some("no option is that value".to_owned()),
+        ..Default::default()
+    });
+
+    let mut value = instructed(
+        &format!("{VALUE_QUESTION_PREFIX}{tool}"),
+        json!({"field": description, "question": "Which option is the value of `field` in `message`?"}),
+    )?;
+    value.kind = Choice {
+        options,
+        ..Default::default()
+    }
+    .into();
+
+    let mut stated = instructed(
+        &format!("{VALUE_STATED_PREFIX}{tool}"),
+        json!(format!("Does `message` name {description} outright?")),
+    )?;
+    stated.kind = Noul {
+        when_true: Some("the message names it in so many words".to_owned()),
+        when_false: Some(
+            "it is implied, absent, or would have to be worked out from something else".to_owned(),
+        ),
+        ..Default::default()
+    }
+    .into();
+
+    let mut one_only = instructed(
+        &format!("{VALUE_ONE_ONLY_PREFIX}{tool}"),
+        json!(format!(
+            "Does `message` name exactly one {description}, rather than several?"
+        )),
+    )?;
+    one_only.kind = Noul {
+        when_true: Some("exactly one".to_owned()),
+        when_false: Some("two or more, or a list".to_owned()),
+        ..Default::default()
+    }
+    .into();
+
+    Some(vec![value, stated, one_only])
+}
+
+/// The span the decision picked for `tool`, once all three of its questions agree it is safe to
+/// use: the choice is confident and is not the escape, the message states the value outright, and
+/// it states only one. Any of those failing leaves the argument to be composed generatively, which
+/// costs one call and nothing else.
+fn picked_span(answers: &[Answer], tool: &str) -> Option<String> {
+    let choice = find_choice(answers, &format!("{VALUE_QUESTION_PREFIX}{tool}"))?;
+    if choice.choice == NO_VALUE_OPTION
+        || choice.confidence < VALUE_CHOICE_CONFIDENCE_THRESHOLD
+        || find_noul(answers, &format!("{VALUE_STATED_PREFIX}{tool}"))? < VALUE_STATED_THRESHOLD
+        || find_noul(answers, &format!("{VALUE_ONE_ONLY_PREFIX}{tool}"))? < VALUE_ONE_ONLY_THRESHOLD
+    {
+        return None;
+    }
+    Some(choice.choice.clone())
 }
 
 fn instructed(id: &str, instructions: Value) -> Option<Question> {
@@ -636,13 +816,26 @@ fn fast_dispatchable_tool_call(
     choice: &ChoiceAnswer,
     available_tools: &[CatalogEntry],
     question: &str,
+    answers: &[Answer],
 ) -> Option<ToolCall> {
-    if !fits_fast_dispatch(question) {
-        return None;
-    }
     let tool = available_tools
         .iter()
         .find(|tool| tool.name == choice.choice)?;
+
+    // An argument that takes a word or two of the message is tried first: it is the narrower claim
+    // of the two, and the same decision already carries its answer.
+    if let Some((field, _)) = span_valued_field(&tool.input_schema_json)
+        && let Some(value) = picked_span(answers, &tool.name)
+    {
+        return Some(ToolCall {
+            name: tool.name.clone(),
+            args: json!({ field: value }),
+        });
+    }
+
+    if !fits_fast_dispatch(question) {
+        return None;
+    }
     let field = single_required_string_field(&tool.input_schema_json)?;
     Some(ToolCall {
         name: tool.name.clone(),
@@ -1025,6 +1218,9 @@ mod tests {
         reply: String,
         then_reply: Option<String>,
         decide_tool: Mutex<Option<(String, f64)>>,
+        /// The span pick, its confidence, and the two absolute gates, answered for whichever tool
+        /// is asked about: `(choice, confidence, stated, one_only)`.
+        decide_span: Mutex<Option<(String, f64, f64, f64)>>,
         decide_needs_external_info: Mutex<Option<f64>>,
         decide_calls: Mutex<usize>,
         decide_hangs: Mutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -1037,6 +1233,7 @@ mod tests {
                 reply: reply.to_owned(),
                 then_reply: None,
                 decide_tool: Mutex::new(None),
+                decide_span: Mutex::new(None),
                 decide_needs_external_info: Mutex::new(None),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
@@ -1049,6 +1246,7 @@ mod tests {
                 reply: reply.to_owned(),
                 then_reply: Some(then_reply.to_owned()),
                 decide_tool: Mutex::new(None),
+                decide_span: Mutex::new(None),
                 decide_needs_external_info: Mutex::new(None),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
@@ -1066,6 +1264,11 @@ mod tests {
         /// Arms `Decide`'s `tool` answer. Leaving both this and
         /// `answer_decide_needs_external_info` unset makes `decide` fail, matching an unarmed
         /// `Complete` — the fail-safe every non-scripted existing test in this module exercises.
+        fn answer_decide_span(&self, choice: &str, confidence: f64, stated: f64, one_only: f64) {
+            *self.decide_span.lock().expect("lock") =
+                Some((choice.to_owned(), confidence, stated, one_only));
+        }
+
         fn answer_decide_tool(&self, choice: &str, confidence: f64) {
             *self.decide_tool.lock().expect("lock") = Some((choice.to_owned(), confidence));
         }
@@ -1128,6 +1331,7 @@ mod tests {
             }
             let tool = self.decide_tool.lock().expect("lock").clone();
             let needs_info = *self.decide_needs_external_info.lock().expect("lock");
+            let span = self.decide_span.lock().expect("lock").clone();
             if tool.is_none() && needs_info.is_none() {
                 return Err(connectrpc::ConnectError::unavailable(
                     "configured fake decider failure",
@@ -1137,7 +1341,7 @@ mod tests {
             let answers = owned
                 .questions
                 .iter()
-                .filter_map(|question| scripted_answer(&question.id, &tool, needs_info))
+                .filter_map(|question| scripted_answer(&question.id, &tool, needs_info, &span))
                 .collect();
             Response::ok(DecideResponse {
                 answers,
@@ -1160,7 +1364,37 @@ mod tests {
         id: &str,
         tool: &Option<(String, f64)>,
         needs_info: Option<f64>,
+        span: &Option<(String, f64, f64, f64)>,
     ) -> Option<Answer> {
+        if let Some((choice, confidence, stated, one_only)) = span {
+            if let Some(noul) = id
+                .starts_with(VALUE_STATED_PREFIX)
+                .then_some(*stated)
+                .or_else(|| id.starts_with(VALUE_ONE_ONLY_PREFIX).then_some(*one_only))
+            {
+                return Some(Answer {
+                    id: id.to_owned(),
+                    answer: NoulAnswer {
+                        noul,
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                });
+            }
+            if id.starts_with(VALUE_QUESTION_PREFIX) {
+                return Some(Answer {
+                    id: id.to_owned(),
+                    answer: ChoiceAnswer {
+                        choice: choice.clone(),
+                        confidence: *confidence,
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                });
+            }
+        }
         match id {
             TOOL_QUESTION_ID => tool.as_ref().map(|(choice, confidence)| Answer {
                 id: TOOL_QUESTION_ID.to_owned(),
@@ -1549,6 +1783,165 @@ mod tests {
         assert_eq!(single_required_string_field(&schema), None);
     }
 
+    fn span_field_tool(name: &str, field: &str) -> CatalogEntry {
+        CatalogEntry {
+            name: name.to_owned(),
+            description: "does a thing".to_owned(),
+            input_schema_json: json!({
+                "type": "object",
+                "required": [field],
+                "properties": {field: {
+                    "type": "string",
+                    "description": "the place whose reading is asked about",
+                    "x-value-in-message": true,
+                }},
+            })
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn spans_offers_each_word_and_the_runs_of_words_beside_it() {
+        assert_eq!(
+            spans("weather in Bishkek?"),
+            vec![
+                "weather",
+                "in",
+                "Bishkek",
+                "weather in",
+                "in Bishkek",
+                "weather in Bishkek",
+            ]
+        );
+    }
+
+    /// A value of more than one word must be among the options, not only its parts, or the pick can
+    /// only ever be half of it.
+    #[test]
+    fn a_multi_word_value_is_itself_an_option() {
+        assert!(spans("weather in New York").contains(&"New York".to_owned()));
+    }
+
+    #[test]
+    fn spans_does_not_offer_the_same_words_twice() {
+        let found = spans("rain rain go away");
+        let mut once = found.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(once.len(), found.len(), "{found:?}");
+    }
+
+    #[test]
+    fn a_field_that_does_not_say_its_value_is_in_the_message_is_not_asked_about() {
+        let plain = json!({
+            "type": "object",
+            "required": ["place"],
+            "properties": {"place": {"type": "string"}},
+        })
+        .to_string();
+        assert_eq!(span_valued_field(&plain), None);
+    }
+
+    #[test]
+    fn the_questions_carry_the_fields_own_description_rather_than_its_name() {
+        let questions = span_questions(
+            "weather in Bishkek?",
+            &[span_field_tool("some_tool", "place")],
+        );
+        assert_eq!(questions.len(), 3, "one pick and two absolute gates");
+        let rendered = serde_json::to_string(&questions).expect("serialize");
+        assert!(
+            rendered.contains("the place whose reading is asked about"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("`place`"),
+            "the parameter's name is not the question"
+        );
+    }
+
+    /// The escape every closed set gets: the options are spans of one message, and the message may
+    /// not contain the value at all.
+    #[test]
+    fn the_pick_offers_a_way_to_say_none_of_these() {
+        let questions = span_questions(
+            "weather in Bishkek?",
+            &[span_field_tool("some_tool", "place")],
+        );
+        let rendered = serde_json::to_string(&questions[0]).expect("serialize");
+        assert!(rendered.contains(NO_VALUE_OPTION), "{rendered}");
+    }
+
+    fn span_answers(choice: &str, confidence: f64, stated: f64, one_only: f64) -> Vec<Answer> {
+        vec![
+            Answer {
+                id: format!("{VALUE_QUESTION_PREFIX}some_tool"),
+                answer: ChoiceAnswer {
+                    choice: choice.to_owned(),
+                    confidence,
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            Answer {
+                id: format!("{VALUE_STATED_PREFIX}some_tool"),
+                answer: NoulAnswer {
+                    noul: stated,
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            Answer {
+                id: format!("{VALUE_ONE_ONLY_PREFIX}some_tool"),
+                answer: NoulAnswer {
+                    noul: one_only,
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn a_confident_pick_that_both_gates_agree_with_is_used() {
+        let answers = span_answers("Bishkek", 0.99, 0.99, 0.9);
+        assert_eq!(
+            picked_span(&answers, "some_tool"),
+            Some("Bishkek".to_owned())
+        );
+    }
+
+    /// Each gate catches a different way of being confidently wrong, measured against the live
+    /// decider: a value that is only implied ("the capital of Kyrgyzstan"), one that is not there at
+    /// all ("here"), and two of them at once ("Paris and Berlin"). The choice is confident in all
+    /// three; only the absolute questions tell them apart.
+    #[test]
+    fn each_gate_refuses_a_confident_pick_on_its_own() {
+        for (label, answers) in [
+            (
+                "the message only implies it",
+                span_answers("capital of Kyrgyzstan", 0.98, 0.15, 0.82),
+            ),
+            (
+                "the message names two",
+                span_answers("Paris and Berlin", 0.95, 0.99, 0.08),
+            ),
+            (
+                "the choice itself is unsure",
+                span_answers("York", 0.4, 0.99, 0.9),
+            ),
+            (
+                "nothing in the message fits",
+                span_answers(NO_VALUE_OPTION, 0.99, 0.99, 0.9),
+            ),
+        ] {
+            assert_eq!(picked_span(&answers, "some_tool"), None, "{label}");
+        }
+    }
+
     // The shape the whole annotation exists for: one required string field that wants a *value* —
     // a place, a pair, a code — not the asking words. Handing it the message verbatim produces a
     // request that was never going to work, so it must not qualify however confidently the tool
@@ -1663,6 +2056,87 @@ mod tests {
             .await
             .expect("execute");
         (output, fake, tool)
+    }
+
+    /// End to end: the argument is a word of the message, the decision picks it, and the tool is
+    /// reached with that word — no generative call composes anything, and the whole question is
+    /// nowhere near the tool.
+    #[tokio::test]
+    async fn a_span_valued_argument_is_dispatched_with_the_picked_word_not_the_question() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "clear, 15C"}"#,
+        ));
+        fake.answer_decide_tool("some_tool", 0.9);
+        fake.answer_decide_span("Bishkek", 0.99, 0.99, 0.9);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 15}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![span_field_tool("some_tool", "place")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute(
+                "llm",
+                &config,
+                &json!({"question": "weather in Bishkek?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            tool.calls(),
+            1,
+            "the tool is reached without composing first"
+        );
+        let calls = tool.received.lock().expect("lock");
+        assert_eq!(calls[0].input_json, r#"{"place":"Bishkek"}"#);
+        drop(calls);
+        assert_eq!(
+            fake.calls(),
+            1,
+            "one Complete for the whole turn: the answer, and nothing to build the call"
+        );
+        assert_eq!(output["reply"], json!("clear, 15C"));
+    }
+
+    /// The same tool, the same confident choice, but the gates refuse the pick. Nothing is
+    /// dispatched and the turn composes the argument the way it does today.
+    #[tokio::test]
+    async fn a_span_the_gates_refuse_leaves_the_argument_to_be_composed() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "clear, 15C"}"#,
+        ));
+        fake.answer_decide_tool("some_tool", 0.9);
+        fake.answer_decide_span("capital of Kyrgyzstan", 0.98, 0.15, 0.82);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 15}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![span_field_tool("some_tool", "place")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute(
+                "llm",
+                &config,
+                &json!({"question": "what is the weather in the capital of Kyrgyzstan?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(tool.calls(), 0, "a refused pick reaches no tool");
+        assert!(output.get("fast_tool_call").is_none(), "{output}");
     }
 
     /// The counterpart, end to end: a tool whose one required string argument wants a value rather
