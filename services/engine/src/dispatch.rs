@@ -65,6 +65,7 @@ impl Dispatcher {
             .into_iter()
             .map(|tool| CatalogEntry {
                 name: tool.slug,
+                title: tool.name,
                 description: tool.description,
                 input_schema_json: tool.input_schema_json,
             })
@@ -275,9 +276,12 @@ mod tests {
             ToolTaskExecutor::new(&tool_url).expect("tool client"),
         );
         let config = json!({"tool_calling": true});
+        // A result already in state, because that is now the only way a generative call happens at
+        // all: on a bare question the turn either dispatches a source or declines.
+        let state = json!({"tool_result": [{"observed": "something"}]});
 
         dispatcher
-            .execute("llm", &config, &json!({}), "e:l:0")
+            .execute("llm", &config, &state, "e:l:0")
             .await
             .expect("execute");
 

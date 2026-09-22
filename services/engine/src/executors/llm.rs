@@ -33,10 +33,9 @@ pub enum Mode {
     /// Both outcomes are open and the model picks. The residual case: the decision reached neither
     /// conclusion confidently.
     Loop,
-    /// A tool is needed and only its arguments are missing. Tools are offered; a reply is refused.
+    /// A source is needed and only its arguments are missing. Tools are offered; a reply is
+    /// refused.
     ComposeOnly,
-    /// No tool is needed. No tools are offered, so none can be promised.
-    AnswerOnly,
 }
 
 static COMPOSE_ONLY_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
@@ -54,19 +53,6 @@ without a tool call is not accepted here.
             })
             .expect("a ToolCall always serializes"),
             reply: Value::Null,
-        }),
-    )
-});
-
-static ANSWER_ONLY_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        r#"
-Answer from what you already have. Respond with exactly this JSON and nothing else:
-{}
-"#,
-        shape_of(LlmOutput {
-            tool_call: Value::Null,
-            reply: Value::String(ANSWER_PLACEHOLDER.to_owned()),
         }),
     )
 });
@@ -98,6 +84,20 @@ already failed the same way.
     )
 });
 
+const FINAL_ANSWER_STYLE: &str = r#"
+Final answer style, overriding any instinct to be thorough or helpful: your "reply" is read aloud.
+Your reply is either the value you were asked for, or an admission that you could not get it.
+There is no third option: naming a place the value could be found is not an answer, it is the
+admission with extra words. If you do not have the value, the whole reply is a handful of words
+saying so.
+Answer only what was asked, in as few words as it takes — a fragment is better than a sentence,
+and one line is the maximum. Give the value, not a write-up of it.
+Never narrate your process, never list sources, never use markdown. Never add advice, suggestions,
+next steps, alternatives, caveats or offers of further help: the user asked a question, not for
+instructions.
+A bare value, a fragment, or "Couldn't get it." are all complete answers. A sentence that opens
+with "Based on my search" or closes by suggesting where else to look is not.
+"#;
 const TOOL_USE_POLICY: &str = r#"
 The tools listed above are live and connected. Use one rather than answering from memory
 whenever you are not certain your answer is correct and current — anything that could have
@@ -119,27 +119,6 @@ you were shown in this conversation. Never fill one in from memory, and never ca
 what you knew before: a value you remember is out of date by definition, and a plausible wrong
 value is worse than none. If a tool result does not contain what was asked, call another tool; if
 nothing gives it to you, say you could not get it rather than supplying it yourself.
-"#;
-const TOOL_NUDGE: &str = r#"
-You answered without using any tool. If a tool above could confirm or supply what you just said,
-call it now: respond with the tool_call itself. Every tool listed is connected and working — if
-it fails you will be shown the error and can try another. If no tool applies, or you truly
-cannot make the call, answer the question with what you already have: do not describe a plan and
-do not decline.
-"#;
-const FINAL_ANSWER_STYLE: &str = r#"
-Final answer style, overriding any instinct to be thorough or helpful: your "reply" is read aloud.
-Your reply is either the value you were asked for, or an admission that you could not get it.
-There is no third option: naming a place the value could be found is not an answer, it is the
-admission with extra words. If you do not have the value, the whole reply is a handful of words
-saying so.
-Answer only what was asked, in as few words as it takes — a fragment is better than a sentence,
-and one line is the maximum. Give the value, not a write-up of it.
-Never narrate your process, never list sources, never use markdown. Never add advice, suggestions,
-next steps, alternatives, caveats or offers of further help: the user asked a question, not for
-instructions.
-A bare value, a fragment, or "Couldn't get it." are all complete answers. A sentence that opens
-with "Based on my search" or closes by suggesting where else to look is not.
 "#;
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RETRY_ATTEMPTS: u32 = 3;
@@ -181,7 +160,6 @@ const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// mirrors (that constant is private to its own module, so this is its own copy, not a shared one).
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-const NEEDS_EXTERNAL_INFO_ID: &str = "needs_external_information";
 const PROMISE_ID: &str = "promise";
 /// Above this the reply undertakes work rather than reporting any. Set at the midpoint: the guard
 /// only ever replaces a promise with the truth, so an even split is better spent on the honest
@@ -199,25 +177,40 @@ const PROMISE_REFUSED: &str = "I couldn't get that just now. Ask me again and I'
 const TOOL_QUESTION_ID: &str = "tool";
 const NO_TOOL_OPTION: &str = "none";
 
-/// Phrased behaviourally, naming no subject: the repo's `gate-architecture` rule "Capabilities, Not
-/// Topics" forbids a domain or topic anywhere in code or prompts, and this text is read by the
-/// typed decider, not the model, so it never gets a tool's own description mixed into it.
-const NEEDS_EXTERNAL_INFO_INSTRUCTIONS: &str = "Does answering this question require information \
-not present here — something current, something specific, or something about this system's own \
-data?";
-const NEEDS_EXTERNAL_INFO_WHEN_TRUE: &str = "the answer depends on something current, something \
-specific that would have to be looked up, or something about this system's own data";
-const NEEDS_EXTERNAL_INFO_WHEN_FALSE: &str = "the question can be answered from general knowledge or reasoning alone, with nothing \
-current, specific, or system-specific to look up";
-const TOOL_QUESTION_INSTRUCTIONS: &str = "Which of the listed tools, if any, should be called to answer this question directly? \
-Choose the option named for no-tool if none of them is needed.";
+/// The one question the whole turn now turns on. It asks which of the sources the operator has
+/// connected covers what is being asked — a question about the catalog — and not whether the model
+/// needs help, which is a question about the model's confidence in its own memory.
+///
+/// That distinction is the whole change. A calibrated decider asked "does this require looking
+/// something up?" answers no whenever the model believes it knows, and believing it knows is
+/// exactly the state in which it is most likely to be confidently wrong. Measured: a question whose
+/// answer the connected store held was answered from memory, incorrectly, because that question
+/// came back confidently false.
+///
+/// Phrased naming no subject: the repo's `gate-architecture` rule "Capabilities, Not Topics"
+/// forbids a domain or topic anywhere in code or prompts. Every subject in this decision arrives
+/// from the catalog at runtime, written by the operator.
+const TOOL_QUESTION_INSTRUCTIONS: &str = "Which of these sources can answer this question? Choose \
+the one whose material covers what is being asked. Choose the option for none of them when none \
+does.";
+/// The `none` option's own description. Without it the decider is left to infer what `none` means
+/// from its name, and the option that has to carry every out-of-scope question is the one that can
+/// least afford to be guessed at.
+/// The decline's own words. They name what can be answered and ask which of it was meant, because a
+/// person who asked something adjacent needs a way back in — a bare refusal leaves them guessing at
+/// what the system is for.
+const DECLINE_OPENING: &str = "I can only answer from what I'm connected to: ";
+const DECLINE_CLOSING: &str = "Which of those did you mean?";
+/// When the catalog is empty there is nothing to offer, and listing nothing would read as a bug.
+const NOTHING_CONNECTED: &str =
+    "I'm not connected to anything I can answer from at the moment. Please try again shortly.";
+const NO_TOOL_DESCRIPTION: &str =
+    "no source listed here holds what this question asks for, or the message asks for nothing";
 
-/// Below this the model cannot separate "no information needed" from real doubt, and skipping the
-/// nudge on a wrong guess costs the turn's whole answer, not one extra call — so this asks for real
-/// confidence, not just a lean, before the nudge is given up.
-const NEEDS_EXTERNAL_INFO_CONFIDENT_FALSE_THRESHOLD: f64 = 0.3;
-/// A wrong tool pick on this path costs one tool call, not the turn — the normal loop continues
-/// after it — so this does not need the same certainty as skipping the nudge above.
+/// A pick at or above this is acted on. Measured over 16 questions against a catalog whose entries
+/// describe their coverage: every in-scope question reached its source at 0.88 or better, and every
+/// out-of-scope one reached `none` at 0.91 or better. The gap is wide enough that the exact value
+/// here does not decide anything — which is the point of asking the catalog rather than the model.
 const TOOL_CHOICE_CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// The question is sent to a fast-dispatched tool verbatim, as the whole value of its one string
 /// argument — never composed by a model first. That is only safe for something shaped like a
@@ -275,7 +268,13 @@ pub struct LlmNodeConfig {
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct CatalogEntry {
+    /// The slug a call is dispatched by.
     pub name: String,
+    /// What the operator calls this source, for the one place a person reads it: the decline that
+    /// names what can be answered. A slug there reads as a machine dump, and a person told
+    /// `kb_read_document` has been told nothing.
+    #[serde(default)]
+    pub title: String,
     pub description: String,
     /// The tool's `input_schema_json`, exactly as `ListTools` published it — read at runtime by
     /// `single_required_string_field` to decide whether a confident pick may be dispatched without
@@ -314,20 +313,15 @@ pub fn build_prompt_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> (S
         system.push_str(match mode {
             Mode::Loop => &TOOL_CALLING_INSTRUCTIONS,
             Mode::ComposeOnly => &COMPOSE_ONLY_INSTRUCTIONS,
-            Mode::AnswerOnly => &ANSWER_ONLY_INSTRUCTIONS,
         });
     }
-    // Not listed in answer-only: a tool the model cannot see is a tool it cannot promise.
-    if !config.available_tools.is_empty() && mode != Mode::AnswerOnly {
+    if !config.available_tools.is_empty() {
         system.push_str("\n\nAvailable tools:\n");
         for tool in &config.available_tools {
             system.push_str(&format!("- {}: {}\n", tool.name, tool.description));
         }
     }
-    // The policy tells the model to prefer a listed tool over its memory. In answer-only nothing is
-    // listed, so it would be pointing at an empty table — and a model told to call something it
-    // cannot see names one from memory, which is the promise this mode exists to prevent.
-    if config.tool_calling && mode != Mode::AnswerOnly {
+    if config.tool_calling {
         system.push_str(TOOL_USE_POLICY);
     }
     // The style block is about a reply, and it is the last thing the model reads. In compose-only
@@ -470,9 +464,6 @@ impl TaskExecutor for LlmTaskExecutor {
         let request = complete_request(&config, state);
         let output = self.complete_with_retries(&request).await?;
 
-        if answered_before_consulting_any_tool(&config, state, &output) {
-            return self.nudged_once(&config, state, &request, output).await;
-        }
         Ok(output)
     }
 }
@@ -504,9 +495,6 @@ fn complete_request_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> Co
 /// `decide_usage_value` — so `try_fast_path` can fold it into the budget the same way
 /// `merge_usage` already folds the nudge's second `Complete` in.
 enum FastPath {
-    /// `needs_external_information` came back confidently false, and `tool` named nothing
-    /// confidently: answer with one `Complete`, nudge disabled.
-    NoToolNeeded { decide_usage: Value },
     /// `tool` came back confident, named a live catalog entry, that entry's schema takes exactly
     /// one required string field, and the question is shaped like something safe to send
     /// verbatim: call it with the question verbatim.
@@ -516,12 +504,15 @@ enum FastPath {
     /// not offered the choice of answering, because that is the choice it gets wrong: given both,
     /// a light model replies "I will look that up" and the turn ends having called nothing.
     ComposeOnly { tool: String, decide_usage: Value },
-    /// No typed decision was reached (an error or a timeout), or the decision reached is neither
-    /// of the above — including a confident tool pick naming a tool the live catalog does not
-    /// have, which vetoes `NoToolNeeded` too: the decider has said a tool is needed, and that
-    /// outranks a separate, independently-evaluated "no information needed". Today's flow,
-    /// unchanged, nudge included.
-    Unavailable,
+    /// No connected source covers the question — `none`, confidently — or the decision could not
+    /// be reached at all. Both end the turn the same way, saying what can be answered and asking
+    /// which of it was meant. They are one variant because they are one outcome for the person:
+    /// nothing here was answered, and nothing was invented in place of an answer.
+    ///
+    /// A decision that does not arrive used to fall through to a loop where the model could answer
+    /// from memory. That fall-through is gone: it is the failure this design exists to remove, and
+    /// keeping it for outages would mean the guarantee holds only while the provider is up.
+    Decline { decide_usage: Value },
 }
 
 impl LlmTaskExecutor {
@@ -552,35 +543,8 @@ impl LlmTaskExecutor {
                 self.compose_tool_call(config, state, &tool, &decide_usage, idempotency_key)
                     .await,
             ),
-            FastPath::NoToolNeeded { decide_usage } => {
-                // Answer-only: no tools are listed, so none can be promised.
-                let request = complete_request_for(config, state, Mode::AnswerOnly);
-                let outcome = self
-                    .complete_with_retries(&request)
-                    .await
-                    .map(|output| merge_usage(&decide_usage, without_tool_call(output)));
-                Some(outcome)
-            }
-            FastPath::Unavailable => None,
+            FastPath::Decline { decide_usage } => Some(Ok(decline(config, &decide_usage))),
         }
-    }
-
-    /// The residual path's second chance: the model was offered tools and answered without calling
-    /// one, so it is told so and asked again. Whatever comes back is checked for a promise, because
-    /// this is the one route where neither the decision nor the mode could stop one.
-    async fn nudged_once(
-        &self,
-        config: &LlmNodeConfig,
-        state: &Value,
-        request: &CompleteRequest,
-        first: Value,
-    ) -> Result<Value, TaskError> {
-        tracing::info!("llm answered before using any tool, nudging once");
-        let mut nudged = request.clone();
-        nudged.system_prompt.push_str(TOOL_NUDGE);
-        let second = self.complete_with_retries(&nudged).await?;
-        let merged = merge_usage(&first, second);
-        Ok(self.without_an_empty_promise(config, state, merged).await)
     }
 
     /// The last thing between a promise and the person. Twice offered tools and twice answering
@@ -592,16 +556,10 @@ impl LlmTaskExecutor {
     /// rather than the question. A promise is replaced with the plain truth. An unavailable or
     /// unconfident decision leaves the reply exactly as it was: this guard may only remove a
     /// promise, never invent a failure.
-    async fn without_an_empty_promise(
-        &self,
-        config: &LlmNodeConfig,
-        state: &Value,
-        output: Value,
-    ) -> Value {
-        if !answered_before_consulting_any_tool(config, state, &output) {
-            return output;
-        }
-        let Some(reply) = output.get("reply").and_then(Value::as_str) else {
+    async fn without_an_empty_promise(&self, output: Value) -> Value {
+        let Some(reply) = output.get("reply").and_then(Value::as_str).filter(|reply| {
+            !reply.is_empty() && output.get("tool_call").is_none_or(Value::is_null)
+        }) else {
             return output;
         };
         let Some(request) = promise_request(reply) else {
@@ -683,6 +641,7 @@ impl LlmTaskExecutor {
         // instructions say that this means call again rather than that the task is over.
         let request = complete_request(config, &state_with_result);
         let output = self.complete_with_retries(&request).await?;
+        let output = self.without_an_empty_promise(output).await;
         let output = merge_usage(decide_usage, merge_usage(&spent, output));
         Ok(attach_fast_tool_call(output, &call, result))
     }
@@ -703,12 +662,13 @@ impl LlmTaskExecutor {
         let state_with_result = state_with_extra_tool_result(state, result.clone());
         let request = complete_request(config, &state_with_result);
         let output = self.complete_with_retries(&request).await?;
+        let output = self.without_an_empty_promise(output).await;
         let output = merge_usage(decide_usage, output);
         Ok(attach_fast_tool_call(output, call, result))
     }
 
     /// Sends one `Decide` whose state is the question alone — not the whole execution state, per
-    /// the vendor's own guidance. Any error or timeout is `FastPath::Unavailable`, the fail-safe
+    /// the vendor's own guidance. Any error or timeout is `FastPath::Decline`: the turn says what it
     /// that keeps a `Decide` outage from ever costing a turn. The vendor evaluates each question
     /// independently (`llm_router.proto`'s `DecideRequest` doc), so a confident `tool` pick and a
     /// confident "no information needed" can — and do — co-occur; `confident_tool_choice` is
@@ -716,7 +676,9 @@ impl LlmTaskExecutor {
     /// gate still returns `Unavailable`, never falling through to `NoToolNeeded`.
     async fn decide_fast_path(&self, config: &LlmNodeConfig, question: &str) -> FastPath {
         let Some(request) = decide_request(question, &config.available_tools) else {
-            return FastPath::Unavailable;
+            return FastPath::Decline {
+                decide_usage: Value::Null,
+            };
         };
         let decided = match self.decider.decide(request).await {
             Ok(response) => response.into_owned(),
@@ -725,7 +687,9 @@ impl LlmTaskExecutor {
                     %error,
                     "typed decision failed, falling back to today's flow with the nudge enabled"
                 );
-                return FastPath::Unavailable;
+                return FastPath::Decline {
+                    decide_usage: Value::Null,
+                };
             }
         };
         let decide_usage = decide_usage_value(&decided);
@@ -746,15 +710,10 @@ impl LlmTaskExecutor {
                         decide_usage,
                     }
                 }
-                None => FastPath::Unavailable,
+                None => FastPath::Decline { decide_usage },
             };
         }
-        if find_noul(&decided.answers, NEEDS_EXTERNAL_INFO_ID)
-            .is_some_and(|value| value < NEEDS_EXTERNAL_INFO_CONFIDENT_FALSE_THRESHOLD)
-        {
-            return FastPath::NoToolNeeded { decide_usage };
-        }
-        FastPath::Unavailable
+        FastPath::Decline { decide_usage }
     }
 
     /// Runs the fast-dispatched tool the same way a failed normal tool call would be shown to the
@@ -837,10 +796,7 @@ fn state_with_extra_tool_result(state: &Value, result: Value) -> Value {
 /// is read only when no confident, schema-eligible tool pick is found — see `decide_fast_path`.
 fn decide_request(question: &str, available_tools: &[CatalogEntry]) -> Option<DecideRequest> {
     let mut request: DecideRequest = serde_json::from_value(json!({ "state": question })).ok()?;
-    request.questions = vec![
-        needs_external_information_question()?,
-        tool_question(available_tools)?,
-    ];
+    request.questions = vec![tool_question(available_tools)?];
     request
         .questions
         .extend(decidable_questions(question, available_tools));
@@ -1068,20 +1024,6 @@ fn promise_request(reply: &str) -> Option<DecideRequest> {
     Some(request)
 }
 
-fn needs_external_information_question() -> Option<Question> {
-    let mut question = instructed(
-        NEEDS_EXTERNAL_INFO_ID,
-        json!(NEEDS_EXTERNAL_INFO_INSTRUCTIONS),
-    )?;
-    question.kind = Noul {
-        when_true: Some(NEEDS_EXTERNAL_INFO_WHEN_TRUE.to_owned()),
-        when_false: Some(NEEDS_EXTERNAL_INFO_WHEN_FALSE.to_owned()),
-        ..Default::default()
-    }
-    .into();
-    Some(question)
-}
-
 /// One option per entry in the live catalog the dispatcher injected, plus `NO_TOOL_OPTION` — read
 /// from `available_tools` at runtime, never a name written in Rust.
 fn tool_question(available_tools: &[CatalogEntry]) -> Option<Question> {
@@ -1095,7 +1037,7 @@ fn tool_question(available_tools: &[CatalogEntry]) -> Option<Question> {
         .collect();
     options.push(ChoiceOption {
         name: NO_TOOL_OPTION.to_owned(),
-        description: None,
+        description: Some(NO_TOOL_DESCRIPTION.to_owned()),
         ..Default::default()
     });
     let mut question = instructed(TOOL_QUESTION_ID, json!(TOOL_QUESTION_INSTRUCTIONS))?;
@@ -1258,14 +1200,45 @@ fn names_a_live_tool(choice: &ChoiceAnswer, available_tools: &[CatalogEntry]) ->
         .any(|tool| tool.name == choice.choice)
 }
 
-/// Clears any `tool_call` an answer-only response carried. The graph edges `llm -> tool` on that
-/// field being truthy, so leaving it would run a tool the typed decision said was not needed, named
-/// by a model that was shown no catalog to name it from.
-fn without_tool_call(mut output: Value) -> Value {
-    if let Some(object) = output.as_object_mut() {
-        object.insert("tool_call".to_owned(), Value::Null);
+/// What the turn says when no connected source covers the question. Composed from the catalog's own
+/// `name`s at runtime — the code names nothing, and a deployment that connects different sources
+/// gets a different sentence without being rebuilt.
+///
+/// No generative call is spent on it. Asking a model to phrase the refusal costs a second and
+/// invites it to answer the question inside the refusal, which is the failure being refused.
+fn decline(config: &LlmNodeConfig, decide_usage: &Value) -> Value {
+    let mut names: Vec<&str> = Vec::new();
+    for tool in &config.available_tools {
+        // The slug is the fallback, not the choice: a catalog that publishes no title leaves the
+        // person something to name rather than nothing.
+        let name = Some(tool.title.as_str())
+            .filter(|title| !title.is_empty())
+            .unwrap_or(tool.name.as_str());
+        // Several tools can reach one source — searching it and reading from it are two entries in
+        // the catalog and one thing to a person. An operator names them alike, and naming the same
+        // thing twice in a list reads as a fault.
+        if !names.contains(&name) {
+            names.push(name);
+        }
     }
-    output
+    let reply = if names.is_empty() {
+        NOTHING_CONNECTED.to_owned()
+    } else {
+        format!("{DECLINE_OPENING}{}. {DECLINE_CLOSING}", listed(&names))
+    };
+    merge_usage(
+        decide_usage,
+        json!({"tool_call": Value::Null, "reply": reply}),
+    )
+}
+
+/// Joins names the way a sentence does, so the reply reads as one rather than as a dump.
+fn listed(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 /// The `tool_call` a compose-only response carries, if it carries one.
@@ -1406,8 +1379,11 @@ mod tests {
     #[test]
     fn the_tool_use_policy_names_no_subject_and_no_tool() {
         let lowered = format!(
-            "{TOOL_USE_POLICY}{TOOL_NUDGE}{FINAL_ANSWER_STYLE}{NEEDS_EXTERNAL_INFO_INSTRUCTIONS}\
-             {NEEDS_EXTERNAL_INFO_WHEN_TRUE}{NEEDS_EXTERNAL_INFO_WHEN_FALSE}{TOOL_QUESTION_INSTRUCTIONS}"
+            "{TOOL_USE_POLICY}{FINAL_ANSWER_STYLE}{TOOL_QUESTION_INSTRUCTIONS}\
+             {NO_TOOL_DESCRIPTION}{DECLINE_OPENING}{DECLINE_CLOSING}{NOTHING_CONNECTED}\
+             {COMPOSE_REFUSAL}{COMPOSE_FAILURE}{}\
+             {PROMISE_INSTRUCTIONS}{PROMISE_WHEN_TRUE}{PROMISE_WHEN_FALSE}{PROMISE_REFUSED}",
+            *COMPOSE_ONLY_INSTRUCTIONS,
         )
         .to_lowercase();
 
@@ -1722,10 +1698,9 @@ mod tests {
                 barrier.wait().await;
             }
             let tool = self.decide_tool.lock().expect("lock").clone();
-            let needs_info = *self.decide_needs_external_info.lock().expect("lock");
             let span = self.decide_span.lock().expect("lock").clone();
             let promise = *self.decide_promise.lock().expect("lock");
-            if tool.is_none() && needs_info.is_none() && promise.is_none() {
+            if tool.is_none() && promise.is_none() {
                 return Err(connectrpc::ConnectError::unavailable(
                     "configured fake decider failure",
                 ));
@@ -1738,7 +1713,7 @@ mod tests {
                     if question.id == PROMISE_ID {
                         return promise.map(|noul| noul_answer(PROMISE_ID, noul));
                     }
-                    scripted_answer(&question.id, &tool, needs_info, &span)
+                    scripted_answer(&question.id, &tool, &span)
                 })
                 .collect();
             Response::ok(DecideResponse {
@@ -1773,7 +1748,6 @@ mod tests {
     fn scripted_answer(
         id: &str,
         tool: &Option<(String, f64)>,
-        needs_info: Option<f64>,
         span: &Option<(String, f64, f64, f64)>,
     ) -> Option<Answer> {
         if let Some((choice, confidence, stated, one_only)) = span {
@@ -1811,15 +1785,6 @@ mod tests {
                 answer: ChoiceAnswer {
                     choice: choice.clone(),
                     confidence: *confidence,
-                    ..Default::default()
-                }
-                .into(),
-                ..Default::default()
-            }),
-            NEEDS_EXTERNAL_INFO_ID => needs_info.map(|noul| Answer {
-                id: NEEDS_EXTERNAL_INFO_ID.to_owned(),
-                answer: NoulAnswer {
-                    noul,
                     ..Default::default()
                 }
                 .into(),
@@ -1936,6 +1901,7 @@ mod tests {
     fn single_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
+            title: name.to_owned(),
             description: "does a thing".to_owned(),
             input_schema_json: json!({
                 "type": "object",
@@ -1951,6 +1917,7 @@ mod tests {
     fn single_value_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
+            title: name.to_owned(),
             description: "does a thing".to_owned(),
             input_schema_json: json!({
                 "type": "object",
@@ -1964,6 +1931,7 @@ mod tests {
     fn two_field_tool(name: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
+            title: name.to_owned(),
             description: "does a thing".to_owned(),
             input_schema_json: json!({
                 "type": "object",
@@ -1974,6 +1942,9 @@ mod tests {
         }
     }
 
+    /// The generative loop as it now exists: reached only once a source has run, where the state
+    /// already carries a result. Before that, the turn either dispatches or declines, so there is
+    /// no longer any way to arrive here on a bare question.
     #[tokio::test]
     async fn execute_sends_the_built_prompt_and_parses_a_tool_call_reply() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -1986,7 +1957,10 @@ mod tests {
             .execute(
                 "llm",
                 &json!({"tool_calling": true}),
-                &json!({"question": "what is it?"}),
+                &json!({
+                    "question": "what is it?",
+                    TOOL_RESULT_STATE_KEY: [{"observed": "something"}],
+                }),
                 "e:llm:0",
             )
             .await
@@ -1997,7 +1971,10 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].tier, EnumValue::Known(QualityTier::Medium));
         assert!(received[0].system_prompt.contains("tool_call"));
-        assert_eq!(received[0].user_prompt, "what is it?");
+        assert!(
+            received[0].user_prompt.starts_with("what is it?"),
+            "the question leads, with the result that has come back rendered after it"
+        );
         assert_eq!(
             received[0].sampling.response_format,
             Some(EnumValue::Known(ResponseFormat::JsonObject))
@@ -2030,33 +2007,6 @@ mod tests {
             !answered_before_consulting_any_tool(&plain, &no_tool_yet, &answered),
             "a node with no tools offered has nothing to be nudged towards"
         );
-    }
-
-    #[tokio::test]
-    async fn an_answer_given_before_any_tool_ran_is_nudged_once_into_the_call() {
-        let fake = Arc::new(FakeLlmRouter::then(
-            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
-            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
-        ));
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
-
-        let output = executor
-            .execute(
-                "llm",
-                &json!({"tool_calling": true}),
-                &json!({"question": "which courses exist?"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        assert_eq!(output["tool_call"]["name"], json!("some_search"));
-        assert_eq!(fake.calls(), 2);
-        let received = fake.received.lock().expect("lock");
-        assert!(received[1].system_prompt.contains("without using any tool"));
-        assert!(received[1].system_prompt.contains("connected and working"));
-        assert_eq!(output["usage"]["tokens_in"], json!(FAKE_TOKENS_IN * 2));
     }
 
     #[tokio::test]
@@ -2095,27 +2045,6 @@ mod tests {
             .expect("execute");
 
         assert_eq!(fake.calls(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_model_that_answers_tool_lessly_twice_is_not_nudged_again() {
-        let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "I will look into it."}"#,
-        ));
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
-
-        executor
-            .execute(
-                "llm",
-                &json!({"tool_calling": true}),
-                &json!({"question": "q"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        assert_eq!(fake.calls(), 2);
     }
 
     #[tokio::test]
@@ -2204,6 +2133,7 @@ mod tests {
     fn span_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
+            title: name.to_owned(),
             description: "does a thing".to_owned(),
             input_schema_json: json!({
                 "type": "object",
@@ -2296,6 +2226,7 @@ mod tests {
     fn listed_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
+            title: name.to_owned(),
             description: "does a thing".to_owned(),
             input_schema_json: json!({
                 "type": "object",
@@ -2491,50 +2422,6 @@ mod tests {
         assert_eq!(single_required_string_field("not json"), None);
         assert_eq!(single_required_string_field("{}"), None);
         assert_eq!(single_required_string_field(r#"{"required": []}"#), None);
-    }
-
-    #[tokio::test]
-    async fn a_confident_no_external_information_needed_answer_skips_the_nudge() {
-        let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "68"}"#,
-        ));
-        fake.answer_decide_needs_external_info(0.02);
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
-
-        let output = executor
-            .execute(
-                "llm",
-                &json!({"tool_calling": true}),
-                &json!({"question": "what is 17 times 4?"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        assert_eq!(output["reply"], json!("68"));
-        assert_eq!(
-            fake.decide_calls(),
-            1,
-            "one Decide call precedes the answer"
-        );
-        assert_eq!(
-            fake.calls(),
-            1,
-            "a confident no-external-information-needed answer must cost exactly one Complete \
-             call, with the nudge disabled — the reply above carries no tool_call, so a nudge \
-             would otherwise have fired"
-        );
-        assert_eq!(
-            output["usage"]["tokens_in"],
-            json!(i64::from(FAKE_TOKENS_IN + FAKE_DECIDE_TOKENS_IN)),
-            "the Decide call this path spends must be charged against the budget too, not just \
-             the Complete call — the nudge path already does this with merge_usage"
-        );
-        assert_eq!(
-            output["usage"]["tokens_out"],
-            json!(i64::from(FAKE_TOKENS_OUT + FAKE_DECIDE_TOKENS_OUT))
-        );
     }
 
     async fn dispatched_fast_tool_call() -> (Value, Arc<FakeLlmRouter>, Arc<FakeToolService>) {
@@ -2744,22 +2631,24 @@ mod tests {
         );
     }
 
-    /// The failure the whole change exists to remove, in the one place the three branches cannot
-    /// reach: the decision was unconfident, the loop ran, the nudge ran, and the model still
-    /// answered with an undertaking. Nothing runs after a reply, so the undertaking is never kept.
+    /// The question the whole design turns on: a source covers it, or nothing does. When nothing
+    /// does, the turn says so and names what it can answer — and spends no generative call doing
+    /// it, because asking a model to phrase a refusal invites it to answer inside the refusal.
     #[tokio::test]
-    async fn a_reply_that_only_undertakes_work_is_replaced_with_the_plain_truth() {
+    async fn a_question_no_connected_source_covers_is_declined_without_a_generative_call() {
         let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "Bishkek. I'll look up the weather there and the NASDAQ."}"#,
+            r#"{"tool_call": null, "reply": "Bishkek."}"#,
         ));
-        fake.answer_decide_promise(0.9);
+        fake.answer_decide_tool(NO_TOOL_OPTION, 0.97);
         let llm_url = serve(Arc::clone(&fake)).await;
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let mut entry = single_field_tool("some_slug", "query");
+        entry.title = "What the operator calls it".to_owned();
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
+            available_tools: vec![entry],
             ..Default::default()
         }
         .to_json();
@@ -2770,101 +2659,209 @@ mod tests {
             .expect("execute");
 
         assert_eq!(
+            fake.calls(),
+            0,
+            "a decline costs no generative call: the model is never asked, so it cannot answer \
+             from memory inside its own refusal"
+        );
+        assert_eq!(tool.calls(), 0);
+        let reply = output["reply"].as_str().expect("a reply");
+        assert!(
+            reply.contains("What the operator calls it"),
+            "the decline names sources the way the operator named them, not by slug: {reply:?}"
+        );
+        assert!(
+            reply.contains("did you mean"),
+            "and asks which of it was meant, so an adjacent question has a way back in: {reply:?}"
+        );
+    }
+
+    /// Several catalog entries can reach one source: searching it and reading from it are two rows
+    /// and one thing to the person reading the decline.
+    #[tokio::test]
+    async fn the_decline_names_one_source_once_however_many_tools_reach_it() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "x"}"#,
+        ));
+        fake.answer_decide_tool(NO_TOOL_OPTION, 0.97);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, UNREACHABLE).expect("client");
+        let mut searching = single_field_tool("search_it", "query");
+        searching.title = "The stored material".to_owned();
+        let mut reading = single_field_tool("read_it", "query");
+        reading.title = "The stored material".to_owned();
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![searching, reading],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        let reply = output["reply"].as_str().expect("a reply");
+        assert_eq!(
+            reply.matches("The stored material").count(),
+            1,
+            "naming the same source twice reads as a fault: {reply:?}"
+        );
+    }
+
+    /// The guarantee cannot hold only while the decider is up. A decision that never arrives used
+    /// to fall through to a loop where the model answered from memory; that was the failure, and an
+    /// outage is exactly when it would go unnoticed.
+    #[tokio::test]
+    async fn a_decision_that_never_arrives_declines_rather_than_answering_from_memory() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "Bishkek."}"#,
+        ));
+        // Nothing arms the decider, so `decide` fails the way an outage fails.
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            fake.calls(),
+            0,
+            "no generative call is made on this path either"
+        );
+        assert_ne!(output["reply"], json!("Bishkek."));
+        assert!(
+            output["reply"]
+                .as_str()
+                .is_some_and(|reply| reply.contains("Current weather for a place")),
+            "an outage still tells the person what this is for"
+        );
+    }
+
+    /// A pick the live catalog does not carry is not a source. It cannot be dispatched and it
+    /// cannot license an answer, so it declines like any other unanswerable question.
+    #[tokio::test]
+    async fn a_pick_naming_a_tool_the_catalog_does_not_carry_declines() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "Bishkek."}"#,
+        ));
+        fake.answer_decide_tool("a_tool_that_left", 0.95);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            tool.calls(),
+            0,
+            "a tool that is not in the catalog is never dispatched"
+        );
+        assert_ne!(output["reply"], json!("Bishkek."));
+    }
+
+    /// A lean is not a pick. Below the threshold no source has been named, and naming none is what
+    /// declining means.
+    #[tokio::test]
+    async fn a_pick_too_weak_to_act_on_declines() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "Bishkek."}"#,
+        ));
+        fake.answer_decide_tool("Current weather for a place", 0.2);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok("{}"));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(fake.calls(), 0);
+        assert_ne!(output["reply"], json!("Bishkek."));
+    }
+
+    /// With nothing connected there is nothing to offer, and listing nothing would read as a bug.
+    #[tokio::test]
+    async fn an_empty_catalog_says_so_rather_than_listing_nothing() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "x"}"#,
+        ));
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, UNREACHABLE).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!(NOTHING_CONNECTED));
+    }
+
+    /// The promise guard now sits where a promise is still possible: after a source has run, over
+    /// the reply that was written from its result.
+    #[tokio::test]
+    async fn a_promise_written_after_a_source_ran_is_replaced_with_the_plain_truth() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "I'll go and check that for you."}"#,
+        ));
+        fake.answer_decide_tool("Current weather for a place", 0.95);
+        fake.answer_decide_promise(0.9);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 21}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(tool.calls(), 1, "the source did run");
+        assert_eq!(
             output["reply"],
             json!(PROMISE_REFUSED),
-            "a promise the turn cannot keep must never reach the person"
+            "but the reply undertook work instead of reporting it"
         );
-    }
-
-    /// The guard may only ever remove a promise. An answer given from what the model knows is a
-    /// finished answer, however few tools it called getting there.
-    #[tokio::test]
-    async fn a_reply_that_answers_is_left_alone_even_though_no_tool_ran() {
-        let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "Bishkek."}"#,
-        ));
-        fake.answer_decide_promise(0.05);
-        let llm_url = serve(Arc::clone(&fake)).await;
-        let tool = Arc::new(FakeToolService::ok("{}"));
-        let tool_url = serve_tool(Arc::clone(&tool)).await;
-        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
-        let config = LlmNodeConfig {
-            tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
-            ..Default::default()
-        }
-        .to_json();
-
-        let output = executor
-            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
-            .await
-            .expect("execute");
-
-        assert_eq!(output["reply"], json!("Bishkek."));
-    }
-
-    /// A decider that cannot answer must not cost the person their reply. The guard removes a
-    /// promise; it never invents a failure.
-    #[tokio::test]
-    async fn an_unavailable_guard_leaves_the_reply_exactly_as_it_was() {
-        let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "I'll look that up."}"#,
-        ));
-        let llm_url = serve(Arc::clone(&fake)).await;
-        let tool = Arc::new(FakeToolService::ok("{}"));
-        let tool_url = serve_tool(Arc::clone(&tool)).await;
-        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
-        let config = LlmNodeConfig {
-            tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
-            ..Default::default()
-        }
-        .to_json();
-
-        let output = executor
-            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
-            .await
-            .expect("execute");
-
-        assert_eq!(output["reply"], json!("I'll look that up."));
-    }
-
-    /// When the decision says no tool is needed, none is listed. A model cannot promise a lookup
-    /// with a tool it was never shown, and that promise is how a turn ends having done nothing.
-    #[tokio::test]
-    async fn the_answer_only_branch_lists_no_tools_so_none_can_be_promised() {
-        let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "Bishkek."}"#,
-        ));
-        fake.answer_decide_needs_external_info(0.02);
-        let llm_url = serve(Arc::clone(&fake)).await;
-        let tool = Arc::new(FakeToolService::ok("{}"));
-        let tool_url = serve_tool(Arc::clone(&tool)).await;
-        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
-        let config = LlmNodeConfig {
-            tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
-            ..Default::default()
-        }
-        .to_json();
-
-        let output = executor
-            .execute(
-                "llm",
-                &config,
-                &json!({"question": "capital of Kyrgyzstan?"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        let prompt = fake.system_prompt(0);
-        assert!(
-            !prompt.contains("some_tool") && !prompt.contains("Available tools"),
-            "no tool is offered on the answer-only branch: {prompt}"
-        );
-        assert_eq!(output["reply"], json!("Bishkek."));
-        assert_eq!(fake.calls(), 1, "and one Complete settles the turn");
     }
 
     /// A tool whose schema needs two fields cannot be handed the question verbatim, but the
@@ -3016,97 +3013,6 @@ mod tests {
         assert_eq!(tool.calls(), 1, "and the tool the decision named is called");
     }
 
-    #[tokio::test]
-    async fn a_confident_pick_of_a_tool_not_in_the_live_catalog_vetoes_no_tool_needed_too() {
-        let fake = Arc::new(FakeLlmRouter::then(
-            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
-            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
-        ));
-        fake.answer_decide_tool("nonexistent_tool", 0.95);
-        fake.answer_decide_needs_external_info(0.02);
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
-        let config = LlmNodeConfig {
-            tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
-            ..Default::default()
-        }
-        .to_json();
-
-        let output = executor
-            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
-            .await
-            .expect("execute");
-
-        assert_eq!(output["tool_call"]["name"], json!("some_search"));
-        assert_eq!(
-            fake.calls(),
-            2,
-            "a confident pick naming no tool in the live catalog still vetoes NoToolNeeded"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_low_confidence_tool_pick_does_not_veto_no_tool_needed() {
-        let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "68"}"#,
-        ));
-        fake.answer_decide_tool("some_tool", 0.2); // below TOOL_CHOICE_CONFIDENCE_THRESHOLD
-        fake.answer_decide_needs_external_info(0.02);
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
-        let config = LlmNodeConfig {
-            tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
-            ..Default::default()
-        }
-        .to_json();
-
-        let output = executor
-            .execute(
-                "llm",
-                &config,
-                &json!({"question": "what is 17 times 4?"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        assert_eq!(output["reply"], json!("68"));
-        assert_eq!(
-            fake.calls(),
-            1,
-            "a tool mentioned with low confidence must not block the no-tool-needed fast path"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_missing_tool_answer_does_not_veto_no_tool_needed() {
-        let fake = Arc::new(FakeLlmRouter::always(
-            r#"{"tool_call": null, "reply": "68"}"#,
-        ));
-        fake.answer_decide_needs_external_info(0.02); // tool left unarmed: no `tool` answer at all
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
-
-        let output = executor
-            .execute(
-                "llm",
-                &json!({"tool_calling": true}),
-                &json!({"question": "what is 17 times 4?"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        assert_eq!(output["reply"], json!("68"));
-        assert_eq!(
-            fake.calls(),
-            1,
-            "no `tool` answer at all must not block the no-tool-needed fast path"
-        );
-    }
-
     // A follow-up's question is not always a question — see MAX_FAST_DISPATCH_QUESTION_CHARS's
     // doc. A confident, schema-eligible tool pick must still not be fast-dispatched when the
     // question itself is multi-line, and must still veto NoToolNeeded (today's flow decides).
@@ -3182,40 +3088,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_failed_decide_falls_through_to_todays_flow_with_the_nudge_enabled() {
-        let fake = Arc::new(FakeLlmRouter::then(
-            r#"{"tool_call": null, "reply": "I do not have access to that."}"#,
-            r#"{"tool_call": {"name": "some_search", "args": {"query": "q"}}}"#,
-        ));
-        // Neither `answer_decide_tool` nor `answer_decide_needs_external_info` is armed, so
-        // `decide` fails — the fail-safe this test exercises.
-        let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
-
-        let output = executor
-            .execute(
-                "llm",
-                &json!({"tool_calling": true}),
-                &json!({"question": "which courses exist?"}),
-                "e:llm:0",
-            )
-            .await
-            .expect("execute");
-
-        assert_eq!(output["tool_call"]["name"], json!("some_search"));
-        assert_eq!(
-            fake.decide_calls(),
-            1,
-            "a Decide attempt must be made and observed to fail, not skipped"
-        );
-        assert_eq!(
-            fake.calls(),
-            2,
-            "an unavailable Decide falls through to today's flow, nudge included"
-        );
-    }
-
     // Real network on loopback (the fake server, the TCP and HTTP/2 handshake), virtual time for
     // the deadline itself — the same idiom as `services/chat/src/intent.rs`'s matching test.
     // Isolated to `decide_fast_path` itself, not the whole `execute` flow: chaining the two further
@@ -3246,8 +3118,9 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            matches!(outcome, FastPath::Unavailable),
-            "a hung Decide must fall back to Unavailable, today's flow with the nudge enabled"
+            matches!(outcome, FastPath::Decline { .. }),
+            "a decider that does not answer must decline, never fall through to answering from \
+             memory — the guarantee cannot hold only while the provider is up"
         );
         assert!(
             elapsed >= DECIDE_CALL_TIMEOUT,

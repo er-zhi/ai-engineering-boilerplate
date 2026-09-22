@@ -209,29 +209,29 @@ fn system_tool_definitions() -> [SystemTool; 4] {
     [
         SystemTool {
             slug: slugs::WEB_SEARCH,
-            name: "Web search",
-            description: "Searches the public web and returns matching pages with a title, URL, snippet, and where a page could be read, its text.",
+            name: "Web search".to_owned(),
+            description: "Searches the public web and returns matching pages with a title, URL, snippet, and where a page could be read, its text.".to_owned(),
             risk: Risk::ReadOnly,
             input_schema: tool::args::input_schema::<tool::args::Search>(),
         },
         SystemTool {
             slug: slugs::WEB_FETCH,
-            name: "Fetch a web page",
-            description: "Fetches a page and returns its readable title and text. Pass several urls to fetch candidates at once and get whichever answers first — do that when several pages would each answer the question and you cannot tell which will respond.",
+            name: "Fetch a web page".to_owned(),
+            description: "Fetches a page and returns its readable title and text. Pass several urls to fetch candidates at once and get whichever answers first — do that when several pages would each answer the question and you cannot tell which will respond.".to_owned(),
             risk: Risk::ReadOnly,
             input_schema: tool::args::input_schema::<tool::args::Fetch>(),
         },
         SystemTool {
             slug: slugs::KB_SEARCH,
-            name: "Knowledge base search",
-            description: "Searches this project's knowledge base.",
+            name: "Knowledge base search".to_owned(),
+            description: "Searches this project's knowledge base.".to_owned(),
             risk: Risk::ReadOnly,
             input_schema: tool::args::input_schema::<tool::args::Search>(),
         },
         SystemTool {
             slug: slugs::KB_READ_DOCUMENT,
-            name: "Read a knowledge base document",
-            description: "Reads the full text of one knowledge base document, identified by the source and source_id a knowledge base search result carries.",
+            name: "Read a knowledge base document".to_owned(),
+            description: "Reads the full text of one knowledge base document, identified by the source and source_id a knowledge base search result carries.".to_owned(),
             risk: Risk::ReadOnly,
             input_schema: tool::args::input_schema::<tool::args::ReadDocument>(),
         },
@@ -239,8 +239,12 @@ fn system_tool_definitions() -> [SystemTool; 4] {
 }
 
 async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) {
+    let overrides = std::env::var("BUILT_IN_TOOLS_PATH")
+        .map(|path| tool::built_in_overrides::load(&path))
+        .unwrap_or_default();
     for definition in system_tool_definitions() {
         let slug = definition.slug;
+        let applied = overrides.get(slug).cloned().unwrap_or_default();
         let existing = match Entity::find()
             .filter(tool::entity::tool::Column::UserId.is_null())
             .filter(tool::entity::tool::Column::Slug.eq(slug))
@@ -253,6 +257,13 @@ async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) 
                 continue;
             }
         };
+        if applied.enabled == Some(false) {
+            if let Some(row) = existing.filter(|row| row.status == Status::Active) {
+                withdraw_system_tool(db, slug, row).await;
+            }
+            continue;
+        }
+        let definition = definition.overridden_by(&applied);
         if seeding_already_finished(existing.as_ref(), &definition) {
             continue;
         }
@@ -274,10 +285,41 @@ fn seeding_already_finished(
 
 struct SystemTool {
     slug: &'static str,
-    name: &'static str,
-    description: &'static str,
+    name: String,
+    description: String,
     risk: Risk,
     input_schema: serde_json::Value,
+}
+
+impl SystemTool {
+    /// Applies what the operator said about this tool. `None` for a field keeps what the binary
+    /// declares; `enabled: false` is not applied here — it is read by the caller, which takes the
+    /// tool out of the catalog rather than seeding it.
+    fn overridden_by(mut self, applied: &tool::built_in_overrides::Override) -> Self {
+        if let Some(name) = &applied.name {
+            self.name = name.clone();
+        }
+        if let Some(description) = &applied.description {
+            self.description = description.clone();
+        }
+        self
+    }
+}
+
+/// Takes a tool out of the catalog without deleting it. `list_tools` returns only `Active` rows, so
+/// moving it back to `Draft` is enough: the decision that routes a question can no longer see it,
+/// and re-enabling it in the operator's file seeds it again with its history intact.
+async fn withdraw_system_tool(
+    db: &sea_orm::DatabaseConnection,
+    slug: &str,
+    row: tool::entity::tool::Model,
+) {
+    let mut withdrawing: tool::entity::tool::ActiveModel = row.into();
+    withdrawing.status = sea_orm::ActiveValue::Set(Status::Draft);
+    match sea_orm::ActiveModelTrait::update(withdrawing, db).await {
+        Ok(_) => tracing::info!(slug, "system tool withdrawn from the catalog"),
+        Err(error) => tracing::error!(slug, %error, "could not withdraw a system tool"),
+    }
 }
 
 async fn seed_pre_vetted_system_tool(
@@ -304,8 +346,8 @@ async fn create_and_activate_system_tool(
 ) -> Result<(), String> {
     let new_tool = NewTool::checked(
         definition.slug.to_owned(),
-        definition.name.to_owned(),
-        definition.description.to_owned(),
+        definition.name.clone(),
+        definition.description.clone(),
         definition.input_schema.clone(),
         serde_json::json!({"type": "object"}),
         definition.risk,
