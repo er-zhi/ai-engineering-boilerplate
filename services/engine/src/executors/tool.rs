@@ -8,7 +8,7 @@ use common::proto::tools::v1::{
 use connectrpc::client::HttpClient;
 use engine_core::{
     LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
-    llm_tool_call_pointer,
+    ToolRecord, llm_tool_call_pointer,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -208,14 +208,13 @@ fn results_by_call(calls: &[ToolCall], outcomes: &[CallOutcome]) -> Value {
         .iter()
         .zip(outcomes)
         .map(|(call, outcome)| {
-            let mut entry = serde_json::json!({"name": call.name, "args": call.args});
-            match outcome {
-                CallOutcome::Output(output) => entry["result"] = output.clone(),
+            let result = match outcome {
+                CallOutcome::Output(output) => output.clone(),
                 CallOutcome::Error(message) => {
-                    entry[TOOL_RESULT_ERROR_KEY] = Value::String(message.clone());
+                    serde_json::json!({ TOOL_RESULT_ERROR_KEY: message })
                 }
-            }
-            entry
+            };
+            ToolRecord::of(call, result, chrono::Utc::now().to_rfc3339()).to_json()
         })
         .collect();
     serde_json::json!({"calls": entries})

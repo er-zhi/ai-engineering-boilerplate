@@ -86,6 +86,28 @@ fn continued_execution_if_readable(execution_id: Option<&str>) -> Option<Uuid> {
     execution_id.and_then(|id| Uuid::parse_str(id).ok())
 }
 
+impl EngineServiceImpl {
+    async fn refuse_another_users_execution(
+        &self,
+        ctx: &RequestContext,
+        execution_id: Uuid,
+    ) -> Result<(), ConnectError> {
+        let owner = self
+            .service
+            .get_execution(execution_id)
+            .await?
+            .user_id
+            .map(|owner| owner.0);
+        let caller = principal::from_metadata(ctx.headers()).map(|p| p.user_id);
+        if owner.is_some() && owner != caller {
+            return Err(ConnectError::permission_denied(format!(
+                "execution {execution_id} belongs to another user"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[allow(refining_impl_trait)]
 impl EngineService for EngineServiceImpl {
     async fn register_graph(
@@ -131,11 +153,13 @@ impl EngineService for EngineServiceImpl {
 
     async fn interrupt(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, InterruptRequest>,
     ) -> ServiceResult<InterruptResponse> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
+        self.refuse_another_users_execution(&ctx, execution_id)
+            .await?;
         self.service
             .interrupt(execution_id, &msg.input_json)
             .await?;
@@ -144,33 +168,39 @@ impl EngineService for EngineServiceImpl {
 
     async fn resume(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, ResumeRequest>,
     ) -> ServiceResult<ResumeResponse> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
+        self.refuse_another_users_execution(&ctx, execution_id)
+            .await?;
         self.service.resume(execution_id, &msg.event_json).await?;
         Response::ok(ResumeResponse::default())
     }
 
     async fn cancel(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, CancelRequest>,
     ) -> ServiceResult<CancelResponse> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
+        self.refuse_another_users_execution(&ctx, execution_id)
+            .await?;
         self.service.cancel(execution_id).await?;
         Response::ok(CancelResponse::default())
     }
 
     async fn get_execution(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, GetExecutionRequest>,
     ) -> ServiceResult<ExecutionProto> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
+        self.refuse_another_users_execution(&ctx, execution_id)
+            .await?;
         let execution = self.service.get_execution(execution_id).await?;
         Response::ok(execution_to_proto(&execution))
     }
@@ -187,14 +217,7 @@ impl EngineService for EngineServiceImpl {
             .map(|s| parse_uuid(s, "execution_id"))
             .transpose()?;
         if let Some(id) = execution_id {
-            let owner = self.service.get_execution(id).await?.user_id.map(|u| u.0);
-            if owner.is_some()
-                && owner != principal::from_metadata(ctx.headers()).map(|p| p.user_id)
-            {
-                return Err(ConnectError::permission_denied(format!(
-                    "execution {id} belongs to another user"
-                )));
-            }
+            self.refuse_another_users_execution(&ctx, id).await?;
         }
         let scope = match execution_id {
             Some(id) => stream::Scope::Execution(id),

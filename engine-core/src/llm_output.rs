@@ -13,6 +13,49 @@ pub const TOOL_RESULT_ERROR_KEY: &str = "error";
 pub const FAST_TOOL_CALL_FIELD: &str = "fast_tool_call";
 
 const TOOL_CALL_FIELD: &str = "tool_call";
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct ToolRecord {
+    pub name: String,
+    #[serde(default)]
+    pub args: Value,
+    #[serde(default)]
+    pub result: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+}
+
+impl ToolRecord {
+    #[must_use]
+    pub fn of(call: &ToolCall, result: Value, fetched_at: String) -> Self {
+        Self {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            result,
+            fetched_at: Some(fetched_at),
+        }
+    }
+
+    #[must_use]
+    pub fn read(stored: &Value) -> Option<Self> {
+        serde_json::from_value(stored.clone()).ok()
+    }
+
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    #[must_use]
+    pub fn reached_its_source(&self) -> bool {
+        self.result.get(TOOL_RESULT_ERROR_KEY).is_none()
+    }
+
+    #[must_use]
+    pub fn failure(&self) -> Option<&str> {
+        self.result.get(TOOL_RESULT_ERROR_KEY)?.as_str()
+    }
+}
 const REPLY_FIELD: &str = "reply";
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]

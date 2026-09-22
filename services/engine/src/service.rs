@@ -4,7 +4,9 @@ use chrono::Utc;
 use engine_core::{
     ActiveNode, Budget, CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, Graph,
 };
-use engine_core::{PRIOR_MATERIAL_STATE_KEY, RENDERED_TOOL_RESULTS, TOOL_RESULT_STATE_KEY};
+use engine_core::{
+    PRIOR_MATERIAL_STATE_KEY, RENDERED_TOOL_RESULTS, TOOL_RESULT_STATE_KEY, ToolRecord,
+};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
@@ -100,19 +102,22 @@ fn prefer_the_record_that_carries_the_call(records: &mut Vec<Value>, state: &Val
     else {
         return;
     };
-    let Some(result) = with_the_call.get("result") else {
+    let Some(full) = ToolRecord::read(with_the_call) else {
         return;
     };
-    if let Some(same_fetch_without_the_call) = records.iter_mut().find(|record| *record == result) {
-        *same_fetch_without_the_call = with_the_call.clone();
-    } else {
-        records.push(with_the_call.clone());
+    let as_json = full.to_json();
+    let same_fetch = |record: &&mut Value| match ToolRecord::read(record) {
+        Some(typed) => typed.result == full.result,
+        None => **record == full.result,
+    };
+    match records.iter_mut().find(same_fetch) {
+        Some(written_without_the_call) => *written_without_the_call = as_json,
+        None => records.push(as_json),
     }
 }
 
 fn reached_its_source(record: &Value) -> bool {
-    let result = record.get("result").unwrap_or(record);
-    result.get(engine_core::TOOL_RESULT_ERROR_KEY).is_none()
+    ToolRecord::read(record).is_none_or(|record| record.reached_its_source())
 }
 
 fn execution_input(input_json: &str) -> Result<Value, EngineError> {

@@ -18,7 +18,7 @@ use common::proto::tools::v1::{ExecuteRequest, ExecuteResponse, ExecuteStatus, T
 use connectrpc::client::HttpClient;
 use engine_core::{
     FAST_TOOL_CALL_FIELD, LlmOutput, PRIOR_MATERIAL_STATE_KEY, RENDERED_TOOL_RESULTS,
-    TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
+    TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall, ToolRecord,
 };
 use serde_json::{Value, json};
 
@@ -162,7 +162,6 @@ you.
 const POINTED_AT_ID: &str = "pointed_at";
 const POINTED_AT_ENOUGH_TO_DISPATCH: f64 = 0.8;
 const BELOW_EVERY_THRESHOLD: f64 = 0.0;
-const FETCHED_AT_FIELD: &str = "fetched_at";
 const CARRIED_MATERIAL_GOES_STALE_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 const POINTED_AT_INSTRUCTIONS: &str = "Does `message` refer to `value`, by that name or by any \
 description that can only mean it?";
@@ -310,6 +309,13 @@ fn rendered_tool_results(state: &Value) -> impl Iterator<Item = (usize, &Value)>
         .skip(first_rendered)
 }
 
+fn fetched_recently(record: &Value, now: chrono::DateTime<Utc>) -> bool {
+    ToolRecord::read(record)
+        .and_then(|record| record.fetched_at)
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+        .is_some_and(|at| now - at.with_timezone(&Utc) < CARRIED_MATERIAL_GOES_STALE_AFTER)
+}
+
 fn still_fresh(records: Option<&Value>) -> Value {
     let Some(records) = records.and_then(Value::as_array) else {
         return Value::Null;
@@ -318,15 +324,7 @@ fn still_fresh(records: Option<&Value>) -> Value {
     Value::Array(
         records
             .iter()
-            .filter(|record| {
-                record
-                    .get(FETCHED_AT_FIELD)
-                    .and_then(Value::as_str)
-                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-                    .is_some_and(|at| {
-                        now - at.with_timezone(&Utc) < CARRIED_MATERIAL_GOES_STALE_AFTER
-                    })
-            })
+            .filter(|record| fetched_recently(record, now))
             .cloned()
             .collect::<Vec<_>>(),
     )
@@ -840,10 +838,7 @@ fn decide_usage_value(decided: &DecideResponse) -> Value {
 
 fn attach_fast_tool_call(mut output: Value, call: &ToolCall, result: Value) -> Value {
     if let Some(object) = output.as_object_mut() {
-        object.insert(
-            FAST_TOOL_CALL_FIELD.to_owned(),
-            json!({"name": call.name, "args": call.args, "result": result}),
-        );
+        object.insert(FAST_TOOL_CALL_FIELD.to_owned(), tool_record(call, result));
     }
     output
 }
@@ -869,12 +864,7 @@ fn no_tool_results_yet(state: &Value) -> bool {
 }
 
 fn tool_record(call: &ToolCall, result: Value) -> Value {
-    json!({
-        "name": call.name,
-        "args": call.args,
-        "result": result,
-        FETCHED_AT_FIELD: Utc::now().to_rfc3339(),
-    })
+    ToolRecord::of(call, result, Utc::now().to_rfc3339()).to_json()
 }
 
 fn state_with_extra_tool_result(state: &Value, result: Value) -> Value {
@@ -2754,15 +2744,24 @@ mod tests {
         let (output, ..) = dispatched_fast_tool_call().await;
 
         assert_eq!(
-            output["fast_tool_call"],
-            json!({
-                "name": "some_tool",
-                "args": {"query": "what is 17 times 4?"},
-                "result": {"answer": "sixty-eight"},
-            }),
+            output["fast_tool_call"]["name"],
+            json!("some_tool"),
             "the fast-dispatched call must be recorded on the node's own output, so it is \
              event-logged and checkpointed by the ordinary per-node machinery — otherwise the \
              most common tool call in the system is invisible"
+        );
+        assert_eq!(
+            output["fast_tool_call"]["args"],
+            json!({"query": "what is 17 times 4?"})
+        );
+        assert_eq!(
+            output["fast_tool_call"]["result"],
+            json!({"answer": "sixty-eight"})
+        );
+        assert!(
+            output["fast_tool_call"]["fetched_at"].is_string(),
+            "a record carried into a later turn has to say how old it is, or a price from an \
+             hour ago answers and the grounding guard approves it"
         );
         assert_eq!(
             output["usage"]["tokens_in"],
@@ -2793,7 +2792,7 @@ mod tests {
                 "name": "a_source",
                 "args": {"query": "q"},
                 "result": {"temp": 29.6},
-                FETCHED_AT_FIELD: long_ago,
+                "fetched_at": long_ago,
             }],
         });
 

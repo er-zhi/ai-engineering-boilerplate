@@ -3,14 +3,27 @@
 use crate::error::EngineError;
 use crate::service::Service;
 
-pub const KNOWLEDGE_SEARCH_TOOL_SLUG: &str = "kb_search";
+const RETRIEVAL_TOOL_SLUG_VAR: &str = "RAG_RETRIEVAL_TOOL_SLUG";
 
-fn definitions() -> [(&'static str, engine_core::Graph); 3] {
-    [
+fn retrieval_tool_slug() -> Option<String> {
+    let slug = std::env::var(RETRIEVAL_TOOL_SLUG_VAR).ok()?;
+    let slug = slug.trim().to_owned();
+    (!slug.is_empty()).then_some(slug)
+}
+
+fn definitions() -> Vec<(&'static str, engine_core::Graph)> {
+    let mut graphs = vec![
         ("simple", engine_core::simple_graph()),
-        ("rag", engine_core::rag_graph(KNOWLEDGE_SEARCH_TOOL_SLUG)),
         ("agent", engine_core::agent_graph()),
-    ]
+    ];
+    match retrieval_tool_slug() {
+        Some(slug) => graphs.push(("rag", engine_core::rag_graph(&slug))),
+        None => tracing::info!(
+            var = RETRIEVAL_TOOL_SLUG_VAR,
+            "no retrieval tool named, so the rag graph is not registered"
+        ),
+    }
+    graphs
 }
 
 pub async fn register_all(service: &Service) {
@@ -55,6 +68,17 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(after_second_boot, after_first_boot);
+    }
+
+    #[test]
+    fn a_retrieval_graph_is_registered_only_when_a_tool_is_named_for_it() {
+        // Which tool retrieves is the Tool service's to own and an operator's to withdraw, so the
+        // slug is theirs to name. Declaring it here would register a node pointing at a slug that
+        // `built-in-tools.json` can take out of the catalog.
+        assert!(
+            !definitions().iter().any(|(name, _)| *name == "rag"),
+            "with no tool named, the rag graph must not be registered against a guessed slug"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
