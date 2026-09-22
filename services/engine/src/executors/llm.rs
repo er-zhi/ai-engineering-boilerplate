@@ -174,6 +174,29 @@ person something, or says plainly that it could not find out";
 /// What replaces a promise. It reports the failure, because the undertaking will not be kept: the
 /// reply ends the turn.
 const PROMISE_REFUSED: &str = "I couldn't get that just now. Ask me again and I'll try.";
+const PROMISE_CORRECTION: &str = r#" It undertook to do something rather than
+reporting what came back. Nothing runs after your reply. Answer from what is already in front of
+you.
+"#;
+
+const GROUNDED_ID: &str = "grounded";
+/// Below this the reply says something the material does not. Measured against a reply that named
+/// a place when the material held a temperature (0.05), an invented figure (0.03), and two correct
+/// answers (0.82 and 0.98): the gap is wide, so the midpoint is not a fine judgement.
+const GROUNDED_THRESHOLD: f64 = 0.5;
+const GROUNDED_INSTRUCTIONS: &str = "Is every specific value in the reply present in the material?";
+const GROUNDED_WHEN_TRUE: &str =
+    "every name, number and fact in the reply can be found in the material";
+const GROUNDED_WHEN_FALSE: &str =
+    "the reply states a name, number or fact the material does not contain";
+/// What replaces an answer nothing supports. A value the material does not hold is worse than no
+/// value, because it reads exactly like one that was looked up.
+const UNGROUNDED_REFUSED: &str = "I got something back but couldn't read the answer out of it.";
+const UNGROUNDED_CORRECTION: &str = r#" Nothing in what came back says it.
+Write the reply again using only the values in front of you, and do not repeat the refused words.
+The question names a subject; what came back holds what was measured about it, and the measurement
+is the answer — never the subject's own name. If what came back does not hold the answer, say so.
+"#;
 const TOOL_QUESTION_ID: &str = "tool";
 const NO_TOOL_OPTION: &str = "none";
 
@@ -556,34 +579,73 @@ impl LlmTaskExecutor {
     /// rather than the question. A promise is replaced with the plain truth. An unavailable or
     /// unconfident decision leaves the reply exactly as it was: this guard may only remove a
     /// promise, never invent a failure.
-    async fn without_an_empty_promise(&self, output: Value) -> Value {
-        let Some(reply) = output.get("reply").and_then(Value::as_str).filter(|reply| {
-            !reply.is_empty() && output.get("tool_call").is_none_or(Value::is_null)
-        }) else {
+    async fn checked_against(
+        &self,
+        request: &CompleteRequest,
+        material: &Value,
+        output: Value,
+    ) -> Value {
+        let Some(faults) = self.faults_in(material, &output).await else {
             return output;
         };
-        let Some(request) = promise_request(reply) else {
+        if faults.sound() {
             return output;
+        }
+        // One more ask, with the fault stated. A reply that named the wrong thing usually has the
+        // right thing in front of it and reached past it; told so, it reaches for it again. This is
+        // worth one generative call because the alternative is telling the person nothing when the
+        // answer was already in hand.
+        tracing::info!(
+            ?faults,
+            "the reply did not hold up against what came back, asking again"
+        );
+        let rejected = output
+            .get("reply")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut again = request.clone();
+        again.system_prompt.push_str(&faults.correction(&rejected));
+        let Ok(second) = self.complete_with_retries(&again).await else {
+            return refused(output, faults.refusal());
         };
-        // The client already carries DECIDE_CALL_TIMEOUT, so a slow decider costs the same bounded
-        // wait here as anywhere else, and a failure leaves the reply untouched.
+        let second = merge_usage(&output, second);
+        match self.faults_in(material, &second).await {
+            Some(faults) if !faults.sound() => {
+                tracing::warn!(
+                    ?faults,
+                    "the second reply did not hold up either, answering plainly"
+                );
+                refused(second, faults.refusal())
+            }
+            _ => second,
+        }
+    }
+
+    /// Both judgements in one `Decide`: whether the reply only undertakes work, and whether every
+    /// specific thing in it is present in what came back. `None` when there is nothing to judge or
+    /// the decider could not be reached — these guards may only catch a fault, never invent one.
+    async fn faults_in(&self, material: &Value, output: &Value) -> Option<Faults> {
+        let reply = output
+            .get("reply")
+            .and_then(Value::as_str)
+            .filter(|reply| {
+                !reply.is_empty() && output.get("tool_call").is_none_or(Value::is_null)
+            })?;
+        let request = reply_check_request(material, reply)?;
         let decided = match self.decider.decide(request).await {
             Ok(response) => response.into_owned(),
             Err(error) => {
-                tracing::warn!(%error, "could not check the reply for a promise, leaving it as it is");
-                return output;
+                tracing::warn!(%error, "could not check the reply, leaving it as it is");
+                return None;
             }
         };
-        if !find_noul(&decided.answers, PROMISE_ID).is_some_and(|value| value > PROMISE_THRESHOLD) {
-            return output;
-        }
-        tracing::info!("the reply undertook work that never ran, answering plainly instead");
-        let usage = decide_usage_value(&decided);
-        let mut replaced = output;
-        if let Some(object) = replaced.as_object_mut() {
-            object.insert("reply".to_owned(), json!(PROMISE_REFUSED));
-        }
-        merge_usage(&usage, replaced)
+        Some(Faults {
+            promises: find_noul(&decided.answers, PROMISE_ID)
+                .is_some_and(|value| value > PROMISE_THRESHOLD),
+            ungrounded: find_noul(&decided.answers, GROUNDED_ID)
+                .is_some_and(|value| value < GROUNDED_THRESHOLD),
+        })
     }
 
     /// One `Complete` in compose-only mode, then the dispatch the decision already committed to.
@@ -641,7 +703,7 @@ impl LlmTaskExecutor {
         // instructions say that this means call again rather than that the task is over.
         let request = complete_request(config, &state_with_result);
         let output = self.complete_with_retries(&request).await?;
-        let output = self.without_an_empty_promise(output).await;
+        let output = self.checked_against(&request, &result, output).await;
         let output = merge_usage(decide_usage, merge_usage(&spent, output));
         Ok(attach_fast_tool_call(output, &call, result))
     }
@@ -662,7 +724,7 @@ impl LlmTaskExecutor {
         let state_with_result = state_with_extra_tool_result(state, result.clone());
         let request = complete_request(config, &state_with_result);
         let output = self.complete_with_retries(&request).await?;
-        let output = self.without_an_empty_promise(output).await;
+        let output = self.checked_against(&request, &result, output).await;
         let output = merge_usage(decide_usage, output);
         Ok(attach_fast_tool_call(output, call, result))
     }
@@ -1011,17 +1073,84 @@ fn instructed(id: &str, instructions: Value) -> Option<Question> {
 
 /// Asked of the finished reply, never of the question. Phrased about what the sentence does, so it
 /// names no subject and no tool — the `gate-architecture` rule holds here as everywhere.
-fn promise_request(reply: &str) -> Option<DecideRequest> {
-    let mut request: DecideRequest = serde_json::from_value(json!({ "state": reply })).ok()?;
-    let mut question = instructed(PROMISE_ID, json!(PROMISE_INSTRUCTIONS))?;
+fn reply_check_request(material: &Value, reply: &str) -> Option<DecideRequest> {
+    let state = json!({"material": material, "reply": reply});
+    let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
+    request.questions = vec![
+        noul_question(
+            PROMISE_ID,
+            PROMISE_INSTRUCTIONS,
+            PROMISE_WHEN_TRUE,
+            PROMISE_WHEN_FALSE,
+        )?,
+        noul_question(
+            GROUNDED_ID,
+            GROUNDED_INSTRUCTIONS,
+            GROUNDED_WHEN_TRUE,
+            GROUNDED_WHEN_FALSE,
+        )?,
+    ];
+    Some(request)
+}
+
+fn noul_question(
+    id: &str,
+    instructions: &str,
+    when_true: &str,
+    when_false: &str,
+) -> Option<Question> {
+    let mut question = instructed(id, json!(instructions))?;
     question.kind = Noul {
-        when_true: Some(PROMISE_WHEN_TRUE.to_owned()),
-        when_false: Some(PROMISE_WHEN_FALSE.to_owned()),
+        when_true: Some(when_true.to_owned()),
+        when_false: Some(when_false.to_owned()),
         ..Default::default()
     }
     .into();
-    request.questions = vec![question];
-    Some(request)
+    Some(question)
+}
+
+/// What the two guards found. Kept together because they are one `Decide` and one decision about
+/// what the person is shown.
+#[derive(Clone, Copy, Debug)]
+struct Faults {
+    promises: bool,
+    ungrounded: bool,
+}
+
+impl Faults {
+    fn sound(self) -> bool {
+        !self.promises && !self.ungrounded
+    }
+
+    /// What to tell the model on the second ask. The rejected reply is quoted back: told only that
+    /// it was wrong, a light model writes the same thing again — measured, twice in a row — because
+    /// it cannot tell which part was refused. Shown its own words, it does not repeat them.
+    fn correction(self, rejected: &str) -> String {
+        let fault = if self.ungrounded {
+            UNGROUNDED_CORRECTION
+        } else {
+            PROMISE_CORRECTION
+        };
+        format!("\n\nYour previous reply was refused: \"{rejected}\".{fault}")
+    }
+
+    /// What the person is told when the second ask fails too. Reporting the failure beats sending
+    /// either an undertaking nothing will keep or a value nothing supports.
+    fn refusal(self) -> &'static str {
+        if self.ungrounded {
+            UNGROUNDED_REFUSED
+        } else {
+            PROMISE_REFUSED
+        }
+    }
+}
+
+/// Replaces a reply that did not hold up, keeping everything else the output carried.
+fn refused(mut output: Value, reply: &str) -> Value {
+    if let Some(object) = output.as_object_mut() {
+        object.insert("reply".to_owned(), json!(reply));
+    }
+    output
 }
 
 /// One option per entry in the live catalog the dispatcher injected, plus `NO_TOOL_OPTION` — read
@@ -1576,6 +1705,10 @@ mod tests {
         decide_span: Mutex<Option<(String, f64, f64, f64)>>,
         decide_needs_external_info: Mutex<Option<f64>>,
         decide_promise: Mutex<Option<f64>>,
+        /// One verdict per check, in order; the last stands for every check after it. A retry only
+        /// means anything if the second look can come back different.
+        decide_grounded: Mutex<Vec<f64>>,
+        grounded_checks: Mutex<usize>,
         decide_calls: Mutex<usize>,
         decide_hangs: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     }
@@ -1590,6 +1723,8 @@ mod tests {
                 decide_span: Mutex::new(None),
                 decide_needs_external_info: Mutex::new(None),
                 decide_promise: Mutex::new(None),
+                decide_grounded: Mutex::new(Vec::new()),
+                grounded_checks: Mutex::new(0),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
             }
@@ -1604,6 +1739,8 @@ mod tests {
                 decide_span: Mutex::new(None),
                 decide_needs_external_info: Mutex::new(None),
                 decide_promise: Mutex::new(None),
+                decide_grounded: Mutex::new(Vec::new()),
+                grounded_checks: Mutex::new(0),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
             }
@@ -1643,6 +1780,11 @@ mod tests {
         /// Arms the guard's verdict over a finished reply.
         fn answer_decide_promise(&self, noul: f64) {
             *self.decide_promise.lock().expect("lock") = Some(noul);
+        }
+
+        /// Arms whether the reply's values were found in what came back, one verdict per check.
+        fn answer_decide_grounded(&self, nouls: &[f64]) {
+            *self.decide_grounded.lock().expect("lock") = nouls.to_vec();
         }
 
         /// Accepts a `Decide` call and then never answers it, so a test can observe it abandoned
@@ -1700,7 +1842,8 @@ mod tests {
             let tool = self.decide_tool.lock().expect("lock").clone();
             let span = self.decide_span.lock().expect("lock").clone();
             let promise = *self.decide_promise.lock().expect("lock");
-            if tool.is_none() && promise.is_none() {
+            let grounded = self.decide_grounded.lock().expect("lock").clone();
+            if tool.is_none() && promise.is_none() && grounded.is_empty() {
                 return Err(connectrpc::ConnectError::unavailable(
                     "configured fake decider failure",
                 ));
@@ -1712,6 +1855,15 @@ mod tests {
                 .filter_map(|question| {
                     if question.id == PROMISE_ID {
                         return promise.map(|noul| noul_answer(PROMISE_ID, noul));
+                    }
+                    if question.id == GROUNDED_ID {
+                        if grounded.is_empty() {
+                            return None;
+                        }
+                        let mut checks = self.grounded_checks.lock().expect("lock");
+                        let noul = grounded[(*checks).min(grounded.len() - 1)];
+                        *checks += 1;
+                        return Some(noul_answer(GROUNDED_ID, noul));
                     }
                     scripted_answer(&question.id, &tool, &span)
                 })
@@ -2829,6 +2981,100 @@ mod tests {
             .expect("execute");
 
         assert_eq!(output["reply"], json!(NOTHING_CONNECTED));
+    }
+
+    /// Measured live: asked for the weather in a capital named indirectly, the source returned a
+    /// temperature and the model replied with the city's name — answering a question nobody asked,
+    /// with a word the material does not contain. Told so, it answers from what is in front of it.
+    #[tokio::test]
+    async fn a_reply_stating_what_the_material_does_not_hold_is_asked_again() {
+        let fake = Arc::new(FakeLlmRouter::then(
+            r#"{"tool_call": null, "reply": "Bishkek"}"#,
+            r#"{"tool_call": null, "reply": "22.11"}"#,
+        ));
+        fake.answer_decide_tool("weather", 0.95);
+        fake.answer_decide_grounded(&[0.05, 0.98]);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 22.11}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("weather", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!("22.11"));
+        let asked_again = fake.system_prompt(1);
+        assert!(
+            asked_again.contains("\"Bishkek\""),
+            "the second ask quotes the words it refused, or the model writes them again: \
+             {asked_again}"
+        );
+    }
+
+    /// Twice ungrounded, the turn says so. A value the material does not hold is worse than no
+    /// value, because it reads exactly like one that was looked up.
+    #[tokio::test]
+    async fn a_reply_that_stays_ungrounded_is_refused_rather_than_sent() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "31.4 degrees"}"#,
+        ));
+        fake.answer_decide_tool("weather", 0.95);
+        fake.answer_decide_grounded(&[0.03]);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 22.11}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("weather", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!(UNGROUNDED_REFUSED));
+    }
+
+    /// The guards may only catch a fault, never invent one. A grounded, finished answer passes
+    /// untouched however short it is — a bare value is what this system answers with.
+    #[tokio::test]
+    async fn a_grounded_answer_passes_untouched() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "22.11"}"#,
+        ));
+        fake.answer_decide_tool("weather", 0.95);
+        fake.answer_decide_grounded(&[0.98]);
+        fake.answer_decide_promise(0.02);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 22.11}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("weather", "query")],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute("llm", &config, &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(output["reply"], json!("22.11"));
+        assert_eq!(fake.calls(), 1, "and costs no second generative call");
     }
 
     /// The promise guard now sits where a promise is still possible: after a source has run, over
