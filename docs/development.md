@@ -48,6 +48,26 @@ they drift:
   (`chat = { path = ".", features = ["test-support"] }`). Without that the tests are not compiled at
   all by a plain `cargo nextest run --workspace` — they are skipped, not reported.
 
+## Golden Cases
+
+The deterministic suite proves the code does what it was written to do. It cannot prove the product
+answers. That is what `golden/` is for: end-to-end cases run against a live stack through Gateway —
+the same door a browser uses — covering the declarative tools, multi-theme splitting and the
+knowledge base.
+
+```bash
+set -a && source .env && set +a
+cargo run -p golden > /tmp/golden-run.json
+```
+
+The runner judges nothing. Answers are generated text, so it records what happened — how many
+topics a message opened, what each was asked, what came back, when each finished — and a model
+reads the run against each case's written expectation. The procedure, including the provider check
+that has to come first, is in [the golden skill](../.agents/skills/golden/SKILL.md).
+
+These are not part of `cargo nextest run --workspace`: they need the stack up, real API keys and a
+judgement no assertion makes.
+
 ## Image Build Speed
 
 `rust-toolchain.toml`'s channel and the `FROM rust:<version>-alpine` tag in every

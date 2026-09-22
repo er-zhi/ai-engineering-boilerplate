@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "engine-core", "services/chat", "services/crawler", "services/engine", "services/gateway", "services/knowledge-base", "services/llm-router", "services/tool"]
+members = ["common", "engine-core", "golden", "services/chat", "services/crawler", "services/engine", "services/gateway", "services/knowledge-base", "services/llm-router", "services/tool"]
 resolver = "3"
 
 [workspace.package]

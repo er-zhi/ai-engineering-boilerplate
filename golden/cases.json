@@ -1,0 +1,122 @@
+[
+  {
+    "id": "weather-named-place",
+    "kind": "chat",
+    "message": "what is the weather in Bishkek?",
+    "expect": "One topic. The answer gives the weather in Bishkek — a temperature, and possibly the sky, humidity or wind. It is a value read now, not a description of how to find one, and not a promise to look it up."
+  },
+  {
+    "id": "weather-and-knowledge",
+    "kind": "chat",
+    "message": "what is the weather in Bishkek and what is the capital of Kyrgyzstan?",
+    "expect": "Two topics, or one topic that answers both. Every answer is a finished answer: a temperature for the weather, and Bishkek for the capital. Neither answer promises to look anything up."
+  },
+  {
+    "id": "three-themes-with-a-reference",
+    "kind": "chat",
+    "message": "capital of Kyrgyzstan and what the wheather there, and NASDAQ today",
+    "expect": "Three topics: the capital, the weather, and the NASDAQ. The weather topic must not ask where — the reference to 'there' has to have been resolved from the message. Every topic completes with a value: Bishkek, a temperature, and a NASDAQ figure. No answer promises work. The misspelling of 'weather' must not matter."
+  },
+  {
+    "id": "currency-pair",
+    "kind": "chat",
+    "message": "what is the exchange rate of the dollar to the euro?",
+    "expect": "One topic, answered with a number roughly between 0.5 and 1.5. This tool takes two separate arguments, so the arguments had to be composed rather than copied from the message — the answer is the proof that composing worked."
+  },
+  {
+    "id": "crypto-spot",
+    "kind": "chat",
+    "message": "what is BTC-USD trading at?",
+    "expect": "One topic, answered with a price. A number, not an explanation of where to find the price."
+  },
+  {
+    "id": "market-index",
+    "kind": "chat",
+    "message": "NASDAQ today",
+    "expect": "One topic, answered with an index level — a number in the thousands or tens of thousands."
+  },
+  {
+    "id": "pure-knowledge-no-tool",
+    "kind": "chat",
+    "message": "what is the capital of Kyrgyzstan?",
+    "expect": "One topic answered 'Bishkek', and answered quickly — under about two seconds — because nothing needed looking up. A slow answer here means a tool ran that should not have."
+  },
+  {
+    "id": "kb-what-are-skills",
+    "kind": "chat",
+    "message": "what are agent skills?",
+    "expect": "One topic. The answer describes skills as specialised knowledge Claude loads when a request matches them, and reads like it came from the knowledge base rather than from a web search — concrete and specific, not a generic definition of the word 'skill'."
+  },
+  {
+    "id": "kb-which-courses",
+    "kind": "chat",
+    "message": "which Academy courses exist?",
+    "expect": "One topic. The answer names several actual Claude Academy courses, such as 'Introduction to agent skills', 'AI Capabilities and Limitations' or 'Teaching AI Fluency'. Invented course names are a failure."
+  },
+  {
+    "id": "kb-mcp",
+    "kind": "chat",
+    "message": "what is the Model Context Protocol?",
+    "expect": "One topic, answered with what MCP is, drawing on the knowledge base's own MCP material. It must be an answer, not a promise to look it up."
+  },
+  {
+    "id": "kb-prompt-caching",
+    "kind": "chat",
+    "message": "how does prompt caching work?",
+    "expect": "One topic. The answer explains prompt caching concretely. The knowledge base holds several pages on it, so a vague or hedging answer means the knowledge base was not consulted."
+  },
+  {
+    "id": "kb-and-tool-together",
+    "kind": "chat",
+    "message": "what are agent skills, and what is the weather in Tokyo?",
+    "expect": "Two topics, arriving independently. One answers from the knowledge base, the other with a Tokyo temperature. Neither waits for the other, and neither promises."
+  },
+  {
+    "id": "kb-absent-subject",
+    "kind": "chat",
+    "message": "what does the knowledge base say about the migratory routes of Arctic terns?",
+    "expect": "One topic. The knowledge base holds Claude Academy material and nothing about Arctic terns, so the honest outcomes are: saying it could not find anything, or answering from general knowledge while making clear it is not from the knowledge base. Inventing a knowledge-base document is a failure."
+  },
+  {
+    "id": "three-tools-at-once",
+    "kind": "chat",
+    "message": "weather in Tokyo, the dollar to euro rate, and BTC-USD",
+    "expect": "Three topics, each completing on its own as it becomes ready rather than all at the end. Each answer is a value: a temperature, a rate, a price."
+  },
+  {
+    "id": "not-a-request",
+    "kind": "chat",
+    "message": "thanks, that's helpful",
+    "expect": "No topic is started, or the turn asks what to find out. Opening a topic and answering something here is a failure — there was no request."
+  },
+  {
+    "id": "follow-up-reference",
+    "kind": "chat",
+    "message": "the capital of Kyrgyzstan, and how warm it is there right now",
+    "expect": "Two topics. The second must name the place it asks about — a topic is answered with its own question and nothing else, so a question left saying 'there' reaches an agent that cannot know where. Both complete with values."
+  },
+  {
+    "id": "kb-search-skills",
+    "kind": "kb",
+    "query": "agent skills",
+    "expect": "Several results, whose titles are Claude Academy pages about skills — 'What are skills?', 'Introduction to agent skills', 'Sharing skills' or similar."
+  },
+  {
+    "id": "kb-search-mcp",
+    "kind": "kb",
+    "query": "Model Context Protocol",
+    "expect": "Several results about MCP, such as 'Introducing MCP' or 'Model Context Protocol: Advanced Topics'."
+  },
+  {
+    "id": "kb-search-caching",
+    "kind": "kb",
+    "query": "prompt caching",
+    "expect": "Several results about prompt caching, such as 'Prompt caching in action' or 'Rules of prompt caching'."
+  },
+  {
+    "id": "kb-search-unrelated",
+    "kind": "kb",
+    "query": "Arctic tern migration routes",
+    "expect": "Either no results, or results that are plainly unrelated Claude Academy pages. The point is that nothing about Arctic terns is returned as though it were held — a semantic index will return its nearest neighbours, and that is fine as long as they are not dressed up as matches."
+  }
+]
