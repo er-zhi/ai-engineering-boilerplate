@@ -13,8 +13,8 @@ use common::proto::llm_router::v1::{
 use common::proto::tools::v1::{ExecuteRequest, ExecuteResponse, ExecuteStatus, ToolServiceClient};
 use connectrpc::client::HttpClient;
 use engine_core::{
-    FAST_TOOL_CALL_FIELD, LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError,
-    TaskExecutor, ToolCall,
+    FAST_TOOL_CALL_FIELD, LlmOutput, PRIOR_MATERIAL_STATE_KEY, TOOL_RESULT_ERROR_KEY,
+    TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
 };
 use serde_json::{Value, json};
 
@@ -36,6 +36,9 @@ pub enum Mode {
     /// A source is needed and only its arguments are missing. Tools are offered; a reply is
     /// refused.
     ComposeOnly,
+    /// The answer is in material an earlier turn already fetched. No tools are listed — there is
+    /// nothing to fetch — and the reply is judged against that material.
+    FromMaterial,
 }
 
 static COMPOSE_ONLY_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
@@ -43,6 +46,8 @@ static COMPOSE_ONLY_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
         r#"
 Call one of the tools below. Respond with exactly this JSON and nothing else:
 {}
+Argument values come from the message itself, or from material already shown to you. Never supply
+one of your own.
 Do not answer from your own knowledge, and do not describe what you are about to do — a reply
 without a tool call is not accepted here.
 "#,
@@ -53,6 +58,21 @@ without a tool call is not accepted here.
             })
             .expect("a ToolCall always serializes"),
             reply: Value::Null,
+        }),
+    )
+});
+
+static FROM_MATERIAL_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"
+Answer from the material below, which this system looked up earlier in this conversation. Use
+only what is there — including what was asked for, which the material records beside each result.
+Respond with exactly this JSON and nothing else:
+{}
+"#,
+        shape_of(LlmOutput {
+            tool_call: Value::Null,
+            reply: Value::String(ANSWER_PLACEHOLDER.to_owned()),
         }),
     )
 });
@@ -179,6 +199,27 @@ reporting what came back. Nothing runs after your reply. Answer from what is alr
 you.
 "#;
 
+/// Asked of a composed argument, before anything is dispatched. Not "does the message name it" —
+/// that question refuses a value the message describes rather than spells, and measured at 0.05 for
+/// a place the message pins down exactly. This one asks whether the message *points* at the value,
+/// which a name, an unambiguous description and a normalisation of either all do, and a pronoun
+/// does not.
+///
+/// Measured over 18 pairs: everything the message points at scored 0.82–0.97 — a place named, a
+/// place described ("the capital of Japan"), currency codes normalised from "dollar to euro", an
+/// exchange symbol normalised from "NASDAQ", and a place named in Russian. Everything it does not
+/// scored 0.31–0.70 — four forms of "there", "it", a place invented outright, and a place appearing
+/// where the message named none.
+const POINTED_AT_ID: &str = "pointed_at";
+/// The measured bands are 0.31–0.70 and 0.82–0.97; this sits in the gap.
+const POINTED_AT_THRESHOLD: f64 = 0.8;
+const POINTED_AT_INSTRUCTIONS: &str = "Does `message` refer to `value`, by that name or by any \
+description that can only mean it?";
+const POINTED_AT_WHEN_TRUE: &str = "the message points at this one thing, whether by naming it or \
+by describing it unambiguously";
+const POINTED_AT_WHEN_FALSE: &str =
+    "the message does not point at this thing at all, or points at it only vaguely";
+
 const GROUNDED_ID: &str = "grounded";
 /// Below this the reply says something the material does not. Measured against a reply that named
 /// a place when the material held a temperature (0.05), an invented figure (0.03), and two correct
@@ -199,6 +240,16 @@ is the answer — never the subject's own name. If what came back does not hold 
 "#;
 const TOOL_QUESTION_ID: &str = "tool";
 const NO_TOOL_OPTION: &str = "none";
+/// Offered only when an earlier turn of the same conversation left something behind. It is a source
+/// like any other in the choice — the question "which source answers this?" has one more answer —
+/// so a follow-up about what was already found is routed rather than declined.
+const PRIOR_OPTION: &str = "already_found";
+/// Measured against three wordings over six follow-ups: this one routed five correctly, including
+/// a question about a value inside the material and one about what was looked up, while still
+/// sending "and what about Osaka?" to fetch afresh and declining what nothing covers.
+const PRIOR_DESCRIPTION: &str = "the material already shown above. Choose this when the answer is \
+somewhere in that material — including what was asked for, which the material records beside each \
+result — so nothing new needs looking up";
 
 /// The one question the whole turn now turns on. It asks which of the sources the operator has
 /// connected covers what is being asked — a question about the catalog — and not whether the model
@@ -221,12 +272,18 @@ does.";
 /// least afford to be guessed at.
 /// The decline's own words. They name what can be answered and ask which of it was meant, because a
 /// person who asked something adjacent needs a way back in — a bare refusal leaves them guessing at
-/// what the system is for.
-const DECLINE_OPENING: &str = "I can only answer from what I'm connected to: ";
+/// what the system is for. Declared in `common` because Chat has to recognise it: a topic that
+/// declined found nothing, and its text is never context for a later turn.
+use common::agent_replies::{CLARIFY_OPENING, DECLINE_OPENING};
 const DECLINE_CLOSING: &str = "Which of those did you mean?";
 /// When the catalog is empty there is nothing to offer, and listing nothing would read as a bug.
 const NOTHING_CONNECTED: &str =
     "I'm not connected to anything I can answer from at the moment. Please try again shortly.";
+/// The clarification's opening. The turn found a source and could not fill it in; asking is the
+/// only honest move, and it is a question rather than a refusal because the person can answer it in
+/// one word.
+/// When the schema says nothing about the argument, ask in the most general terms there are.
+const MISSING_VALUE_FALLBACK: &str = "to know what to look it up for";
 const NO_TOOL_DESCRIPTION: &str =
     "no source listed here holds what this question asks for, or the message asks for nothing";
 
@@ -336,15 +393,18 @@ pub fn build_prompt_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> (S
         system.push_str(match mode {
             Mode::Loop => &TOOL_CALLING_INSTRUCTIONS,
             Mode::ComposeOnly => &COMPOSE_ONLY_INSTRUCTIONS,
+            Mode::FromMaterial => &FROM_MATERIAL_INSTRUCTIONS,
         });
     }
-    if !config.available_tools.is_empty() {
+    // Nothing is listed when the answer is already in hand: a tool the model cannot see is a tool
+    // it cannot go looking for instead of reading what is in front of it.
+    if !config.available_tools.is_empty() && mode != Mode::FromMaterial {
         system.push_str("\n\nAvailable tools:\n");
         for tool in &config.available_tools {
             system.push_str(&format!("- {}: {}\n", tool.name, tool.description));
         }
     }
-    if config.tool_calling {
+    if config.tool_calling && mode != Mode::FromMaterial {
         system.push_str(TOOL_USE_POLICY);
     }
     // The style block is about a reply, and it is the last thing the model reads. In compose-only
@@ -362,19 +422,54 @@ pub fn build_prompt_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> (S
 }
 
 fn rendered_tool_results(state: &Value) -> impl Iterator<Item = (usize, &Value)> {
-    let results = state
+    let prior = state
+        .get(PRIOR_MATERIAL_STATE_KEY)
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let fetched = state
         .get(TOOL_RESULT_STATE_KEY)
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let first_rendered = results.len().saturating_sub(RENDERED_TOOL_RESULTS);
-    results.iter().enumerate().skip(first_rendered)
+    // Carried material first, this turn's second, and only the last few of the two together: a
+    // model reads the most recent, and everything older is prompt weight.
+    let all: Vec<&Value> = prior.iter().chain(fetched.iter()).collect();
+    let first_rendered = all.len().saturating_sub(RENDERED_TOOL_RESULTS);
+    all.into_iter().enumerate().skip(first_rendered)
 }
 
-fn render_tool_result(index: usize, result: &Value) -> String {
+/// What an earlier turn found, as the text a decision and a model will both read. `None` when this
+/// turn inherited nothing, which is every turn that is not a follow-up.
+fn rendered_prior_material(state: &Value) -> Option<String> {
+    let records = state.get(PRIOR_MATERIAL_STATE_KEY)?.as_array()?;
+    if records.is_empty() {
+        return None;
+    }
+    let first = records.len().saturating_sub(RENDERED_TOOL_RESULTS);
+    Some(
+        records
+            .iter()
+            .enumerate()
+            .skip(first)
+            .map(|(index, record)| render_tool_result(index, record))
+            .collect(),
+    )
+}
+
+fn render_tool_result(index: usize, record: &Value) -> String {
+    // A record written before this shape existed, or by a path that stores the bare output, renders
+    // as it always did.
+    let (asked, result) = match record.get("result") {
+        Some(result) => (record.get("args"), result),
+        None => (None, record),
+    };
+    let asked = asked.map_or_else(String::new, |args| format!(" (asked for {args})"));
     match result.get(TOOL_RESULT_ERROR_KEY).and_then(Value::as_str) {
-        Some(error) => format!("\n\nTool result {index} — ERROR: {}", truncated(error)),
+        Some(error) => format!(
+            "\n\nTool result {index}{asked} — ERROR: {}",
+            truncated(error)
+        ),
         None => format!(
-            "\n\nTool result {index}: {}",
+            "\n\nTool result {index}{asked}: {}",
             truncated(&result.to_string())
         ),
     }
@@ -527,6 +622,10 @@ enum FastPath {
     /// not offered the choice of answering, because that is the choice it gets wrong: given both,
     /// a light model replies "I will look that up" and the turn ends having called nothing.
     ComposeOnly { tool: String, decide_usage: Value },
+    /// The question asks about what an earlier turn already found, and the decision said so. The
+    /// one answer-only form the design allows: over material this system fetched, never over a bare
+    /// question, and checked against that material afterwards like any other answer.
+    FromMaterial { decide_usage: Value },
     /// No connected source covers the question — `none`, confidently — or the decision could not
     /// be reached at all. Both end the turn the same way, saying what can be answered and asking
     /// which of it was meant. They are one variant because they are one outcome for the person:
@@ -557,7 +656,11 @@ impl LlmTaskExecutor {
             return None;
         }
         let question = ExecutionInput::in_state(state).question;
-        match self.decide_fast_path(config, &question).await {
+        let prior = rendered_prior_material(state);
+        match self
+            .decide_fast_path(config, &question, prior.as_deref())
+            .await
+        {
             FastPath::ToolCall { call, decide_usage } => Some(
                 self.run_fast_tool_call(config, state, &call, &decide_usage, idempotency_key)
                     .await,
@@ -566,8 +669,31 @@ impl LlmTaskExecutor {
                 self.compose_tool_call(config, state, &tool, &decide_usage, idempotency_key)
                     .await,
             ),
+            FastPath::FromMaterial { decide_usage } => Some(
+                self.answer_from_material(config, state, &decide_usage)
+                    .await,
+            ),
             FastPath::Decline { decide_usage } => Some(Ok(decline(config, &decide_usage))),
         }
+    }
+
+    /// Answers over what an earlier turn found: no tools listed, the material rendered into the
+    /// prompt, and the reply checked against that material afterwards. Safe as answer-only never
+    /// was on a bare question, because here there is something to check it against.
+    async fn answer_from_material(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        decide_usage: &Value,
+    ) -> Result<Value, TaskError> {
+        let material = state
+            .get(PRIOR_MATERIAL_STATE_KEY)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let request = complete_request_for(config, state, Mode::FromMaterial);
+        let output = self.complete_with_retries(&request).await?;
+        let output = self.checked_against(&request, &material, output).await;
+        Ok(merge_usage(decide_usage, without_tool_call(output)))
     }
 
     /// The last thing between a promise and the person. Twice offered tools and twice answering
@@ -622,6 +748,77 @@ impl LlmTaskExecutor {
         }
     }
 
+    /// One compose-only `Complete`, and a second with the refusal stated if the first carried no
+    /// call. Returns what was spent either way; the caller reads the call out of it.
+    async fn composed(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        tool: &str,
+    ) -> Result<Value, TaskError> {
+        let request = complete_request_for(config, state, Mode::ComposeOnly);
+        let spent = self.complete_with_retries(&request).await?;
+        if composed_call(&spent).is_some() {
+            return Ok(spent);
+        }
+        tracing::info!(
+            tool,
+            "compose-only reply carried no tool call, asking once more"
+        );
+        let mut again = request;
+        again.system_prompt.push_str(COMPOSE_REFUSAL);
+        let second = self.complete_with_retries(&again).await?;
+        Ok(merge_usage(&spent, second))
+    }
+
+    /// `Some(a question back)` when the message points at no such value as the one composed, and
+    /// the turn asks for it instead of dispatching.
+    async fn asked_for_instead(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        call: &ToolCall,
+    ) -> Option<Value> {
+        let asked = self.not_pointed_at(state, call).await?;
+        tracing::info!(
+            tool = call.name,
+            value = %asked,
+            "the message points at no such value, asking for it"
+        );
+        Some(clarify(self.schema_of(config, &call.name), &Value::Null))
+    }
+
+    /// `Some(the composed value)` when the message points at no such thing. This is the only guard
+    /// that can reach a wrong argument: dispatched, the source answers for whatever it was asked,
+    /// the reply is faithfully grounded in that answer, and every later check passes. Measured, the
+    /// composed value `"there"` reached a village of that name and its weather scored 0.96 on
+    /// grounding.
+    ///
+    /// Spent only on the composing path, which already costs a generative call; the dispatch path
+    /// settles its argument from the decision and pays nothing.
+    async fn not_pointed_at(&self, state: &Value, call: &ToolCall) -> Option<String> {
+        let question = ExecutionInput::in_state(state).question;
+        let request = pointed_at_request(&question, &call.args)?;
+        let decided = match self.decider.decide(request).await {
+            Ok(response) => response.into_owned(),
+            Err(error) => {
+                tracing::warn!(%error, "could not check the composed value, dispatching it as it is");
+                return None;
+            }
+        };
+        let pointed = find_noul(&decided.answers, POINTED_AT_ID)?;
+        (pointed < POINTED_AT_THRESHOLD).then(|| call.args.to_string())
+    }
+
+    /// The chosen tool's published schema, for wording the question back to the person.
+    fn schema_of<'a>(&self, config: &'a LlmNodeConfig, name: &str) -> &'a str {
+        config
+            .available_tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .map_or("", |tool| tool.input_schema_json.as_str())
+    }
+
     /// Both judgements in one `Decide`: whether the reply only undertakes work, and whether every
     /// specific thing in it is present in what came back. `None` when there is nothing to judge or
     /// the decider could not be reached — these guards may only catch a fault, never invent one.
@@ -660,31 +857,8 @@ impl LlmTaskExecutor {
         decide_usage: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TaskError> {
-        let request = complete_request_for(config, state, Mode::ComposeOnly);
-        let mut spent = self.complete_with_retries(&request).await?;
-        if composed_call(&spent).is_none() {
-            tracing::info!(
-                tool,
-                "compose-only reply carried no tool call, asking once more"
-            );
-            let mut again = request.clone();
-            again.system_prompt.push_str(COMPOSE_REFUSAL);
-            let second = self.complete_with_retries(&again).await?;
-            spent = merge_usage(&spent, second);
-        }
-        let Some(call) = composed_call(&spent).filter(|call| {
-            let known = config
-                .available_tools
-                .iter()
-                .any(|entry| entry.name == call.name);
-            if !known {
-                tracing::warn!(
-                    composed = call.name,
-                    "compose-only named a tool not in this node's catalog"
-                );
-            }
-            known
-        }) else {
+        let spent = self.composed(config, state, tool).await?;
+        let Some(call) = composed_call(&spent).filter(|call| in_catalog(config, call)) else {
             tracing::warn!(
                 tool,
                 "compose-only produced no tool call twice, answering plainly"
@@ -697,8 +871,12 @@ impl LlmTaskExecutor {
                 ),
             ));
         };
+        if let Some(asking) = self.asked_for_instead(config, state, &call).await {
+            return Ok(merge_usage(decide_usage, merge_usage(&spent, asking)));
+        }
         let result = self.dispatch_tool_fast(&call, idempotency_key).await;
-        let state_with_result = state_with_extra_tool_result(state, result.clone());
+        let state_with_result =
+            state_with_extra_tool_result(state, tool_record(&call, result.clone()));
         // Loop, not answer-only: a failed call is shown as an ERROR result, and only the loop's
         // instructions say that this means call again rather than that the task is over.
         let request = complete_request(config, &state_with_result);
@@ -721,7 +899,8 @@ impl LlmTaskExecutor {
         idempotency_key: &str,
     ) -> Result<Value, TaskError> {
         let result = self.dispatch_tool_fast(call, idempotency_key).await;
-        let state_with_result = state_with_extra_tool_result(state, result.clone());
+        let state_with_result =
+            state_with_extra_tool_result(state, tool_record(call, result.clone()));
         let request = complete_request(config, &state_with_result);
         let output = self.complete_with_retries(&request).await?;
         let output = self.checked_against(&request, &result, output).await;
@@ -729,15 +908,16 @@ impl LlmTaskExecutor {
         Ok(attach_fast_tool_call(output, call, result))
     }
 
-    /// Sends one `Decide` whose state is the question alone — not the whole execution state, per
-    /// the vendor's own guidance. Any error or timeout is `FastPath::Decline`: the turn says what it
-    /// that keeps a `Decide` outage from ever costing a turn. The vendor evaluates each question
-    /// independently (`llm_router.proto`'s `DecideRequest` doc), so a confident `tool` pick and a
-    /// confident "no information needed" can — and do — co-occur; `confident_tool_choice` is
-    /// checked first for exactly that reason, and a confident pick that fails the fast-dispatch
-    /// gate still returns `Unavailable`, never falling through to `NoToolNeeded`.
-    async fn decide_fast_path(&self, config: &LlmNodeConfig, question: &str) -> FastPath {
-        let Some(request) = decide_request(question, &config.available_tools) else {
+    /// Sends one `Decide` over the question, and over what an earlier turn found when there is any.
+    /// Not the whole execution state, per the vendor's own guidance. Any error or timeout is
+    /// `FastPath::Decline`, which is what keeps a decider outage from answering from memory.
+    async fn decide_fast_path(
+        &self,
+        config: &LlmNodeConfig,
+        question: &str,
+        prior: Option<&str>,
+    ) -> FastPath {
+        let Some(request) = decide_request(question, &config.available_tools, prior) else {
             return FastPath::Decline {
                 decide_usage: Value::Null,
             };
@@ -757,6 +937,9 @@ impl LlmTaskExecutor {
         let decide_usage = decide_usage_value(&decided);
 
         if let Some(choice) = confident_tool_choice(&decided.answers) {
+            if choice.choice == PRIOR_OPTION {
+                return FastPath::FromMaterial { decide_usage };
+            }
             return match fast_dispatchable_tool_call(
                 choice,
                 &config.available_tools,
@@ -839,6 +1022,14 @@ fn no_tool_results_yet(state: &Value) -> bool {
         .is_none_or(Vec::is_empty)
 }
 
+/// What one dispatch is remembered as: the call and what came back, together. The call is half the
+/// record — "where?" is answered by the argument, not by the temperature — and without it a
+/// follow-up about what was looked up has nothing to read, and the grounding guard judges a reply
+/// against only half of what produced it.
+fn tool_record(call: &ToolCall, result: Value) -> Value {
+    json!({"name": call.name, "args": call.args, "result": result})
+}
+
 fn state_with_extra_tool_result(state: &Value, result: Value) -> Value {
     let mut state = state.clone();
     let mut results: Vec<Value> = state
@@ -856,9 +1047,20 @@ fn state_with_extra_tool_result(state: &Value, result: Value) -> Value {
 /// The JSON `Decide` reads: the question alone, not the whole execution state — see
 /// `try_fast_path`'s doc for why. Two questions ride the same call: `needs_external_information`
 /// is read only when no confident, schema-eligible tool pick is found — see `decide_fast_path`.
-fn decide_request(question: &str, available_tools: &[CatalogEntry]) -> Option<DecideRequest> {
-    let mut request: DecideRequest = serde_json::from_value(json!({ "state": question })).ok()?;
-    request.questions = vec![tool_question(available_tools)?];
+fn decide_request(
+    question: &str,
+    available_tools: &[CatalogEntry],
+    prior: Option<&str>,
+) -> Option<DecideRequest> {
+    // The material travels as the rendered text, not as an object: `google.protobuf.Value` re-sorts
+    // an object's keys and widens its numbers, and the decision should judge what the model will
+    // read.
+    let state = match prior {
+        Some(prior) => json!({"message": question, "already_found": prior}),
+        None => json!(question),
+    };
+    let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
+    request.questions = vec![tool_question(available_tools, prior.is_some())?];
     request
         .questions
         .extend(decidable_questions(question, available_tools));
@@ -1145,6 +1347,40 @@ impl Faults {
     }
 }
 
+/// Whether the message points at every value this call was composed with. A composed argument is
+/// the one place the model may put a word of its own into a request that then comes back looking
+/// like fact: dispatched, the source answers for whatever it was asked, the answer is faithfully
+/// grounded in that, and nothing downstream can tell. Measured: "weather there?" composed
+/// `place: "there"`, a real village in Pakistan, and every later guard passed its weather at 0.96.
+///
+/// An unreachable decider leaves the call alone, the same as every other guard here: this may stop
+/// a call, never invent a reason to.
+fn pointed_at_request(question: &str, args: &Value) -> Option<DecideRequest> {
+    let state = json!({"message": question, "value": args});
+    let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
+    request.questions = vec![noul_question(
+        POINTED_AT_ID,
+        POINTED_AT_INSTRUCTIONS,
+        POINTED_AT_WHEN_TRUE,
+        POINTED_AT_WHEN_FALSE,
+    )?];
+    Some(request)
+}
+
+/// What the turn asks for when a value was needed and the message pointed at none. The wording of
+/// the argument comes from the tool's own schema — operator data — so this names no subject and
+/// costs no generative call.
+fn clarify(input_schema_json: &str, decide_usage: &Value) -> Value {
+    let wanted = decidable_argument(input_schema_json)
+        .map(|(_, description)| description)
+        .unwrap_or_else(|| MISSING_VALUE_FALLBACK.to_owned());
+    let reply = format!("{CLARIFY_OPENING}{wanted}.");
+    merge_usage(
+        decide_usage,
+        json!({"tool_call": Value::Null, "reply": reply}),
+    )
+}
+
 /// Replaces a reply that did not hold up, keeping everything else the output carried.
 fn refused(mut output: Value, reply: &str) -> Value {
     if let Some(object) = output.as_object_mut() {
@@ -1155,7 +1391,7 @@ fn refused(mut output: Value, reply: &str) -> Value {
 
 /// One option per entry in the live catalog the dispatcher injected, plus `NO_TOOL_OPTION` — read
 /// from `available_tools` at runtime, never a name written in Rust.
-fn tool_question(available_tools: &[CatalogEntry]) -> Option<Question> {
+fn tool_question(available_tools: &[CatalogEntry], has_prior: bool) -> Option<Question> {
     let mut options: Vec<ChoiceOption> = available_tools
         .iter()
         .map(|tool| ChoiceOption {
@@ -1164,6 +1400,13 @@ fn tool_question(available_tools: &[CatalogEntry]) -> Option<Question> {
             ..Default::default()
         })
         .collect();
+    if has_prior {
+        options.push(ChoiceOption {
+            name: PRIOR_OPTION.to_owned(),
+            description: Some(PRIOR_DESCRIPTION.to_owned()),
+            ..Default::default()
+        });
+    }
     options.push(ChoiceOption {
         name: NO_TOOL_OPTION.to_owned(),
         description: Some(NO_TOOL_DESCRIPTION.to_owned()),
@@ -1368,6 +1611,32 @@ fn listed(names: &[&str]) -> String {
         [only] => (*only).to_owned(),
         [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
+}
+
+/// Clears a `tool_call` from a reply that was meant to be an answer. The graph edges `llm -> tool`
+/// on that field, so leaving one would send the turn fetching after it had already answered.
+fn without_tool_call(mut output: Value) -> Value {
+    if let Some(object) = output.as_object_mut() {
+        object.insert("tool_call".to_owned(), Value::Null);
+    }
+    output
+}
+
+/// Whether a composed call names something this node's catalog actually carries. A slug from
+/// elsewhere is not a source: it cannot be dispatched, and sending it anyway would bypass the
+/// per-node scoping `available_tools` exists to express.
+fn in_catalog(config: &LlmNodeConfig, call: &ToolCall) -> bool {
+    let known = config
+        .available_tools
+        .iter()
+        .any(|entry| entry.name == call.name);
+    if !known {
+        tracing::warn!(
+            composed = call.name,
+            "compose-only named a tool not in this node's catalog"
+        );
+    }
+    known
 }
 
 /// The `tool_call` a compose-only response carries, if it carries one.
@@ -1708,6 +1977,7 @@ mod tests {
         /// One verdict per check, in order; the last stands for every check after it. A retry only
         /// means anything if the second look can come back different.
         decide_grounded: Mutex<Vec<f64>>,
+        decide_pointed_at: Mutex<Option<f64>>,
         grounded_checks: Mutex<usize>,
         decide_calls: Mutex<usize>,
         decide_hangs: Mutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -1724,6 +1994,7 @@ mod tests {
                 decide_needs_external_info: Mutex::new(None),
                 decide_promise: Mutex::new(None),
                 decide_grounded: Mutex::new(Vec::new()),
+                decide_pointed_at: Mutex::new(None),
                 grounded_checks: Mutex::new(0),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
@@ -1740,6 +2011,7 @@ mod tests {
                 decide_needs_external_info: Mutex::new(None),
                 decide_promise: Mutex::new(None),
                 decide_grounded: Mutex::new(Vec::new()),
+                decide_pointed_at: Mutex::new(None),
                 grounded_checks: Mutex::new(0),
                 decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
@@ -1780,6 +2052,11 @@ mod tests {
         /// Arms the guard's verdict over a finished reply.
         fn answer_decide_promise(&self, noul: f64) {
             *self.decide_promise.lock().expect("lock") = Some(noul);
+        }
+
+        /// Arms whether the message points at the composed value.
+        fn answer_decide_pointed_at(&self, noul: f64) {
+            *self.decide_pointed_at.lock().expect("lock") = Some(noul);
         }
 
         /// Arms whether the reply's values were found in what came back, one verdict per check.
@@ -1843,7 +2120,8 @@ mod tests {
             let span = self.decide_span.lock().expect("lock").clone();
             let promise = *self.decide_promise.lock().expect("lock");
             let grounded = self.decide_grounded.lock().expect("lock").clone();
-            if tool.is_none() && promise.is_none() && grounded.is_empty() {
+            let pointed_at = *self.decide_pointed_at.lock().expect("lock");
+            if tool.is_none() && promise.is_none() && grounded.is_empty() && pointed_at.is_none() {
                 return Err(connectrpc::ConnectError::unavailable(
                     "configured fake decider failure",
                 ));
@@ -1853,6 +2131,9 @@ mod tests {
                 .questions
                 .iter()
                 .filter_map(|question| {
+                    if question.id == POINTED_AT_ID {
+                        return pointed_at.map(|noul| noul_answer(POINTED_AT_ID, noul));
+                    }
                     if question.id == PROMISE_ID {
                         return promise.map(|noul| noul_answer(PROMISE_ID, noul));
                     }
@@ -2983,6 +3264,99 @@ mod tests {
         assert_eq!(output["reply"], json!(NOTHING_CONNECTED));
     }
 
+    /// The failure that reached a person: "weather there?" composed `place: "there"`, which is a
+    /// real village, and its weather was returned as the answer. No guard over the reply can see
+    /// this — the reply is faithful to material that is faithful to a question nobody asked.
+    #[tokio::test]
+    async fn a_value_the_message_points_at_nothing_for_is_asked_about_rather_than_dispatched() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": {"name": "weather", "args": {"place": "there"}}, "reply": null}"#,
+        ));
+        fake.answer_decide_tool("weather", 0.95);
+        fake.answer_decide_pointed_at(0.62);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 25.9}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let mut entry = single_field_tool("weather", "place");
+        entry.input_schema_json = json!({
+            "type": "object",
+            "required": ["place"],
+            "properties": {"place": {
+                "type": "string",
+                "description": "place do you mean",
+                "x-value-in-message": true,
+            }},
+        })
+        .to_string();
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![entry],
+            ..Default::default()
+        }
+        .to_json();
+
+        let output = executor
+            .execute(
+                "llm",
+                &config,
+                &json!({"question": "weather there?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            tool.calls(),
+            0,
+            "a value the message does not point at must never reach a source: it answers for \
+             whatever it is asked, and the wrong answer then looks exactly like a right one"
+        );
+        let reply = output["reply"].as_str().expect("a reply");
+        assert!(
+            reply.contains("place do you mean"),
+            "the question back is worded from the schema the operator wrote: {reply:?}"
+        );
+    }
+
+    /// A value the message describes without spelling out is pointed at, and must still dispatch —
+    /// "the capital of Japan" names one place and only one.
+    #[tokio::test]
+    async fn a_value_the_message_describes_unambiguously_is_dispatched() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": {"name": "weather", "args": {"place": "Tokyo"}}, "reply": null}"#,
+        ));
+        fake.answer_decide_tool("weather", 0.95);
+        fake.answer_decide_pointed_at(0.97);
+        fake.answer_decide_grounded(&[0.95]);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let tool = Arc::new(FakeToolService::ok(r#"{"temp": 29.6}"#));
+        let tool_url = serve_tool(Arc::clone(&tool)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![single_field_tool("weather", "place")],
+            ..Default::default()
+        }
+        .to_json();
+
+        executor
+            .execute(
+                "llm",
+                &config,
+                &json!({"question": "weather in the capital of Japan?"}),
+                "e:llm:0",
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            tool.calls(),
+            1,
+            "the message points at one place, so the call goes"
+        );
+    }
+
     /// Measured live: asked for the weather in a capital named indirectly, the source returned a
     /// temperature and the model replied with the city's name — answering a question nobody asked,
     /// with a word the material does not contain. Told so, it answers from what is in front of it.
@@ -3359,7 +3733,7 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let outcome = executor
-            .decide_fast_path(&config, "which courses exist?")
+            .decide_fast_path(&config, "which courses exist?", None)
             .await;
         let elapsed = started.elapsed();
 

@@ -95,6 +95,14 @@ const SEPARATE_THEMES_ID: &str = "separate_themes";
 const COVERS_EVERYTHING_ID: &str = "covers_everything";
 /// One per question the split produced, suffixed with its position.
 const STANDS_ALONE_PREFIX: &str = "stands_alone_";
+/// The same question asked of the message itself, on the routing decision. Measured over twelve
+/// messages: every one that leans on the conversation scored 0.05–0.10, every one that stands on
+/// its own 0.82–0.98.
+const STANDS_ALONE_ID: &str = "stands_alone";
+/// How many earlier turns a rewrite may draw on. A reference points at something recent — two turns
+/// back at most in practice — and every extra turn is prompt weight and another thing to confuse it
+/// with.
+const RESOLVE_CONTEXT_TURNS: usize = 4;
 
 const ROUTE_INSTRUCTIONS: &str = "Which of these should the new message go to: one of the named \
 existing topics it continues, or a new topic?";
@@ -118,10 +126,32 @@ const COVERS_EVERYTHING_WHEN_FALSE: &str = "the message asks about something non
 questions asks for, so answering all of them would leave part of the message unanswered";
 const STANDS_ALONE_INSTRUCTIONS: &str = "Could this question be answered by someone shown only \
 it, who had never seen the message it came from?";
+const STANDS_ALONE_MESSAGE_INSTRUCTIONS: &str = "Could the new message be answered by someone \
+shown only it, who had never seen the conversation it came from?";
 const STANDS_ALONE_WHEN_TRUE: &str =
     "it names in full what it is about, and needs nothing else to be understood";
 const STANDS_ALONE_WHEN_FALSE: &str = "it leans on something outside itself — \"there\", \"it\", \
 \"that one\", \"the same\" — so alone nobody could tell what it asks about";
+
+/// Rewriting a reference is reading the conversation, not remembering facts. The rule that keeps
+/// the two apart is the split prompt's: take the words from what was said, and no further.
+const RESOLVE_SYSTEM_PROMPT: &str = "\
+The new message below leans on something said earlier — \"there\", \"it\", \"that one\", \"the \
+same\". Rewrite it so it stands on its own.
+
+Rules:
+- Keep it the user's own request, first person, near-verbatim. Change only what the reference \
+needs.
+- Replace the reference with what the earlier turns say it is, taking those words from them and no \
+further. \"what is the capital of Japan?\" then \"weather there?\" gives \"what is the weather in \
+the capital of Japan?\" — never \"in Tokyo\", which nobody said. Working out what they meant is \
+not your job, and working it out wrongly would be invisible from here.
+- A message can ask about the earlier answer itself rather than about its subject — \"where?\" \
+after a measurement asks which place it was for, not where that place is. Keep it a question about \
+the earlier answer, naming that answer's own words.
+- If the earlier turns do not say what the reference points at, return the message unchanged.
+- Answer with the rewritten message and nothing else. No quotes, no explanation.
+";
 
 const EXAMPLE_QUESTION_1: &str = "What is Claude Code?";
 const EXAMPLE_QUESTION_2: &str = "Which Academy courses exist?";
@@ -190,8 +220,17 @@ pub struct TopicSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    Continue { topic_id: i64 },
-    New { title: String, question: String },
+    Continue {
+        topic_id: i64,
+        /// The turn as the topic should receive it. A message leaning on the conversation —
+        /// "where?" — is rewritten here against the session's own turns, because a topic is
+        /// executed with its question and nothing else, and a continuation is no different.
+        question: String,
+    },
+    New {
+        title: String,
+        question: String,
+    },
 }
 
 /// What the check over a split found. `Missing` and `Unavailable` are both failures, but only one
@@ -347,7 +386,8 @@ impl TopicIntent {
         if !topics.is_empty() {
             match route_outcome(&decided.answers, topics) {
                 RouteOutcome::Continue(topic_id) => {
-                    return Routing::Act(vec![Action::Continue { topic_id }]);
+                    let question = self.standing_alone(&decided.answers, topics, message).await;
+                    return Routing::Act(vec![Action::Continue { topic_id, question }]);
                 }
                 RouteOutcome::Fallback => return Routing::Act(fallback(topics, focus, message)),
                 RouteOutcome::ConfidentNew => {}
@@ -367,10 +407,73 @@ impl TopicIntent {
             return Routing::Clarify;
         }
 
+        // A topic is executed with its own question and nothing else, so a message leaning on the
+        // turn before it — "weather there?" — reaches an agent that cannot know where. The split
+        // path has always checked this; a message with one theme never faced it, and that is where
+        // the conversation's memory was being lost.
+        // Only a verdict that arrived and came back low rewrites anything. A decision that did not
+        // answer leaves the message exactly as the person wrote it: this may repair a reference,
+        // never invent one.
+        let question = self.standing_alone(&decided.answers, topics, message).await;
         Routing::Act(vec![Action::New {
             title: truncate(message, MAX_TITLE_CHARS),
-            question: message.to_owned(),
+            question,
         }])
+    }
+
+    /// The message as a topic should receive it: rewritten against the conversation when it leans
+    /// on it, and untouched otherwise. Only a verdict that arrived and came back low rewrites
+    /// anything — a decision that did not answer leaves the person's words exactly as written, so
+    /// this may repair a reference and never invent one.
+    async fn standing_alone(
+        &self,
+        answers: &[Answer],
+        topics: &[TopicSummary],
+        message: &str,
+    ) -> String {
+        if noul_below(answers, STANDS_ALONE_ID, STANDS_ALONE_THRESHOLD) {
+            self.resolved_against(topics, message).await
+        } else {
+            message.to_owned()
+        }
+    }
+
+    /// Rewrites a message that leans on the conversation so it stands on its own, using the words
+    /// of the session's own turns. Reading what was said earlier is reading the conversation, not
+    /// the model's memory: "weather there?" after "what is capital of Japan?" becomes "the weather
+    /// in the capital of Japan", which points at one place — never "in Tokyo", which nobody said.
+    ///
+    /// Spent only on the turns that need it, and a failure leaves the message as it was: an
+    /// unresolved reference is answered badly, but losing the turn is worse.
+    async fn resolved_against(&self, topics: &[TopicSummary], message: &str) -> String {
+        let Some(context) = recent_context(topics) else {
+            return message.to_owned();
+        };
+        let response = self
+            .llm
+            .complete(CompleteRequest {
+                tier: EnumValue::Known(QualityTier::Low),
+                system_prompt: RESOLVE_SYSTEM_PROMPT.to_owned(),
+                user_prompt: format!(
+                    "Earlier in this conversation:\n{context}\n\nNew message: {message}\n"
+                ),
+                ..Default::default()
+            })
+            .await;
+        match response {
+            Ok(response) => {
+                let resolved = response.into_owned().content.trim().to_owned();
+                if resolved.is_empty() {
+                    message.to_owned()
+                } else {
+                    resolved
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not resolve a message against the conversation");
+                message.to_owned()
+            }
+        }
     }
 
     // The one branch that still needs generated text: several themes in one message, each becoming
@@ -512,6 +615,22 @@ fn scoped_to(message: &str, title: &str) -> String {
 /// An array, not an object: `Question.instructions` says outright that an object's keys reach the
 /// model re-sorted alphabetically, which would put the subject after the thing asked about it. The
 /// order here is the whole meaning — which question, then what to judge about it.
+/// The same judgement the split makes of each question it produces, made of the message itself.
+/// Asked on the routing decision, so it costs nothing beyond the call that already runs.
+fn stands_alone_question_for_message() -> Option<Question> {
+    let mut question = instructed(
+        STANDS_ALONE_ID,
+        serde_json::json!(STANDS_ALONE_MESSAGE_INSTRUCTIONS),
+    )?;
+    question.kind = Noul {
+        when_true: Some(STANDS_ALONE_WHEN_TRUE.to_owned()),
+        when_false: Some(STANDS_ALONE_WHEN_FALSE.to_owned()),
+        ..Default::default()
+    }
+    .into();
+    Some(question)
+}
+
 fn stands_alone_question(at: usize) -> Option<Question> {
     let mut question = instructed(
         &format!("{STANDS_ALONE_PREFIX}{at}"),
@@ -527,6 +646,44 @@ fn stands_alone_question(at: usize) -> Option<Question> {
     }
     .into();
     Some(question)
+}
+
+/// Whether a topic's reply was an answer rather than the system talking about itself. A decline
+/// names the sources it has and a clarification names an argument it wants: both are our words, not
+/// the conversation's, and feeding them back as context is how "weather there?" became "weather in
+/// the current weather for a place" — the rewrite resolved the reference against the text of a
+/// refusal. A topic that ended without finding anything contributes its question and nothing more.
+fn answered(topic: &TopicSummary) -> bool {
+    topic.status == Status::Completed
+        && topic
+            .result_summary
+            .as_deref()
+            .is_some_and(|reply| !common::agent_replies::is_about_itself(reply))
+}
+
+/// The session's recent turns, newest last, as the text a rewrite may draw on. Questions and
+/// answers both: "what is capital of Japan?" is what "there" points at, and a topic's own answer is
+/// what "that" usually means.
+///
+/// `None` when there is nothing to draw on, and the message then stands as it is — there is nothing
+/// to resolve it against.
+fn recent_context(topics: &[TopicSummary]) -> Option<String> {
+    let mut lines: Vec<String> = topics
+        .iter()
+        .rev()
+        .take(RESOLVE_CONTEXT_TURNS)
+        .map(
+            |topic| match topic.result_summary.as_deref().filter(|_| answered(topic)) {
+                Some(answer) => format!("asked: {}\nanswered: {answer}", topic.title),
+                None => format!("asked: {}", topic.title),
+            },
+        )
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.reverse();
+    Some(lines.join("\n"))
 }
 
 fn covers_everything_question() -> Option<Question> {
@@ -579,6 +736,7 @@ fn build_request(
     }
     questions.push(actionable_question()?);
     questions.push(separate_themes_question()?);
+    questions.push(stands_alone_question_for_message()?);
 
     let state = decision_state(topics, focus, message);
     let mut request: DecideRequest =
@@ -745,7 +903,10 @@ fn parse_actions(content: &str, topics: &[TopicSummary]) -> Option<Vec<Action>> 
             RawAction::Continue { topic_id } => topics
                 .iter()
                 .any(|topic| topic.id == topic_id)
-                .then_some(Action::Continue { topic_id }),
+                .then_some(Action::Continue {
+                    topic_id,
+                    question: String::new(),
+                }),
             RawAction::New { title, question } => {
                 let question = question.filter(|q| !q.trim().is_empty())?;
                 let title = title
@@ -776,7 +937,10 @@ fn outermost_json_object(content: &str) -> Option<&str> {
 pub(crate) fn fallback(topics: &[TopicSummary], focus: Option<i64>, message: &str) -> Vec<Action> {
     match focus {
         Some(topic_id) if topics.iter().any(|topic| topic.id == topic_id) => {
-            vec![Action::Continue { topic_id }]
+            vec![Action::Continue {
+                topic_id,
+                question: String::new(),
+            }]
         }
         _ => vec![Action::New {
             title: truncate(message, MAX_TITLE_CHARS),
@@ -861,7 +1025,10 @@ mod tests {
         let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
             panic!("a fragment aimed at a live topic must never clarify");
         };
-        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+        let [Action::Continue { topic_id, .. }] = actions.as_slice() else {
+            panic!("expected one continuation: {actions:?}");
+        };
+        assert_eq!(*topic_id, 7);
     }
 
     #[tokio::test]
@@ -871,7 +1038,10 @@ mod tests {
         let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
             panic!("expected actions");
         };
-        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+        let [Action::Continue { topic_id, .. }] = actions.as_slice() else {
+            panic!("expected one continuation: {actions:?}");
+        };
+        assert_eq!(*topic_id, 7);
     }
 
     #[tokio::test]
@@ -907,6 +1077,65 @@ mod tests {
         };
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
         assert_eq!(question, &long);
+    }
+
+    /// The failure the owner hit: "what is capital of Japan?" then "ok weather there?". The second
+    /// message opened a topic of its own carrying the word "there", which reached a weather source
+    /// and returned a village of that name in Pakistan. A message with one theme never faced the
+    /// check the split has always made of its own questions.
+    #[tokio::test]
+    async fn a_single_theme_message_leaning_on_the_conversation_is_resolved_against_it() {
+        let (url, calls) = crate::fakes::serve_decider_resolving(
+            0.08,
+            "what is the weather in the capital of Japan?",
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let topics = vec![TopicSummary {
+            id: 7,
+            title: "what is capital of Japan?".to_owned(),
+            status: Status::Completed,
+            result_summary: None,
+        }];
+
+        let Routing::Act(actions) = intent.route(&topics, None, "ok weather there?").await else {
+            panic!("expected actions");
+        };
+
+        let [Action::New { question, title }] = actions.as_slice() else {
+            panic!("expected one new topic: {actions:?}");
+        };
+        assert_eq!(question, "what is the weather in the capital of Japan?");
+        assert_eq!(
+            title, "ok weather there?",
+            "the title stays the person's own words — only the question has to stand alone"
+        );
+        assert_eq!(
+            calls.completions(),
+            1,
+            "and it cost one call, on the turn that needed it"
+        );
+    }
+
+    /// A message that stands on its own is not rewritten, and costs nothing to leave alone.
+    #[tokio::test]
+    async fn a_message_that_stands_alone_is_left_exactly_as_written() {
+        let (url, calls) =
+            crate::fakes::serve_decider_resolving(0.95, "something else entirely").await;
+        let intent = TopicIntent::new(&url).expect("client");
+
+        let Routing::Act(actions) = intent
+            .route(&[], None, "what is the weather in Tokyo?")
+            .await
+        else {
+            panic!("expected actions");
+        };
+
+        let [Action::New { question, .. }] = actions.as_slice() else {
+            panic!("expected one new topic");
+        };
+        assert_eq!(question, "what is the weather in Tokyo?");
+        assert_eq!(calls.completions(), 0);
     }
 
     /// A topic is executed with its own `question` and nothing else, so a question left saying
@@ -1038,7 +1267,10 @@ mod tests {
         let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
             panic!("a hung decider must still fall back, not clarify");
         };
-        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+        let [Action::Continue { topic_id, .. }] = actions.as_slice() else {
+            panic!("expected one continuation: {actions:?}");
+        };
+        assert_eq!(*topic_id, 7);
 
         let elapsed = started.elapsed();
         assert!(
@@ -1057,7 +1289,10 @@ mod tests {
         let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
             panic!("a failure must never clarify");
         };
-        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+        let [Action::Continue { topic_id, .. }] = actions.as_slice() else {
+            panic!("expected one continuation: {actions:?}");
+        };
+        assert_eq!(*topic_id, 7);
     }
 
     #[tokio::test]
@@ -1067,7 +1302,10 @@ mod tests {
         let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
             panic!("expected actions");
         };
-        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+        let [Action::Continue { topic_id, .. }] = actions.as_slice() else {
+            panic!("expected one continuation: {actions:?}");
+        };
+        assert_eq!(*topic_id, 7);
     }
 
     #[tokio::test]
@@ -1077,7 +1315,10 @@ mod tests {
         let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
             panic!("expected actions");
         };
-        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+        let [Action::Continue { topic_id, .. }] = actions.as_slice() else {
+            panic!("expected one continuation: {actions:?}");
+        };
+        assert_eq!(*topic_id, 7);
     }
 
     #[test]
@@ -1228,6 +1469,9 @@ mod tests {
         let Routing::Act(actions) = intent.route(&topics(), Some(7), "and?").await else {
             panic!("a failure must never clarify");
         };
-        assert_eq!(actions, vec![Action::Continue { topic_id: 7 }]);
+        let [Action::Continue { topic_id, .. }] = actions.as_slice() else {
+            panic!("expected one continuation: {actions:?}");
+        };
+        assert_eq!(*topic_id, 7);
     }
 }

@@ -1,5 +1,6 @@
 // Connect service stubs and message types generated from common/proto, shared by every service.
 
+pub mod agent_replies;
 pub mod execution_input;
 pub mod extract;
 pub mod logging;

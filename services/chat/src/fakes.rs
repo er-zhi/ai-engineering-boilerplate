@@ -575,6 +575,21 @@ fn stands_alone_ids(plan: &str) -> Vec<String> {
         .collect()
 }
 
+/// `stands_alone` over the message at `alone`, and `resolved` as what a rewrite returns.
+pub async fn serve_decider_resolving(alone: f64, resolved: &'static str) -> (String, Calls) {
+    let router = Arc::new(FakeLlmRouter::default());
+    router.answer_decision(
+        Some(("new", 0.95)),
+        vec![
+            ("actionable", 0.95),
+            ("separate_themes", 0.1),
+            ("stands_alone", alone),
+        ],
+    );
+    router.answer_with(resolved);
+    served(router).await
+}
+
 /// A split refused for leaving a theme behind, then asked for again and covering the message.
 /// `first` is what the splitter returns to begin with and is judged short; `second` is what the
 /// second ask returns, and it is judged complete.

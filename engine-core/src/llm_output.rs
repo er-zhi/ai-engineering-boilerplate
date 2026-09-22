@@ -5,6 +5,12 @@ use serde_json::Value;
 
 pub const LLM_STATE_KEY: &str = "llm";
 pub const TOOL_RESULT_STATE_KEY: &str = "tool_result";
+
+/// What an earlier turn of the same conversation found, carried into this one. Deliberately not
+/// `TOOL_RESULT_STATE_KEY`: the gate that decides whether a turn has fetched anything reads that
+/// key, and material inherited from before is not something *this* turn fetched. Sharing the key
+/// would make every follow-up skip the decision that settles whether it may be answered at all.
+pub const PRIOR_MATERIAL_STATE_KEY: &str = "prior_material";
 pub const TOOL_RESULT_ERROR_KEY: &str = "error";
 /// Set on an `llm` node's own output when its executor dispatched a tool itself, outside the
 /// graph's normal `llm` → `tool` → `llm` loop — see `services/engine/src/executors/llm.rs`'s

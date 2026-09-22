@@ -82,12 +82,27 @@ impl EngineClient {
         graph_id: &str,
         input_json: &str,
     ) -> Result<Uuid, String> {
+        self.start_continuing(principal, graph_id, input_json, None)
+            .await
+    }
+
+    /// `continues` names the execution this one follows on from, so Engine can carry what that
+    /// turn's sources returned into this one. Chat never sees that material: a follow-up like
+    /// "where?" asks about it, and only Engine holds it.
+    pub async fn start_continuing(
+        &self,
+        principal: &Principal,
+        graph_id: &str,
+        input_json: &str,
+        continues: Option<&str>,
+    ) -> Result<Uuid, String> {
         let response = self
             .inner
             .start_execution_with_options(
                 StartExecutionRequest {
                     graph_id: graph_id.to_owned(),
                     input_json: input_json.to_owned(),
+                    continues_execution_id: continues.map(str::to_owned),
                     ..Default::default()
                 },
                 principal_options(principal),

@@ -4,6 +4,7 @@ use chrono::Utc;
 use engine_core::{
     ActiveNode, Budget, CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, Graph,
 };
+use engine_core::{PRIOR_MATERIAL_STATE_KEY, TOOL_RESULT_STATE_KEY};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
@@ -63,6 +64,45 @@ fn validated_graph(definition_json: &str) -> Result<Graph, EngineError> {
     Ok(definition)
 }
 
+/// What a continuation inherits: the parent's own fetches and whatever the parent itself inherited,
+/// oldest first, and only the last few. A conversation of follow-ups would otherwise accumulate
+/// every turn's material forever, in every checkpoint and every prompt; the cap is the same one
+/// that decides how many results a model is shown, because anything beyond it is never read.
+fn carried_records(state: &Value) -> Vec<Value> {
+    let of = |key: &str| {
+        state
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut records = of(PRIOR_MATERIAL_STATE_KEY);
+    records.extend(of(TOOL_RESULT_STATE_KEY));
+    // A dispatch made straight from the decision never passes through a tool node, so the graph
+    // appends only what came back while the node's own output keeps the whole record — the call
+    // included. The call is the half a follow-up needs: "where?" is answered by the argument, not
+    // by the temperature. Prefer the fuller form wherever the two describe the same fetch.
+    if let Some(full) = state
+        .get(engine_core::LLM_STATE_KEY)
+        .and_then(|llm| llm.get(engine_core::FAST_TOOL_CALL_FIELD))
+        && let Some(result) = full.get("result")
+    {
+        if let Some(bare) = records.iter_mut().find(|record| *record == result) {
+            *bare = full.clone();
+        } else {
+            records.push(full.clone());
+        }
+    }
+    // An error is not material: it says a source could not be reached, which a later turn can do
+    // nothing with and a model can only mistake for a finding.
+    records.retain(|record| {
+        let result = record.get("result").unwrap_or(record);
+        result.get(engine_core::TOOL_RESULT_ERROR_KEY).is_none()
+    });
+    let first = records.len().saturating_sub(CARRIED_RECORDS);
+    records.split_off(first)
+}
+
 fn execution_input(input_json: &str) -> Result<Value, EngineError> {
     let input: Value = serde_json::from_str(input_json)
         .map_err(|error| EngineError::InvalidRequest(error.to_string()))?;
@@ -73,6 +113,10 @@ fn execution_input(input_json: &str) -> Result<Value, EngineError> {
     }
     Ok(input)
 }
+
+/// How many of an earlier turn's records travel. Matches what the `llm` executor renders, because
+/// carrying more than is ever read is weight in every checkpoint for nothing.
+const CARRIED_RECORDS: usize = 4;
 
 fn already_stored(row: &entity::graph::Model, definition: &Graph) -> bool {
     let mut candidate = definition.clone();
@@ -188,7 +232,22 @@ impl Service {
         input_json: &str,
         user_id: Option<Uuid>,
     ) -> Result<Uuid, EngineError> {
-        let input = execution_input(input_json)?;
+        self.start_continuing(graph_id, version, input_json, user_id, None)
+            .await
+    }
+
+    pub async fn start_continuing(
+        &self,
+        graph_id: String,
+        version: Option<i32>,
+        input_json: &str,
+        user_id: Option<Uuid>,
+        continues: Option<Uuid>,
+    ) -> Result<Uuid, EngineError> {
+        let mut input = execution_input(input_json)?;
+        if let Some(parent) = continues {
+            self.carry_material_from(parent, &mut input).await;
+        }
         let (graph_row, graph) = self.load_graph(&graph_id, version).await?;
 
         let execution_id = Uuid::new_v4();
@@ -232,6 +291,37 @@ impl Service {
             .await?;
         txn.commit().await?;
         Ok(execution_id)
+    }
+
+    /// Copies what the earlier execution's sources returned into this one's initial state. A
+    /// follow-up — "where?", "explain that more simply" — asks about material already fetched, and
+    /// without it the turn has nothing to answer from: it would either fetch again, which for a
+    /// question like "where?" it cannot, or decline something it has in hand.
+    ///
+    /// Only the tool results travel. Nothing about where the earlier execution had got to is
+    /// carried, because the continuation is a fresh run of the graph and inheriting a position in
+    /// one would resume it rather than begin it.
+    ///
+    /// A parent that cannot be read is not an error: the follow-up runs without the material, which
+    /// is exactly today's behaviour, and losing a checkpoint must not lose the turn.
+    async fn carry_material_from(&self, parent: Uuid, input: &mut Value) {
+        let carried = match self.latest_checkpoint(parent).await {
+            Ok(Some(checkpoint)) => Some(carried_records(&checkpoint.state)),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%parent, %error, "could not read what the earlier turn found");
+                None
+            }
+        };
+        let Some(records) = carried.filter(|records| !records.is_empty()) else {
+            return;
+        };
+        if let Some(object) = input.as_object_mut() {
+            object.insert(
+                PRIOR_MATERIAL_STATE_KEY.to_owned(),
+                serde_json::Value::Array(records),
+            );
+        }
     }
 
     pub async fn get_execution(

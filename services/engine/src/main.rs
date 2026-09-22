@@ -110,9 +110,21 @@ impl EngineService for EngineServiceImpl {
     ) -> ServiceResult<StartExecutionResponse> {
         let msg = request.to_owned_message();
         let user_id = principal::from_metadata(ctx.headers()).map(|p| p.user_id);
+        // An unreadable id is treated as absent rather than refused: the continuation is a
+        // convenience, and losing it must not lose the turn.
+        let continues = msg
+            .continues_execution_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok());
         let execution_id = self
             .service
-            .start_execution(msg.graph_id, msg.version, &msg.input_json, user_id)
+            .start_continuing(
+                msg.graph_id,
+                msg.version,
+                &msg.input_json,
+                user_id,
+                continues,
+            )
             .await?;
         Response::ok(StartExecutionResponse {
             execution_id: execution_id.to_string(),

@@ -34,6 +34,13 @@ message StartExecutionRequest {
   // `common::execution_input::ExecutionInput` type both sides build and parse; a graph of your own
   // may read anything it likes.
   string input_json = 3;
+  // An execution this one continues. What that execution's sources returned is carried into this
+  // one's initial state, so a follow-up can be answered from material already fetched rather than
+  // fetched again — or, where nothing new can be fetched, answered at all.
+  //
+  // Only the material is carried, never the run-time representation: what an execution is doing
+  // stays private to this service, which is why `Execution` does not publish it either.
+  optional string continues_execution_id = 4;
 }
 
 message StartExecutionResponse {

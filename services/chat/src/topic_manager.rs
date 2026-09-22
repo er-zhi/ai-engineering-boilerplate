@@ -75,9 +75,23 @@ impl TopicManager {
         title: String,
         input_json: serde_json::Value,
     ) -> Result<(i64, Status), ChatError> {
+        self.create_topic_continuing(user_id, parent_id, title, input_json, None)
+            .await
+    }
+
+    /// `continues` names the execution this topic follows on from. Engine carries what that
+    /// execution's sources returned into this one; Chat never holds that material itself.
+    pub async fn create_topic_continuing(
+        self: &Arc<Self>,
+        user_id: Uuid,
+        parent_id: Option<i64>,
+        title: String,
+        input_json: serde_json::Value,
+        continues: Option<Uuid>,
+    ) -> Result<(i64, Status), ChatError> {
         let session = self.session.get_or_create_session(user_id).await?;
         let row = self
-            .insert_topic(session.id, parent_id, title, input_json)
+            .insert_topic(session.id, parent_id, title, input_json, continues)
             .await?;
 
         self.publish(
@@ -116,6 +130,7 @@ impl TopicManager {
         parent_id: Option<i64>,
         title: String,
         input_json: serde_json::Value,
+        continues: Option<Uuid>,
     ) -> Result<topic::Model, ChatError> {
         let txn = self.session.db.begin().await?;
         let locked = lock_session(&txn, session_id).await?;
@@ -124,7 +139,12 @@ impl TopicManager {
         let execution_id = if status == Status::Running {
             Some(
                 self.engine
-                    .start_execution(&principal, AGENT_GRAPH_ID, &input_json.to_string())
+                    .start_continuing(
+                        &principal,
+                        AGENT_GRAPH_ID,
+                        &input_json.to_string(),
+                        continues.map(|id| id.to_string()).as_deref(),
+                    )
                     .await
                     .map_err(ChatError::Engine)?,
             )

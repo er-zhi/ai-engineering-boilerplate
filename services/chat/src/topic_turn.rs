@@ -198,11 +198,18 @@ impl TopicManager {
                     received.push(topic_id);
                     new_focus.get_or_insert(topic_id);
                 }
-                Action::Continue { topic_id } => {
+                Action::Continue { topic_id, question } => {
                     let Some(topic) = topics.iter().find(|t| t.id == topic_id) else {
                         continue;
                     };
-                    match self.apply_continue(user_id, topic, content).await? {
+                    // The rewritten turn when routing produced one — a bare "where?" reaches a
+                    // topic that is executed with its question and nothing else.
+                    let delivered = if question.is_empty() {
+                        content
+                    } else {
+                        &question
+                    };
+                    match self.apply_continue(user_id, topic, delivered).await? {
                         Delivery::Existing(id) => received.push(id),
                         Delivery::Child(id) => {
                             received.push(id);
@@ -258,21 +265,20 @@ impl TopicManager {
         parent: &topic::Model,
         content: &str,
     ) -> Result<i64, ChatError> {
-        let question = match parent.result_summary.as_deref() {
-            Some(summary) => format!("Earlier answer:\n{summary}\n\nFollow-up: {content}"),
-            None => {
-                tracing::warn!(
-                    parent_id = parent.id,
-                    "completed parent topic has no result_summary; \
-                     the continuation starts without the earlier answer"
-                );
-                content.to_owned()
-            }
-        };
+        // The follow-up travels as the person wrote it. What the earlier turn found travels too,
+        // but through Engine, which holds it — pasting a summary of it into the question here gave
+        // the decision a lossy second copy to route on, and the summary never held what was asked
+        // for, only what came back.
         let title = truncate(content, MAX_TITLE_CHARS);
-        let input_json = ExecutionInput::new(question).to_json();
+        let input_json = ExecutionInput::new(content.to_owned()).to_json();
         let (child_id, _status) = self
-            .create_topic(user_id, Some(parent.id), title, input_json)
+            .create_topic_continuing(
+                user_id,
+                Some(parent.id),
+                title,
+                input_json,
+                parent.execution_id,
+            )
             .await?;
         Ok(child_id)
     }
@@ -609,13 +615,20 @@ mod tests {
         let input = &starts.last().expect("child start").input_json;
         let state: serde_json::Value = serde_json::from_str(input).expect("input is json");
         let question = ExecutionInput::in_state(&state).question;
-        assert!(
-            question.contains(PARENT_ANSWER),
-            "the child's question must carry the parent's answer: {question}"
+        assert_eq!(
+            question, FOLLOW_UP,
+            "the follow-up travels as the person wrote it: {question}"
         );
         assert!(
-            question.contains(FOLLOW_UP),
-            "the child's question must carry the new turn: {question}"
+            !question.contains(PARENT_ANSWER),
+            "and not with a summary of the earlier answer pasted into it — that summary is a lossy \
+             second copy of material Engine already carries, and it is what the routing decision \
+             then reads: {question}"
+        );
+        let continues = &starts.last().expect("child start").continues_execution_id;
+        assert!(
+            continues.is_some(),
+            "the earlier execution is named instead, so Engine carries what it found"
         );
     }
 
