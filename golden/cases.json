@@ -9,13 +9,13 @@
     "id": "weather-and-knowledge",
     "kind": "chat",
     "message": "what is the weather in Bishkek and what is the capital of Kyrgyzstan?",
-    "expect": "Two topics, or one topic that answers both. Every answer is a finished answer: a temperature for the weather, and Bishkek for the capital. Neither answer promises to look anything up."
+    "expect": "Two topics, or one covering both. The weather part answers with a temperature. The capital part is declined: no connected source holds it. A turn that answers both is a failure — the second answer came from the model's memory."
   },
   {
     "id": "three-themes-with-a-reference",
     "kind": "chat",
     "message": "capital of Kyrgyzstan and what the wheather there, and NASDAQ today",
-    "expect": "Three topics: the capital, the weather, and the NASDAQ. The weather topic must not ask where — the reference to 'there' has to have been resolved from the message. Every topic completes with a value: Bishkek, a temperature, and a NASDAQ figure. No answer promises work. The misspelling of 'weather' must not matter."
+    "expect": "Three topics. The weather topic answers with a temperature and the NASDAQ topic with an index level. The capital topic is declined — nothing connected holds it. The misspelling of 'weather' must not matter, and the weather topic must not ask where: the reference to 'there' has to have been resolved from the message."
   },
   {
     "id": "currency-pair",
@@ -36,10 +36,10 @@
     "expect": "One topic, answered with an index level — a number in the thousands or tens of thousands."
   },
   {
-    "id": "pure-knowledge-no-tool",
+    "id": "knowledge-with-no-source-is-declined",
     "kind": "chat",
     "message": "what is the capital of Kyrgyzstan?",
-    "expect": "One topic answered 'Bishkek', and answered quickly — under about two seconds — because nothing needed looking up. A slow answer here means a tool ran that should not have."
+    "expect": "One topic, declined. No connected source holds this, so the answer must not be given however plainly the model knows it. The decline names the sources that are connected and asks which was meant, and it arrives fast — well under a second — because no generative call is spent on it."
   },
   {
     "id": "kb-what-are-skills",
@@ -69,13 +69,13 @@
     "id": "kb-and-tool-together",
     "kind": "chat",
     "message": "what are agent skills, and what is the weather in Tokyo?",
-    "expect": "Two topics, arriving independently. One answers from the knowledge base, the other with a Tokyo temperature. Neither waits for the other, and neither promises."
+    "expect": "Two topics, arriving independently. One answers from the stored course material, the other with a Tokyo temperature. Both must be grounded in what came back — a generic definition of the word 'skill' means the store was never read."
   },
   {
     "id": "kb-absent-subject",
     "kind": "chat",
     "message": "what does the knowledge base say about the migratory routes of Arctic terns?",
-    "expect": "One topic. The knowledge base holds Claude Academy material and nothing about Arctic terns, so the honest outcomes are: saying it could not find anything, or answering from general knowledge while making clear it is not from the knowledge base. Inventing a knowledge-base document is a failure."
+    "expect": "One topic. The stored material covers Claude Academy course content and nothing about Arctic terns, so the turn must either decline or say it found nothing. Answering from general knowledge is a failure now, however it is hedged, and inventing a stored document is the worse one."
   },
   {
     "id": "three-tools-at-once",
@@ -93,7 +93,7 @@
     "id": "follow-up-reference",
     "kind": "chat",
     "message": "the capital of Kyrgyzstan, and how warm it is there right now",
-    "expect": "Two topics. The second must name the place it asks about — a topic is answered with its own question and nothing else, so a question left saying 'there' reaches an agent that cannot know where. Both complete with values."
+    "expect": "Two topics. The 'how warm is it' topic answers with a temperature, having resolved the place from the message. The capital topic is declined. Neither may answer from memory."
   },
   {
     "id": "kb-search-skills",
@@ -118,5 +118,23 @@
     "kind": "kb",
     "query": "Arctic tern migration routes",
     "expect": "Either no results, or results that are plainly unrelated Claude Academy pages. The point is that nothing about Arctic terns is returned as though it were held — a semantic index will return its nearest neighbours, and that is fine as long as they are not dressed up as matches."
+  },
+  {
+    "id": "an-argument-the-message-does-not-spell-out",
+    "kind": "chat",
+    "message": "what is the weather in the capital of Japan?",
+    "expect": "One topic, answered with a Tokyo temperature. The source covers the weather, so the question is in scope; that its argument is not spelled out in the message is a composing problem, not a scope one. The reply must be the measurement — a place name here is the failure this case exists for, because the material holds no place name and one could only have come from the model's memory."
+  },
+  {
+    "id": "the-same-fact-asked-for-directly-is-declined",
+    "kind": "chat",
+    "message": "what is the capital of Japan?",
+    "expect": "One topic, declined. The neighbouring case answers the weather there, so the system plainly has a way to reach that city — but reaching it to look something up is not the same as stating it as an answer. Asked for the fact itself, with no source that holds it, the turn declines."
+  },
+  {
+    "id": "a-tool-that-is-not-connected-is-not-offered",
+    "kind": "chat",
+    "message": "search the web for today's headlines",
+    "expect": "One topic, declined. Web search is out of circulation, so it must appear neither in the answer nor among the sources the decline lists."
   }
 ]
