@@ -14,10 +14,12 @@ flowchart LR
   chat -->|gRPC| engine[Engine]
   engine -->|gRPC| tool[Tool]
   engine -->|gRPC Complete/Decide| llm[LLM Router]
+  chat -->|gRPC Complete/Decide| llm
   tool -->|gRPC Search| kb
-  tool -->|gRPC Complete/Decide| llm
+  tool -->|gRPC Decide| llm
   kb -->|gRPC Complete| llm
   llm -->|HTTPS| openrouter[OpenRouter]
+  llm -->|HTTPS| typesafe[TypeSafe AI]
   kb -->|HTTP| embedder[Native ANE embedder]
   gateway --- pg[(PostgreSQL)]
   crawler --- pg
@@ -44,7 +46,7 @@ Chat, Engine and Tool are the agent path, alongside Crawler and Knowledge Base's
 - Frontend is a one-shot build container. It copies static files to a volume that Gateway mounts read-only; it is not a runtime server or Cargo workspace member.
 - `native/embedder-ane` is the only host-native component. Core ML has no Linux-container equivalent, so Knowledge Base reaches it through `host.docker.internal`.
 - Provider credentials exist only in LLM Router. Callers request a quality tier for completion, or send typed questions for a decision, and never choose a provider or model slug.
-- Chat, Tool and Engine all call `SystemOneService.Decide` for a typed decision — Chat to route a turn, Tool to approve or refuse a submitted tool definition, Engine to pick a tool before an `llm` node spends a generative call — and reach `LlmRouterService.Complete` only where the branch actually needs generated words: Chat's multi-theme split, Tool's refusal explanation, Engine's answer. Both services are served by the LLM Router container, so a caller's outbound surface is that one address whichever of the two it needs; a decision is advisory everywhere it is used, and a decision that fails must never lose the turn.
+- Chat, Tool and Engine all call `SystemOneService.Decide` for a typed decision — Chat to route a turn, Tool to approve or refuse a submitted tool definition, Engine to pick a tool before an `llm` node spends a generative call — and reach `LlmRouterService.Complete` only where the branch actually needs generated words: Chat's multi-theme split and its rewrite of a message that leans on the conversation, Engine's composing of an argument and its answer. Tool holds no `LlmRouterService` client at all — it composes a refusal in Rust from the criteria a decision answered. Both services are served by the LLM Router container, so a caller's outbound surface is that one address whichever of the two it needs; a decision is advisory everywhere it is used, and a decision that fails must never lose the turn.
 - **The catalog decides what can be answered.** One typed decision per turn asks which connected source covers the question, with an option meaning none does. A source that is named is dispatched; when none is named, or the decision cannot be reached at all, the turn declines and names what it can answer, composed from the catalog's own titles and costing no generative call. Nothing else is licensed: the first generative call of a turn never runs without a source's result in state, so an answer from the model's own memory has no path to the person. Asking instead whether the model *needs* to look something up is what failed — a calibrated decider says no whenever the model believes it knows, which is exactly when it is confidently wrong.
 - Where a source is needed and only its arguments are open, the call that follows is asked for the call alone: tools listed, a plain reply refused, one retry, then a stated failure. A light model handed both options replies "I will look that up", and nothing runs after a reply.
 - **A message that leans on the conversation is rewritten against it, before anything else runs.** The routing decision asks whether the message stands on its own; when it does not, one generative call rewrites it using the words of the session's own turns — never the model's memory, so "weather there?" after a question about a country becomes "the weather in the capital of that country", not a city nobody named. Replies the agent wrote about itself — a decline, a request for a missing value — are not conversation and are never drawn on: resolving a reference against the text of a refusal is measured to produce nonsense.

@@ -1,0 +1,16 @@
+{
+  "kb_search": {
+    "description": "Searches a stored library of Claude Academy course material \u2014 26 courses, written lessons covering: the Claude API and building with it; running Claude on Amazon Bedrock and Google Cloud Vertex AI; the Claude platform, Claude 101 and Claude Code; Claude Cowork; the Model Context Protocol, including advanced topics; agent skills and subagents; deploying Claude across an enterprise; the AI-native software development lifecycle; what AI can and cannot do; building effective human-agent teams; and the whole AI Fluency track \u2014 its framework and foundations, and its courses for educators, K-12 and pK-12 teachers and trainers, students, small businesses, nonprofits, builders and creative work. Use this whenever the question is about any of that material, about what the library holds, or about which courses exist.",
+    "name": "Claude Academy course material"
+  },
+  "kb_read_document": {
+    "description": "Reads the full text of one document in the stored Claude Academy library, identified by the source and source_id a search result carries. Use this when a search result looks right but its passage is too short to answer from.",
+    "name": "Claude Academy course material"
+  },
+  "web_search": {
+    "enabled": false
+  },
+  "web_fetch": {
+    "enabled": false
+  }
+}

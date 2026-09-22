@@ -4,7 +4,7 @@ use chrono::Utc;
 use engine_core::{
     ActiveNode, Budget, CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, Graph,
 };
-use engine_core::{PRIOR_MATERIAL_STATE_KEY, TOOL_RESULT_STATE_KEY};
+use engine_core::{PRIOR_MATERIAL_STATE_KEY, RENDERED_TOOL_RESULTS, TOOL_RESULT_STATE_KEY};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
@@ -64,10 +64,18 @@ fn validated_graph(definition_json: &str) -> Result<Graph, EngineError> {
     Ok(definition)
 }
 
-/// What a continuation inherits: the parent's own fetches and whatever the parent itself inherited,
-/// oldest first, and only the last few. A conversation of follow-ups would otherwise accumulate
-/// every turn's material forever, in every checkpoint and every prompt; the cap is the same one
-/// that decides how many results a model is shown, because anything beyond it is never read.
+impl Service {
+    async fn execution_belongs_to(&self, execution_id: Uuid, caller: Option<Uuid>) -> bool {
+        match self.execution_row(execution_id).await {
+            Ok(row) => row.user_id.is_none() || row.user_id == caller,
+            Err(error) => {
+                tracing::warn!(%execution_id, %error, "could not read the earlier turn's owner");
+                false
+            }
+        }
+    }
+}
+
 fn carried_records(state: &Value) -> Vec<Value> {
     let of = |key: &str| {
         state
@@ -78,29 +86,33 @@ fn carried_records(state: &Value) -> Vec<Value> {
     };
     let mut records = of(PRIOR_MATERIAL_STATE_KEY);
     records.extend(of(TOOL_RESULT_STATE_KEY));
-    // A dispatch made straight from the decision never passes through a tool node, so the graph
-    // appends only what came back while the node's own output keeps the whole record — the call
-    // included. The call is the half a follow-up needs: "where?" is answered by the argument, not
-    // by the temperature. Prefer the fuller form wherever the two describe the same fetch.
-    if let Some(full) = state
+    prefer_the_record_that_carries_the_call(&mut records, state);
+    records.retain(reached_its_source);
+    let oldest_beyond_what_a_follow_up_inherits =
+        records.len().saturating_sub(RENDERED_TOOL_RESULTS);
+    records.split_off(oldest_beyond_what_a_follow_up_inherits)
+}
+
+fn prefer_the_record_that_carries_the_call(records: &mut Vec<Value>, state: &Value) {
+    let Some(with_the_call) = state
         .get(engine_core::LLM_STATE_KEY)
         .and_then(|llm| llm.get(engine_core::FAST_TOOL_CALL_FIELD))
-        && let Some(result) = full.get("result")
-    {
-        if let Some(bare) = records.iter_mut().find(|record| *record == result) {
-            *bare = full.clone();
-        } else {
-            records.push(full.clone());
-        }
+    else {
+        return;
+    };
+    let Some(result) = with_the_call.get("result") else {
+        return;
+    };
+    if let Some(same_fetch_without_the_call) = records.iter_mut().find(|record| *record == result) {
+        *same_fetch_without_the_call = with_the_call.clone();
+    } else {
+        records.push(with_the_call.clone());
     }
-    // An error is not material: it says a source could not be reached, which a later turn can do
-    // nothing with and a model can only mistake for a finding.
-    records.retain(|record| {
-        let result = record.get("result").unwrap_or(record);
-        result.get(engine_core::TOOL_RESULT_ERROR_KEY).is_none()
-    });
-    let first = records.len().saturating_sub(CARRIED_RECORDS);
-    records.split_off(first)
+}
+
+fn reached_its_source(record: &Value) -> bool {
+    let result = record.get("result").unwrap_or(record);
+    result.get(engine_core::TOOL_RESULT_ERROR_KEY).is_none()
 }
 
 fn execution_input(input_json: &str) -> Result<Value, EngineError> {
@@ -113,10 +125,6 @@ fn execution_input(input_json: &str) -> Result<Value, EngineError> {
     }
     Ok(input)
 }
-
-/// How many of an earlier turn's records travel. Matches what the `llm` executor renders, because
-/// carrying more than is ever read is weight in every checkpoint for nothing.
-const CARRIED_RECORDS: usize = 4;
 
 fn already_stored(row: &entity::graph::Model, definition: &Graph) -> bool {
     let mut candidate = definition.clone();
@@ -246,7 +254,7 @@ impl Service {
     ) -> Result<Uuid, EngineError> {
         let mut input = execution_input(input_json)?;
         if let Some(parent) = continues {
-            self.carry_material_from(parent, &mut input).await;
+            self.carry_material_from(parent, user_id, &mut input).await;
         }
         let (graph_row, graph) = self.load_graph(&graph_id, version).await?;
 
@@ -293,18 +301,11 @@ impl Service {
         Ok(execution_id)
     }
 
-    /// Copies what the earlier execution's sources returned into this one's initial state. A
-    /// follow-up — "where?", "explain that more simply" — asks about material already fetched, and
-    /// without it the turn has nothing to answer from: it would either fetch again, which for a
-    /// question like "where?" it cannot, or decline something it has in hand.
-    ///
-    /// Only the tool results travel. Nothing about where the earlier execution had got to is
-    /// carried, because the continuation is a fresh run of the graph and inheriting a position in
-    /// one would resume it rather than begin it.
-    ///
-    /// A parent that cannot be read is not an error: the follow-up runs without the material, which
-    /// is exactly today's behaviour, and losing a checkpoint must not lose the turn.
-    async fn carry_material_from(&self, parent: Uuid, input: &mut Value) {
+    async fn carry_material_from(&self, parent: Uuid, caller: Option<Uuid>, input: &mut Value) {
+        if !self.execution_belongs_to(parent, caller).await {
+            tracing::warn!(%parent, "earlier turn belongs to another user, carrying nothing");
+            return;
+        }
         let carried = match self.latest_checkpoint(parent).await {
             Ok(Some(checkpoint)) => Some(carried_records(&checkpoint.state)),
             Ok(None) => None,

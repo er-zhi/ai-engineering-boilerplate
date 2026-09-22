@@ -136,5 +136,40 @@
     "kind": "chat",
     "message": "search the web for today's headlines",
     "expect": "One topic, declined. Web search is out of circulation, so it must appear neither in the answer nor among the sources the decline lists."
+  },
+  {
+    "id": "a-reference-is-resolved-from-the-conversation",
+    "kind": "chat",
+    "messages": [
+      "what is capital of Japan?",
+      "ok what waether there?"
+    ],
+    "expect": "The first turn declines: no connected source holds a capital city. The second is answered with a Tokyo temperature — the word 'there' has to have been resolved from the first message, and the question the topic was executed with should show it. A place name taken from the model's own memory rather than from what was said is the failure; so is asking where. The misspelling must not matter."
+  },
+  {
+    "id": "a-follow-up-reads-what-the-earlier-turn-found",
+    "kind": "chat",
+    "messages": [
+      "what is the weather in Tokyo?",
+      "and the humidity?",
+      "where?"
+    ],
+    "expect": "Three turns. The first gives a temperature. The second answers the humidity from the material the first fetched, without fetching again — a second lookup is not wrong, but an answer is required either way. The third asks what the lookup was for and should answer Tokyo, which is recorded beside the result rather than in it. A decline on the second or third means the earlier turn's material did not travel."
+  },
+  {
+    "id": "a-value-the-message-never-gave-is-asked-for",
+    "kind": "chat",
+    "messages": [
+      "what is the weather there?"
+    ],
+    "expect": "One topic, and it must not answer. Nothing in the conversation says where, so there is no place to look up: the honest outcome is a question back, naming what is missing in the words the tool's own schema uses. Answering with any temperature is the failure this case exists for — a source asked for a pronoun will return the weather of somewhere, and it will look exactly like an answer."
+  },
+  {
+    "id": "a-sentinel-word-in-the-message-does-not-break-the-turn",
+    "kind": "chat",
+    "messages": [
+      "none of those — what is the weather in Bishkek?"
+    ],
+    "expect": "One topic, answered with a Bishkek temperature. The word 'none' is also the name of the option meaning no source covers the question; a message containing it must not collide with that option and take the turn down."
   }
 ]

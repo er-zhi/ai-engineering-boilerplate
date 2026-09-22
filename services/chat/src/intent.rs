@@ -1,6 +1,4 @@
-// Routes one user turn with one typed decision. Three questions ride the same call because a second
-// question is far cheaper than a second round trip, and the whole point here is that the user sees
-// something back immediately.
+// Routes one user turn onto new or existing topics with one typed decision.
 
 use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
@@ -18,71 +16,19 @@ use serde::{Deserialize, Serialize};
 use crate::entity::topic::Status;
 use crate::topic_status::status_word;
 
-/// `Decide` gets its own deadline, separate from `Complete`'s (see `COMPLETE_CALL_TIMEOUT` below —
-/// the two must never again share one constant). Measured in this deployment, `Decide`'s p50 is
-/// about 155 ms against `Complete`'s p50 of about 2000 ms (`llm_router.decisions.latency_ms` and
-/// `llm_router.requests.latency_ms`). 2 s leaves wide headroom above that p50, because real latency
-/// can still stack up before an answer arrives: a cold connection (no warm pool yet), and our own
-/// hop out to llm-router and back. `Decide` is advisory — see `route`'s doc and `fallback` below —
-/// so this bounds how long a user waits for the deterministic fallback to kick in on a bad day, not
-/// how generously the vendor is normally treated.
-///
-/// **This is the OUTER half of a matched pair with llm-router's own
-/// `adapters::system_one::REQUEST_TIMEOUT` (the INNER one, 1.5 s) — the inner must stay strictly
-/// below this one, and if you change one, change both.** This client asserts this deadline on the
-/// wire as the `grpc-timeout` header; `connectrpc`'s server on llm-router's side parses it on
-/// receipt and wraps that whole side's dispatch — including the pending vendor HTTP call the inner
-/// timeout bounds — in its own `timeout_at`, started the moment the request lands there, strictly
-/// earlier than the inner adapter's own clock (which only starts once it actually issues its HTTP
-/// call). Two equal deadlines with an earlier and a later start are not a race: the outer one —
-/// this one — always wins, and when it does, llm-router drops that whole future, including its
-/// audit write, before that write ever runs — silently losing the very latency measurement this
-/// budget was tuned from. Keep this strictly above the inner one, with margin.
 const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
-/// `Complete` produces generated text, not a typed decision, and keeps the older, more generous
-/// budget this timeout always had. Unrelated to, and unaffected by, `DECIDE_CALL_TIMEOUT` above —
-/// each client below is built with its own `ClientConfig`, so changing one can never silently move
-/// the other.
 const COMPLETE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_TITLE_CHARS: usize = 60;
 
-/// Getting this wrong is not symmetric: asking a person to repeat themselves costs one extra
-/// exchange, while letting an agent execution run a full minute on a bare greeting costs the whole
-/// exchange. So the turn only stops short once the model is fairly confident (under 35%) that it
-/// carries no request at all, rather than clarifying at the first sign of doubt.
-const ACTIONABLE_THRESHOLD: f64 = 0.35;
-/// Below this the model cannot separate the options at all, and the deterministic focus rule is a
-/// better answer than its guess.
-const ROUTE_CONFIDENCE_THRESHOLD: f64 = 0.5;
-/// Splitting a message that holds one theme costs a completion and produces two half-topics, so
-/// this asks for real certainty.
-const SEPARATE_THEMES_THRESHOLD: f64 = 0.75;
-/// Below this the split dropped something, and the turn is answered as one topic carrying the whole
-/// message instead. A split is a convenience — themes answered separately, each arriving as it is
-/// ready — while a dropped theme is an answer the person never gets, so the two are not traded off
-/// against each other: the split is kept only when it is known to have kept everything.
-///
-/// Why a check rather than a better prompt: counting the themes, cutting the message and rewriting
-/// each part are three judgements in one generative call, and a lighter model makes them worse. The
-/// rewriting genuinely needs a generative model; noticing that a part went missing does not.
-const COVERS_EVERYTHING_THRESHOLD: f64 = 0.5;
-/// Below this a question was left leaning on the rest of the message, which the topic answering it
-/// will never see: each topic is executed with its own `question` and nothing more, so "what is the
-/// weather there?" reaches an agent that answers by asking where.
-///
-/// Such a question is repaired rather than refused: it becomes the whole message, and its topic
-/// title still says which part of it that topic is for. The split — themes answered separately,
-/// each arriving as it is ready — is what the person asked for, and it survives one theme having
-/// been written carelessly.
-const STANDS_ALONE_THRESHOLD: f64 = 0.5;
+const CLARIFY_WHEN_ACTIONABLE_BELOW: f64 = 0.35;
+const CONTINUE_FOCUS_WHEN_ROUTE_CONFIDENCE_BELOW: f64 = 0.5;
+const SPLIT_WHEN_SEPARATE_THEMES_ABOVE: f64 = 0.75;
+const KEEP_SPLIT_WHEN_COVERS_EVERYTHING_ABOVE: f64 = 0.5;
+const REWRITE_WHEN_STANDS_ALONE_BELOW: f64 = 0.5;
 
 pub const CLARIFICATION_TEXT: &str =
     "I didn't catch a request in that — what would you like me to find out?";
 
-/// Shown when a follow-up arrives while its topic's execution is still running and Engine's
-/// `Interrupt` reports back busy rather than accepting it — see `topic_turn.rs::send_turn`. This is
-/// the interim answer to a message that could not be delivered: it tells the user honestly rather
-/// than losing the turn behind an `internal` error, without queueing it for them.
 pub const ENGINE_BUSY_TEXT: &str =
     "Still working on the previous question — send that again in a moment.";
 
@@ -93,16 +39,9 @@ const ROUTE_ID: &str = "route";
 const ACTIONABLE_ID: &str = "actionable";
 const SEPARATE_THEMES_ID: &str = "separate_themes";
 const COVERS_EVERYTHING_ID: &str = "covers_everything";
-/// One per question the split produced, suffixed with its position.
-const STANDS_ALONE_PREFIX: &str = "stands_alone_";
-/// The same question asked of the message itself, on the routing decision. Measured over twelve
-/// messages: every one that leans on the conversation scored 0.05–0.10, every one that stands on
-/// its own 0.82–0.98.
-const STANDS_ALONE_ID: &str = "stands_alone";
-/// How many earlier turns a rewrite may draw on. A reference points at something recent — two turns
-/// back at most in practice — and every extra turn is prompt weight and another thing to confuse it
-/// with.
-const RESOLVE_CONTEXT_TURNS: usize = 4;
+const STANDS_ALONE_PER_QUESTION_PREFIX: &str = "stands_alone_";
+const STANDS_ALONE_MESSAGE_ID: &str = "stands_alone";
+const EARLIER_TURNS_A_REWRITE_MAY_DRAW_ON: usize = 4;
 
 const ROUTE_INSTRUCTIONS: &str = "Which of these should the new message go to: one of the named \
 existing topics it continues, or a new topic?";
@@ -133,8 +72,6 @@ const STANDS_ALONE_WHEN_TRUE: &str =
 const STANDS_ALONE_WHEN_FALSE: &str = "it leans on something outside itself — \"there\", \"it\", \
 \"that one\", \"the same\" — so alone nobody could tell what it asks about";
 
-/// Rewriting a reference is reading the conversation, not remembering facts. The rule that keeps
-/// the two apart is the split prompt's: take the words from what was said, and no further.
 const RESOLVE_SYSTEM_PROMPT: &str = "\
 The new message below leans on something said earlier — \"there\", \"it\", \"that one\", \"the \
 same\". Rewrite it so it stands on its own.
@@ -220,38 +157,21 @@ pub struct TopicSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    Continue {
-        topic_id: i64,
-        /// The turn as the topic should receive it. A message leaning on the conversation —
-        /// "where?" — is rewritten here against the session's own turns, because a topic is
-        /// executed with its question and nothing else, and a continuation is no different.
-        question: String,
-    },
-    New {
-        title: String,
-        question: String,
-    },
+    Continue { topic_id: i64, question: String },
+    New { title: String, question: String },
 }
 
-/// What the check over a split found. `Missing` and `Unavailable` are both failures, but only one
-/// of them is worth asking about again: a split that left a theme behind can be asked for properly,
-/// while a decision that never arrived would only fail the same way twice.
-enum Verdict {
+enum SplitVerdict {
     Keeps(Vec<Action>),
-    Missing,
+    MissingATheme,
     Unavailable,
 }
 
-/// What the second ask adds. It names the failure without naming the missing theme — the model has
-/// the message and can see for itself, and telling it what to add invites it to add only that.
 const SPLIT_RETRY_NOTE: &str = "\nYour previous split was refused: between them, the questions did \
 not ask for everything this message asks for. Something in it was left with no topic of its own. \
 Split it again, covering all of it.\n";
 
-/// What one turn is routed to. `Clarify` is reached only when nothing existing was chosen and the
-/// message itself carried no actionable request — see `TopicIntent::route`.
 pub enum Routing {
-    /// Nothing to act on. No topic is created and no execution starts.
     Clarify,
     Act(Vec<Action>),
 }
@@ -287,12 +207,6 @@ fn plan_shape(actions: Vec<RawAction>) -> String {
 pub struct TopicIntent {
     llm: LlmRouterServiceClient<HttpClient>,
     decider: SystemOneServiceClient<HttpClient>,
-    /// `route`'s option ceiling, read once from `DescribeModels` — see `load_decision_budget` below
-    /// — and never refreshed after. `OnceLock` because it is written at most once, from Chat's
-    /// startup path in `main.rs` before any turn is routed, and then only ever read — concurrently,
-    /// by every turn after that, with no lock contention on the hot path. Unset (never loaded, or
-    /// `DescribeModels` failed) is handled identically to a loaded-but-zero budget: see
-    /// `route_options_cap`, which treats both as "no known cap" rather than "send no options".
     decision_budget: OnceLock<DecisionBudget>,
 }
 
@@ -319,13 +233,6 @@ impl TopicIntent {
         })
     }
 
-    /// Reads the decision budget once, called from Chat's startup path (`main.rs`) strictly before
-    /// any turn is routed — never lazily, so no turn ever pays for this call on the latency path.
-    /// Every failure — an unreachable router, an error response, a malformed reply — is logged at
-    /// `warn` and leaves the budget unset. This must never fail or panic: `Decide` is advisory (see
-    /// `route`'s doc), so the budget describing it is too, and a router that is down at boot must
-    /// not stop Chat from serving turns it would route by fallback anyway. A second call is a
-    /// silent no-op — `OnceLock::set` keeps whatever the first call wrote — matching "read once".
     pub async fn load_decision_budget(&self) {
         match self
             .decider
@@ -349,10 +256,6 @@ impl TopicIntent {
         }
     }
 
-    /// `route`'s live option ceiling, derived from whatever `load_decision_budget` last read.
-    /// `None` — nothing was ever loaded, or what was loaded named no positive ceiling — means "no
-    /// known cap": the proto default for an absent or unset budget is zero, and a zero ceiling must
-    /// not be read as "offer nothing" (see `capped_topics`'s doc for why that is safe).
     fn route_options_cap(&self) -> Option<usize> {
         self.decision_budget
             .get()
@@ -360,8 +263,6 @@ impl TopicIntent {
             .filter(|cap| *cap > 0)
     }
 
-    /// Routes one user turn. See the module doc for the read order of the three answers — it is
-    /// load-bearing, not an implementation detail to simplify away.
     pub async fn route(
         &self,
         topics: &[TopicSummary],
@@ -369,27 +270,31 @@ impl TopicIntent {
         message: &str,
     ) -> Routing {
         let Some(request) = build_request(topics, focus, message, self.route_options_cap()) else {
-            return Routing::Act(fallback(topics, focus, message));
+            return Routing::Act(continue_focus_or_open_one_topic(topics, focus, message));
         };
 
         let decided = match self.decider.decide(request).await {
             Ok(response) => response.into_owned(),
             Err(error) => {
                 tracing::warn!(%error, "topic intent decision failed");
-                return Routing::Act(fallback(topics, focus, message));
+                return Routing::Act(continue_focus_or_open_one_topic(topics, focus, message));
             }
         };
         if decided.answers.is_empty() {
-            return Routing::Act(fallback(topics, focus, message));
+            return Routing::Act(continue_focus_or_open_one_topic(topics, focus, message));
         }
 
         if !topics.is_empty() {
             match route_outcome(&decided.answers, topics) {
                 RouteOutcome::Continue(topic_id) => {
-                    let question = self.standing_alone(&decided.answers, topics, message).await;
+                    let question = self
+                        .question_that_stands_alone(&decided.answers, topics, message)
+                        .await;
                     return Routing::Act(vec![Action::Continue { topic_id, question }]);
                 }
-                RouteOutcome::Fallback => return Routing::Act(fallback(topics, focus, message)),
+                RouteOutcome::Fallback => {
+                    return Routing::Act(continue_focus_or_open_one_topic(topics, focus, message));
+                }
                 RouteOutcome::ConfidentNew => {}
             }
         }
@@ -397,56 +302,49 @@ impl TopicIntent {
         if noul_above(
             &decided.answers,
             SEPARATE_THEMES_ID,
-            SEPARATE_THEMES_THRESHOLD,
+            SPLIT_WHEN_SEPARATE_THEMES_ABOVE,
         ) && let Some(actions) = self.split(topics, message).await
         {
             return Routing::Act(actions);
         }
 
-        if noul_below(&decided.answers, ACTIONABLE_ID, ACTIONABLE_THRESHOLD) {
+        if noul_below(
+            &decided.answers,
+            ACTIONABLE_ID,
+            CLARIFY_WHEN_ACTIONABLE_BELOW,
+        ) {
             return Routing::Clarify;
         }
 
-        // A topic is executed with its own question and nothing else, so a message leaning on the
-        // turn before it — "weather there?" — reaches an agent that cannot know where. The split
-        // path has always checked this; a message with one theme never faced it, and that is where
-        // the conversation's memory was being lost.
-        // Only a verdict that arrived and came back low rewrites anything. A decision that did not
-        // answer leaves the message exactly as the person wrote it: this may repair a reference,
-        // never invent one.
-        let question = self.standing_alone(&decided.answers, topics, message).await;
+        let question = self
+            .question_that_stands_alone(&decided.answers, topics, message)
+            .await;
         Routing::Act(vec![Action::New {
             title: truncate(message, MAX_TITLE_CHARS),
             question,
         }])
     }
 
-    /// The message as a topic should receive it: rewritten against the conversation when it leans
-    /// on it, and untouched otherwise. Only a verdict that arrived and came back low rewrites
-    /// anything — a decision that did not answer leaves the person's words exactly as written, so
-    /// this may repair a reference and never invent one.
-    async fn standing_alone(
+    async fn question_that_stands_alone(
         &self,
         answers: &[Answer],
         topics: &[TopicSummary],
         message: &str,
     ) -> String {
-        if noul_below(answers, STANDS_ALONE_ID, STANDS_ALONE_THRESHOLD) {
-            self.resolved_against(topics, message).await
+        if leans_on_the_conversation(answers, STANDS_ALONE_MESSAGE_ID) {
+            self.rewritten_against_the_conversation(topics, message)
+                .await
         } else {
             message.to_owned()
         }
     }
 
-    /// Rewrites a message that leans on the conversation so it stands on its own, using the words
-    /// of the session's own turns. Reading what was said earlier is reading the conversation, not
-    /// the model's memory: "weather there?" after "what is capital of Japan?" becomes "the weather
-    /// in the capital of Japan", which points at one place — never "in Tokyo", which nobody said.
-    ///
-    /// Spent only on the turns that need it, and a failure leaves the message as it was: an
-    /// unresolved reference is answered badly, but losing the turn is worse.
-    async fn resolved_against(&self, topics: &[TopicSummary], message: &str) -> String {
-        let Some(context) = recent_context(topics) else {
+    async fn rewritten_against_the_conversation(
+        &self,
+        topics: &[TopicSummary],
+        message: &str,
+    ) -> String {
+        let Some(context) = recent_turns_newest_last(topics) else {
             return message.to_owned();
         };
         let response = self
@@ -476,44 +374,34 @@ impl TopicIntent {
         }
     }
 
-    // The one branch that still needs generated text: several themes in one message, each becoming
-    // its own topic. Every other outcome is read straight off the typed decision.
-    //
-    // A split that leaves a theme behind is asked for again, once, with the omission stated, rather
-    // than dropped. Dropping it answers the whole message as one topic, and one topic carrying
-    // three separate errands is the shape that gets promised rather than done — the cost of the
-    // fallback is the failure it was meant to avoid. The second ask is spent only on the turns that
-    // needed it; a split that covers the message the first time pays nothing.
     async fn split(&self, topics: &[TopicSummary], message: &str) -> Option<Vec<Action>> {
         let actions = self.ask_split(topics, message, "").await?;
-        match self.judge_split(message, actions).await {
-            Verdict::Keeps(actions) => Some(actions),
-            Verdict::Unavailable => None,
-            Verdict::Missing => {
+        match self.judge_and_repair_split(message, actions).await {
+            SplitVerdict::Keeps(actions) => Some(actions),
+            SplitVerdict::Unavailable => None,
+            SplitVerdict::MissingATheme => {
                 tracing::info!("a split left a theme behind, asking once more");
                 let again = self.ask_split(topics, message, SPLIT_RETRY_NOTE).await?;
-                match self.judge_split(message, again).await {
-                    Verdict::Keeps(actions) => Some(actions),
+                match self.judge_and_repair_split(message, again).await {
+                    SplitVerdict::Keeps(actions) => Some(actions),
                     _ => None,
                 }
             }
         }
     }
 
-    /// One generative split. `note` is appended to the message the model is shown, and is empty on
-    /// the first ask.
     async fn ask_split(
         &self,
         topics: &[TopicSummary],
         message: &str,
-        note: &str,
+        retry_note: &str,
     ) -> Option<Vec<Action>> {
         let response = self
             .llm
             .complete(CompleteRequest {
                 tier: EnumValue::Known(QualityTier::Low),
                 system_prompt: SPLIT_SYSTEM_PROMPT.clone(),
-                user_prompt: format!("New user message:\n{message}\n{note}"),
+                user_prompt: format!("New user message:\n{message}\n{retry_note}"),
                 sampling: Sampling {
                     response_format: Some(EnumValue::Known(ResponseFormat::JsonObject)),
                     ..Default::default()
@@ -526,19 +414,7 @@ impl TopicIntent {
         parse_actions(&response.into_owned().content, topics)
     }
 
-    /// Judges a split and repairs what it can. One request over the message and the questions it
-    /// produced asks two different things: whether the questions between them still ask for
-    /// everything the message asked for, and — separately, for each question — whether it could be
-    /// answered by someone shown only that question.
-    ///
-    /// The two failures are not the same and are not treated the same. A theme that went missing
-    /// is `Missing`, which the caller asks about again — the split itself is what the person asked
-    /// for. A question left saying "there" is repaired here and now: it becomes the message, and
-    /// its topic title still says which part of it that topic is for.
-    ///
-    /// A decision that does not arrive is `Unavailable` and drops the split, because a split nobody
-    /// vouched for is not worth the answer it might lose.
-    async fn judge_split(&self, message: &str, actions: Vec<Action>) -> Verdict {
+    async fn judge_and_repair_split(&self, message: &str, actions: Vec<Action>) -> SplitVerdict {
         let questions: Vec<&str> = actions
             .iter()
             .filter_map(|action| match action {
@@ -546,26 +422,18 @@ impl TopicIntent {
                 Action::Continue { .. } => None,
             })
             .collect();
-        // One question is checked too. Getting here means the decision said the message raises
-        // several themes, so a split that came back with a single topic has collapsed the rest into
-        // it — the failure this check exists for, in its most complete form.
-        if questions.is_empty() {
-            return Verdict::Keeps(actions);
+        let split_produced_no_questions = questions.is_empty();
+        if split_produced_no_questions {
+            return SplitVerdict::Keeps(actions);
         }
-        let Some(mut asked) = covers_everything_question().map(|first| vec![first]) else {
-            return Verdict::Unavailable;
+        let Some(asked) = split_judgement_questions(questions.len()) else {
+            return SplitVerdict::Unavailable;
         };
-        for at in 0..questions.len() {
-            let Some(question) = stands_alone_question(at) else {
-                return Verdict::Unavailable;
-            };
-            asked.push(question);
-        }
         let state = serde_json::json!({ "message": message, "questions": questions });
         let Ok(base) =
             serde_json::from_value::<DecideRequest>(serde_json::json!({ "state": state }))
         else {
-            return Verdict::Unavailable;
+            return SplitVerdict::Unavailable;
         };
         let request = DecideRequest {
             questions: asked,
@@ -575,51 +443,62 @@ impl TopicIntent {
             Ok(response) => response.into_owned().answers,
             Err(error) => {
                 tracing::warn!(%error, "could not judge a split, so it was dropped");
-                return Verdict::Unavailable;
+                return SplitVerdict::Unavailable;
             }
         };
-        if !noul_above(&answers, COVERS_EVERYTHING_ID, COVERS_EVERYTHING_THRESHOLD) {
-            return Verdict::Missing;
+        if !noul_above(
+            &answers,
+            COVERS_EVERYTHING_ID,
+            KEEP_SPLIT_WHEN_COVERS_EVERYTHING_ABOVE,
+        ) {
+            return SplitVerdict::MissingATheme;
         }
-        let mut at = 0;
-        Verdict::Keeps(
-            actions
-                .into_iter()
-                .map(|action| match action {
-                    Action::New { title, question } => {
-                        let id = format!("{STANDS_ALONE_PREFIX}{at}");
-                        at += 1;
-                        let alone = noul_above(&answers, &id, STANDS_ALONE_THRESHOLD);
-                        let repaired = scoped_to(message, &title);
-                        Action::New {
-                            title,
-                            question: if alone { question } else { repaired },
-                        }
-                    }
-                    other => other,
-                })
-                .collect(),
-        )
+        SplitVerdict::Keeps(questions_made_to_stand_alone(actions, &answers, message))
     }
 }
 
-/// A question that could not stand alone, made to stand: the whole message, so the reference it
-/// leans on is there to be resolved, and a line saying which part of it this topic answers — the
-/// topic's own title, which the agent never sees otherwise, because a topic is executed with its
-/// `question` and nothing else. Without the second line the agent tries to answer the whole
-/// message and promises rather than does.
-fn scoped_to(message: &str, title: &str) -> String {
+fn split_judgement_questions(question_count: usize) -> Option<Vec<Question>> {
+    let mut asked = vec![covers_everything_question()?];
+    for at in 0..question_count {
+        asked.push(stands_alone_question(at)?);
+    }
+    Some(asked)
+}
+
+fn questions_made_to_stand_alone(
+    actions: Vec<Action>,
+    answers: &[Answer],
+    message: &str,
+) -> Vec<Action> {
+    let mut at = 0;
+    actions
+        .into_iter()
+        .map(|action| match action {
+            Action::New { title, question } => {
+                let id = format!("{STANDS_ALONE_PER_QUESTION_PREFIX}{at}");
+                at += 1;
+                let repaired = whole_message_scoped_to_title(message, &title);
+                Action::New {
+                    title,
+                    question: if stands_alone_or_no_verdict_arrived(answers, &id) {
+                        question
+                    } else {
+                        repaired
+                    },
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+fn whole_message_scoped_to_title(message: &str, title: &str) -> String {
     format!("{message}\n\nAnswer only this part of it: {title}")
 }
 
-/// An array, not an object: `Question.instructions` says outright that an object's keys reach the
-/// model re-sorted alphabetically, which would put the subject after the thing asked about it. The
-/// order here is the whole meaning — which question, then what to judge about it.
-/// The same judgement the split makes of each question it produces, made of the message itself.
-/// Asked on the routing decision, so it costs nothing beyond the call that already runs.
 fn stands_alone_question_for_message() -> Option<Question> {
     let mut question = instructed(
-        STANDS_ALONE_ID,
+        STANDS_ALONE_MESSAGE_ID,
         serde_json::json!(STANDS_ALONE_MESSAGE_INSTRUCTIONS),
     )?;
     question.kind = Noul {
@@ -632,12 +511,13 @@ fn stands_alone_question_for_message() -> Option<Question> {
 }
 
 fn stands_alone_question(at: usize) -> Option<Question> {
+    let instructions_kept_in_order = serde_json::json!([
+        format!("About `questions[{at}]`, and nothing else:"),
+        STANDS_ALONE_INSTRUCTIONS,
+    ]);
     let mut question = instructed(
-        &format!("{STANDS_ALONE_PREFIX}{at}"),
-        serde_json::json!([
-            format!("About `questions[{at}]`, and nothing else:"),
-            STANDS_ALONE_INSTRUCTIONS,
-        ]),
+        &format!("{STANDS_ALONE_PER_QUESTION_PREFIX}{at}"),
+        instructions_kept_in_order,
     )?;
     question.kind = Noul {
         when_true: Some(STANDS_ALONE_WHEN_TRUE.to_owned()),
@@ -648,12 +528,7 @@ fn stands_alone_question(at: usize) -> Option<Question> {
     Some(question)
 }
 
-/// Whether a topic's reply was an answer rather than the system talking about itself. A decline
-/// names the sources it has and a clarification names an argument it wants: both are our words, not
-/// the conversation's, and feeding them back as context is how "weather there?" became "weather in
-/// the current weather for a place" — the rewrite resolved the reference against the text of a
-/// refusal. A topic that ended without finding anything contributes its question and nothing more.
-fn answered(topic: &TopicSummary) -> bool {
+fn answered_without_talking_about_itself(topic: &TopicSummary) -> bool {
     topic.status == Status::Completed
         && topic
             .result_summary
@@ -661,23 +536,21 @@ fn answered(topic: &TopicSummary) -> bool {
             .is_some_and(|reply| !common::agent_replies::is_about_itself(reply))
 }
 
-/// The session's recent turns, newest last, as the text a rewrite may draw on. Questions and
-/// answers both: "what is capital of Japan?" is what "there" points at, and a topic's own answer is
-/// what "that" usually means.
-///
-/// `None` when there is nothing to draw on, and the message then stands as it is — there is nothing
-/// to resolve it against.
-fn recent_context(topics: &[TopicSummary]) -> Option<String> {
+fn recent_turns_newest_last(topics: &[TopicSummary]) -> Option<String> {
     let mut lines: Vec<String> = topics
         .iter()
         .rev()
-        .take(RESOLVE_CONTEXT_TURNS)
-        .map(
-            |topic| match topic.result_summary.as_deref().filter(|_| answered(topic)) {
+        .take(EARLIER_TURNS_A_REWRITE_MAY_DRAW_ON)
+        .map(|topic| {
+            match topic
+                .result_summary
+                .as_deref()
+                .filter(|_| answered_without_talking_about_itself(topic))
+            {
                 Some(answer) => format!("asked: {}\nanswered: {answer}", topic.title),
                 None => format!("asked: {}", topic.title),
-            },
-        )
+            }
+        })
         .collect();
     if lines.is_empty() {
         return None;
@@ -700,9 +573,6 @@ fn covers_everything_question() -> Option<Question> {
     Some(question)
 }
 
-/// The JSON `Decide` reads the topics and message about. An array, not an object, because a
-/// `google.protobuf.Value` object's keys reach the model re-sorted alphabetically (it is a map),
-/// and topic order — the focused one first — is part of what is being asked about.
 fn decision_state(topics: &[TopicSummary], focus: Option<i64>, message: &str) -> serde_json::Value {
     let mut ordered: Vec<&TopicSummary> = Vec::with_capacity(topics.len());
     ordered.extend(topics.iter().filter(|topic| Some(topic.id) == focus));
@@ -752,19 +622,16 @@ fn instructed(id: &str, instructions: serde_json::Value) -> Option<Question> {
     Some(question)
 }
 
-/// Builds the `route` question: one option per offered topic, plus `new`. `options_cap` — the
-/// budget's `max_choice_options`, read once at startup (see `TopicIntent::load_decision_budget`) —
-/// bounds the whole option list, `new` included; see `capped_topics` for which topics are dropped
-/// and why dropping one is safe.
 fn route_question(topics: &[TopicSummary], options_cap: Option<usize>) -> Option<Question> {
-    let mut options: Vec<ChoiceOption> = capped_topics(topics, options_cap)
-        .iter()
-        .map(|topic| ChoiceOption {
-            name: format!("{TOPIC_OPTION_PREFIX}{}", topic.id),
-            description: Some(topic.title.clone()),
-            ..Default::default()
-        })
-        .collect();
+    let mut options: Vec<ChoiceOption> =
+        most_recent_topics_leaving_room_for_new(topics, options_cap)
+            .iter()
+            .map(|topic| ChoiceOption {
+                name: format!("{TOPIC_OPTION_PREFIX}{}", topic.id),
+                description: Some(topic.title.clone()),
+                ..Default::default()
+            })
+            .collect();
     options.push(ChoiceOption {
         name: NEW_TOPIC_OPTION.to_owned(),
         description: None,
@@ -779,16 +646,10 @@ fn route_question(topics: &[TopicSummary], options_cap: Option<usize>) -> Option
     Some(question)
 }
 
-/// Keeps at most `options_cap` topics, preferring the most recent, and always leaves one slot free
-/// for the `new` option `route_question` appends. `topics` arrives in ascending creation order
-/// (`SessionManager::get_session_view` orders by `CreatedAt` ascending), so "most recent" is the
-/// tail of the slice. `None` — no cap was ever loaded, or the router published none — returns every
-/// topic, exactly today's uncapped behaviour.
-///
-/// Dropping a topic from the options never makes it unreachable: `fallback` below continues the
-/// session's focused topic regardless of what `route` was ever asked about, so a topic left out
-/// here is only unofferable this turn, not unreachable — that is what makes the cap safe to apply.
-fn capped_topics(topics: &[TopicSummary], options_cap: Option<usize>) -> &[TopicSummary] {
+fn most_recent_topics_leaving_room_for_new(
+    topics: &[TopicSummary],
+    options_cap: Option<usize>,
+) -> &[TopicSummary] {
     let Some(cap) = options_cap else {
         return topics;
     };
@@ -822,11 +683,8 @@ fn separate_themes_question() -> Option<Question> {
 }
 
 enum RouteOutcome {
-    /// A confident pick of an existing topic — returned before `actionable` is ever consulted.
     Continue(i64),
-    /// The model could not separate the options, or named something that does not exist.
     Fallback,
-    /// A confident `new` — proceed to `separate_themes` / `actionable`.
     ConfidentNew,
 }
 
@@ -845,14 +703,11 @@ fn parse_route_choice(choice: &str) -> Option<RouteChoice> {
         .map(RouteChoice::Topic)
 }
 
-/// Reads `route` first. This is the ordering the module doc calls load-bearing: putting `route`
-/// ahead of `actionable` means a fragment that plainly continues a live topic — "and?", "i'm still
-/// waiting" — never reaches the clarification check, because it is never actionable on its own.
 fn route_outcome(answers: &[Answer], topics: &[TopicSummary]) -> RouteOutcome {
     let Some(choice) = find_choice(answers, ROUTE_ID) else {
         return RouteOutcome::Fallback;
     };
-    if choice.confidence < ROUTE_CONFIDENCE_THRESHOLD {
+    if choice.confidence < CONTINUE_FOCUS_WHEN_ROUTE_CONFIDENCE_BELOW {
         return RouteOutcome::Fallback;
     }
     match parse_route_choice(&choice.choice) {
@@ -882,6 +737,14 @@ fn find_choice<'a>(answers: &'a [Answer], id: &str) -> Option<&'a ChoiceAnswer> 
             Some(Given::Choice(choice)) => Some(choice.as_ref()),
             _ => None,
         })
+}
+
+fn stands_alone_or_no_verdict_arrived(answers: &[Answer], id: &str) -> bool {
+    find_noul(answers, id).is_none_or(|value| value > REWRITE_WHEN_STANDS_ALONE_BELOW)
+}
+
+fn leans_on_the_conversation(answers: &[Answer], id: &str) -> bool {
+    find_noul(answers, id).is_some_and(|value| value < REWRITE_WHEN_STANDS_ALONE_BELOW)
 }
 
 fn noul_above(answers: &[Answer], id: &str, threshold: f64) -> bool {
@@ -928,13 +791,12 @@ fn outermost_json_object(content: &str) -> Option<&str> {
     (end > start).then(|| &content[start..=end])
 }
 
-/// The behaviour the service had before any decision existed: continue the focus if it is still a
-/// live topic, otherwise open one new topic from the message verbatim. Every failure mode of
-/// `route` — unreachable router, an error response, no answers, an answer for an id never asked, a
-/// `topic_<id>` outside the session, a low-confidence route — lands here. Classification is
-/// advisory; a turn is never lost to it.
 #[must_use]
-pub(crate) fn fallback(topics: &[TopicSummary], focus: Option<i64>, message: &str) -> Vec<Action> {
+pub(crate) fn continue_focus_or_open_one_topic(
+    topics: &[TopicSummary],
+    focus: Option<i64>,
+    message: &str,
+) -> Vec<Action> {
     match focus {
         Some(topic_id) if topics.iter().any(|topic| topic.id == topic_id) => {
             vec![Action::Continue {
@@ -959,28 +821,19 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const CLARIFY_BELOW: f64 = ACTIONABLE_THRESHOLD - 0.1;
+    const ACTIONABLE_LOW_ENOUGH_TO_CLARIFY: f64 = CLARIFY_WHEN_ACTIONABLE_BELOW - 0.1;
 
-    /// A local mirror of llm-router's `adapters::system_one::REQUEST_TIMEOUT` (the INNER half of
-    /// the matched pair `DECIDE_CALL_TIMEOUT` documents above). This crate has no dependency on
-    /// `llm-router` to check against the real constant, so this pins the value the two are kept
-    /// in sync with by hand; llm-router's own `system_one` tests pin the same value from its
-    /// side. Keep both in sync with the real `system_one::REQUEST_TIMEOUT` when either changes.
-    const LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR: Duration = Duration::from_millis(1500);
+    const LLM_ROUTERS_INNER_REQUEST_TIMEOUT_MIRRORED_BY_HAND: Duration =
+        Duration::from_millis(1500);
 
-    // The invariant a lost audit row was traced to: connectrpc's server on llm-router's side
-    // starts its own deadline (this outer constant) strictly before llm-router's adapter starts
-    // its own inner one, so equal or larger and the outer always wins the race, dropping
-    // llm-router's decision future — audit write included — before it runs. Pins that the outer
-    // stays strictly above the inner.
     #[test]
     fn the_outer_chat_deadline_stays_strictly_above_llm_routers_inner_one() {
         assert!(
-            DECIDE_CALL_TIMEOUT > LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR,
+            DECIDE_CALL_TIMEOUT > LLM_ROUTERS_INNER_REQUEST_TIMEOUT_MIRRORED_BY_HAND,
             "Chat's outer Decide deadline must stay strictly above llm-router's own inner \
              vendor-call timeout, or the outer one always wins the race and llm-router's audit \
              row for that attempt is silently never written: {DECIDE_CALL_TIMEOUT:?} vs \
-             {LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR:?}"
+             {LLM_ROUTERS_INNER_REQUEST_TIMEOUT_MIRRORED_BY_HAND:?}"
         );
     }
 
@@ -994,10 +847,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_to_act_on_and_nothing_to_continue_asks() {
-        // No topics at all, so `route` is not even sent: a greeting in an empty session is the
-        // clarification case.
-        let (url, calls) = crate::fakes::serve_decider(vec![("actionable", CLARIFY_BELOW)]).await;
+    async fn a_greeting_in_an_empty_session_asks_instead_of_starting_a_topic() {
+        let (url, calls) =
+            crate::fakes::serve_decider(vec![("actionable", ACTIONABLE_LOW_ENOUGH_TO_CLARIFY)])
+                .await;
         let intent = TopicIntent::new(&url).expect("client");
         assert!(matches!(
             intent.route(&[], None, "hey").await,
@@ -1012,13 +865,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_fragment_aimed_at_a_live_topic_continues_it_instead_of_being_questioned() {
-        // "and?" carries no request of its own, so `actionable` is low — but it plainly continues
-        // the running topic, and interrogating the user about it is the failure this ordering
-        // exists to prevent.
         let (url, _) = crate::fakes::serve_decider_choosing_with(
             "topic_7",
             0.9,
-            vec![("actionable", CLARIFY_BELOW)],
+            vec![("actionable", ACTIONABLE_LOW_ENOUGH_TO_CLARIFY)],
         )
         .await;
         let intent = TopicIntent::new(&url).expect("client");
@@ -1079,10 +929,6 @@ mod tests {
         assert_eq!(question, &long);
     }
 
-    /// The failure the owner hit: "what is capital of Japan?" then "ok weather there?". The second
-    /// message opened a topic of its own carrying the word "there", which reached a weather source
-    /// and returned a village of that name in Pakistan. A message with one theme never faced the
-    /// check the split has always made of its own questions.
     #[tokio::test]
     async fn a_single_theme_message_leaning_on_the_conversation_is_resolved_against_it() {
         let (url, calls) = crate::fakes::serve_decider_resolving(
@@ -1117,7 +963,6 @@ mod tests {
         );
     }
 
-    /// A message that stands on its own is not rewritten, and costs nothing to leave alone.
     #[tokio::test]
     async fn a_message_that_stands_alone_is_left_exactly_as_written() {
         let (url, calls) =
@@ -1138,9 +983,6 @@ mod tests {
         assert_eq!(calls.completions(), 0);
     }
 
-    /// A topic is executed with its own `question` and nothing else, so a question left saying
-    /// "there" reaches an agent that cannot know where. The themes stay split — that is what was
-    /// asked for — and the question that cannot stand alone is given the whole message instead.
     #[tokio::test]
     async fn a_question_that_cannot_stand_alone_is_given_the_whole_message() {
         let (url, _calls) = crate::fakes::serve_decider_split_verdicts(
@@ -1174,9 +1016,6 @@ mod tests {
         }
     }
 
-    /// A split that leaves a theme behind is asked for again rather than dropped. Dropping it puts
-    /// the whole message on one topic, and one topic carrying three errands is what gets promised
-    /// instead of done — the fallback would cost exactly the failure it was meant to avoid.
     #[tokio::test]
     async fn a_split_that_leaves_a_theme_behind_is_asked_for_again() {
         let (url, calls) = crate::fakes::serve_decider_split_asked_again(
@@ -1206,9 +1045,6 @@ mod tests {
         assert_eq!(calls.completions(), 2, "and it cost exactly one extra ask");
     }
 
-    /// A split that loses a theme is not a faster answer, it is a missing one. When the decider
-    /// will not vouch that the questions cover the message, the turn becomes one topic carrying the
-    /// whole message — slower, and complete.
     #[tokio::test]
     async fn a_split_that_drops_a_theme_is_refused_and_the_whole_message_is_answered() {
         let (url, _calls) = crate::fakes::serve_decider_themes_covering(
@@ -1254,12 +1090,8 @@ mod tests {
         assert_eq!(calls.completions(), 1);
     }
 
-    // Real network on loopback (the fake server, the TCP and HTTP/2 handshake), virtual time for
-    // the deadline itself: `start_paused` only auto-advances the clock once nothing else is ready
-    // to run, so the handshake and request still complete at wall-clock speed, and only the
-    // "server never responds" wait is fast-forwarded.
     #[tokio::test(start_paused = true)]
-    async fn a_decider_that_never_answers_is_abandoned_within_the_new_deadline() {
+    async fn a_decider_that_never_answers_is_abandoned_at_the_decide_deadline() {
         let url = crate::fakes::serve_decider_hanging().await;
         let intent = TopicIntent::new(&url).expect("client");
 
@@ -1330,9 +1162,7 @@ mod tests {
         );
     }
 
-    // `many_topics` mirrors the order `SessionManager::get_session_view` hands `route`: ascending
-    // by creation, oldest first — so the highest id here is the most recently created topic.
-    fn many_topics(count: i64) -> Vec<TopicSummary> {
+    fn topics_oldest_first(count: i64) -> Vec<TopicSummary> {
         (1..=count)
             .map(|id| TopicSummary {
                 id,
@@ -1356,12 +1186,9 @@ mod tests {
         }
     }
 
-    // The "computed" half of the cap: route_question itself, exercised directly rather than
-    // through a network round trip, so this pins the cap arithmetic (exactly the cap, `new`
-    // included, most recent kept) independently of whether anything ever wires the cap in.
     #[test]
     fn route_options_are_capped_at_the_budget_keeping_the_most_recent_plus_new() {
-        let topics = many_topics(5); // ids 1..=5, 5 is the most recently created
+        let topics = topics_oldest_first(5);
         let question =
             route_question(&topics, Some(3)).expect("a route question with topics present");
         let names = choice_option_names(&question);
@@ -1387,14 +1214,11 @@ mod tests {
 
     #[test]
     fn no_cap_offers_every_topic_exactly_as_before() {
-        let topics = many_topics(5);
+        let topics = topics_oldest_first(5);
         let question = route_question(&topics, None).expect("a route question");
         assert_eq!(choice_option_names(&question).len(), 6, "5 topics plus new");
     }
 
-    // The "actually sent" half of the cap: goes through TopicIntent::route and a real (fake)
-    // network round trip, so this catches a bug where the cap is computed and stored but the
-    // request-building path that reaches the wire never receives it.
     #[tokio::test]
     async fn the_route_options_cap_reaches_what_actually_leaves_the_process() {
         let router = Arc::new(crate::fakes::FakeLlmRouter::default());
@@ -1407,7 +1231,7 @@ mod tests {
         let intent = TopicIntent::new(&url).expect("client");
         intent.load_decision_budget().await;
 
-        let topics = many_topics(5);
+        let topics = topics_oldest_first(5);
         let _ = intent.route(&topics, None, "hello").await;
 
         let sent = router.last_route_options();
@@ -1423,10 +1247,6 @@ mod tests {
         );
     }
 
-    // Task 3's other required test: DescribeModels being unavailable at startup must not stop
-    // Chat from working. load_decision_budget must not panic or hang, and a turn afterward must
-    // still route on the uncapped default — proving the router's Decide path is unaffected by its
-    // DescribeModels path failing.
     #[tokio::test]
     async fn describe_models_being_unavailable_at_startup_leaves_chat_working_on_the_defaults() {
         let router = Arc::new(crate::fakes::FakeLlmRouter::default());
@@ -1437,7 +1257,7 @@ mod tests {
 
         intent.load_decision_budget().await;
 
-        let topics = many_topics(5);
+        let topics = topics_oldest_first(5);
         let Routing::Act(actions) = intent.route(&topics, None, "hello").await else {
             panic!("a turn must still route even though the startup budget fetch failed");
         };
@@ -1457,9 +1277,6 @@ mod tests {
         );
     }
 
-    // An unreachable router at startup — not just a router that answers with an error — must be
-    // just as harmless: load_decision_budget must return normally rather than hang or panic, and
-    // routing afterward must fall back exactly as it always has.
     #[tokio::test]
     async fn an_unreachable_router_at_startup_still_lets_a_turn_route_by_fallback() {
         let intent = TopicIntent::new("http://127.0.0.1:1").expect("client");

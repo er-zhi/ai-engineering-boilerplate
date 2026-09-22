@@ -79,19 +79,23 @@ impl TopicManager {
             .await
     }
 
-    /// `continues` names the execution this topic follows on from. Engine carries what that
-    /// execution's sources returned into this one; Chat never holds that material itself.
     pub async fn create_topic_continuing(
         self: &Arc<Self>,
         user_id: Uuid,
         parent_id: Option<i64>,
         title: String,
         input_json: serde_json::Value,
-        continues: Option<Uuid>,
+        continues_execution_id: Option<Uuid>,
     ) -> Result<(i64, Status), ChatError> {
         let session = self.session.get_or_create_session(user_id).await?;
         let row = self
-            .insert_topic(session.id, parent_id, title, input_json, continues)
+            .insert_topic(
+                session.id,
+                parent_id,
+                title,
+                input_json,
+                continues_execution_id,
+            )
             .await?;
 
         self.publish(
@@ -130,7 +134,7 @@ impl TopicManager {
         parent_id: Option<i64>,
         title: String,
         input_json: serde_json::Value,
-        continues: Option<Uuid>,
+        continues_execution_id: Option<Uuid>,
     ) -> Result<topic::Model, ChatError> {
         let txn = self.session.db.begin().await?;
         let locked = lock_session(&txn, session_id).await?;
@@ -143,7 +147,7 @@ impl TopicManager {
                         &principal,
                         AGENT_GRAPH_ID,
                         &input_json.to_string(),
-                        continues.map(|id| id.to_string()).as_deref(),
+                        continues_execution_id.map(|id| id.to_string()).as_deref(),
                     )
                     .await
                     .map_err(ChatError::Engine)?,
@@ -235,10 +239,6 @@ impl TopicManager {
         }
     }
 
-    /// Reads `route`'s decision budget once — see `TopicIntent::load_decision_budget` — from Chat's
-    /// startup path in `main.rs`, before `recover` and before any turn is routed. Never fails: any
-    /// problem reaching or parsing `DescribeModels` is logged there and leaves routing on the "no
-    /// known cap" default, exactly as if this were never called.
     pub async fn load_decision_budget(&self) {
         self.intent.load_decision_budget().await;
     }

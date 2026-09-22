@@ -26,7 +26,7 @@ pub fn parse<T: DeserializeOwned>(input: &Value) -> Result<T, String> {
 pub struct Search {
     /// A search takes the asking words themselves, so this is the one argument shape that may be
     /// handed a message verbatim. The annotation is spelled out here because a derive attribute
-    /// takes a literal; `a_searchs_query_is_annotated_as_free_text` holds it to
+    /// takes a literal; `a_search_query_argument_is_annotated_as_free_text` holds it to
     /// `common::tool_schema::ACCEPTS_FREE_TEXT` so the two cannot drift.
     #[schemars(extend("x-accepts-free-text" = true))]
     pub query: String,
@@ -153,7 +153,7 @@ mod annotation_tests {
     /// The derive takes a string literal, so the annotation's spelling lives in two crates. This
     /// holds them together: Engine reads the catalog looking for exactly this key.
     #[test]
-    fn a_searchs_query_is_annotated_as_free_text() {
+    fn a_search_query_argument_is_annotated_as_free_text() {
         let schema = input_schema::<Search>();
         let query = &schema["properties"]["query"];
         assert!(

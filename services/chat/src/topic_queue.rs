@@ -51,9 +51,15 @@ impl TopicManager {
             txn.commit().await?;
             return Ok(());
         };
+        let continues = parent_execution_of(&txn, next.parent_id).await;
         let execution_id = self
             .engine
-            .start_execution(&principal, AGENT_GRAPH_ID, &next.input_json.to_string())
+            .start_continuing(
+                &principal,
+                AGENT_GRAPH_ID,
+                &next.input_json.to_string(),
+                continues.map(|id| id.to_string()).as_deref(),
+            )
             .await
             .map_err(ChatError::Engine)?;
         let mut active: topic::ActiveModel = next.clone().into();
@@ -72,6 +78,20 @@ impl TopicManager {
         .await;
         self.spawn_watch(next.id, execution_id);
         Ok(())
+    }
+}
+
+async fn parent_execution_of(
+    txn: &sea_orm::DatabaseTransaction,
+    parent_id: Option<i64>,
+) -> Option<Uuid> {
+    let parent_id = parent_id?;
+    match topic::Entity::find_by_id(parent_id).one(txn).await {
+        Ok(parent) => parent.and_then(|parent| parent.execution_id),
+        Err(error) => {
+            tracing::warn!(parent_id, %error, "could not read the earlier turn of a queued topic");
+            None
+        }
     }
 }
 

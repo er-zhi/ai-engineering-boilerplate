@@ -1,0 +1,86 @@
+[
+  {
+    "slug": "weather_now",
+    "name": "Current weather for a place",
+    "description": "Returns the current weather for a named place, asked of several independent weather services at once and read straight from whichever answers first. Always gives the temperature and humidity; the sky and the wind come too when the service that wins the race reports them. Takes the place on its own, such as \"Bishkek\" or \"Tokyo\", never a whole sentence. Use this instead of searching the web whenever the question is about the weather somewhere.",
+    "timeout_seconds": 8,
+    "input_schema": {
+      "type": "object",
+      "required": [
+        "place"
+      ],
+      "properties": {
+        "place": {
+          "type": "string",
+          "description": "the place whose weather is asked about",
+          "x-value-in-message": true
+        }
+      }
+    },
+    "sources": {
+      "fan_out": 3,
+      "take": 1,
+      "sources": [
+        {
+          "name": "weatherapi",
+          "url": "https://api.weatherapi.com/v1/current.json?key=${WEATHERAPI_KEY}&q={place}",
+          "pick": "current"
+        },
+        {
+          "name": "openweathermap",
+          "url": "https://api.openweathermap.org/data/2.5/weather?q={place}&units=metric&appid=${OPENWEATHERMAP_KEY}",
+          "pick": "main"
+        },
+        {
+          "name": "wttr",
+          "url": "https://wttr.in/{place}?format=j1",
+          "pick": "current_condition.0"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "currency_rate",
+    "name": "Exchange rate between two currencies",
+    "description": "Returns how much one unit of a base currency is worth in a quote currency, asked of several rate services at once. Takes base and quote as three-letter uppercase codes, e.g. base USD, quote EUR. Use this instead of searching the web whenever the question is about an exchange rate.",
+    "timeout_seconds": 8,
+    "input_schema": {
+      "type": "object",
+      "required": [
+        "base",
+        "quote"
+      ],
+      "properties": {
+        "base": {
+          "type": "string",
+          "description": "Three-letter uppercase code of the currency being converted FROM, e.g. USD."
+        },
+        "quote": {
+          "type": "string",
+          "description": "Three-letter uppercase code of the currency being converted TO, e.g. EUR."
+        }
+      }
+    },
+    "sources": {
+      "fan_out": 3,
+      "take": 1,
+      "sources": [
+        {
+          "name": "frankfurter",
+          "url": "https://api.frankfurter.dev/v1/latest?base={base}&symbols={quote}",
+          "pick": "rates.{quote}"
+        },
+        {
+          "name": "er-api",
+          "url": "https://open.er-api.com/v6/latest/{base}",
+          "pick": "rates.{quote}"
+        },
+        {
+          "name": "exchangerate-api",
+          "url": "https://api.exchangerate-api.com/v4/latest/{base}",
+          "pick": "rates.{quote}"
+        }
+      ]
+    }
+  }
+]

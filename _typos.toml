@@ -1,6 +1,14 @@
 [files]
 extend-exclude = [".temp", "target"]
 
+# Written wrong deliberately: each is a value under test, not prose. `describtion` is the
+# misspelling a schema must refuse; `wheather` is a real user's typo a golden case replays to prove
+# it does not matter; `ANDed` is what the code does to a set of verdicts.
+[default.extend-identifiers]
+describtion = "describtion"
+wheather = "wheather"
+ANDed = "ANDed"
+
 [default.extend-words]
 ane = "ane"
 axum = "axum"

@@ -19,9 +19,6 @@ pub struct OpenAiCompatible {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
-    // The operator's own JSON, opaque to this service: forwarded verbatim as the request body's
-    // `provider` field and never inspected beyond "is it an object" at startup. See `main`'s
-    // `provider_routing` for why that is the only check made.
     provider_routing: Option<Value>,
 }
 
@@ -70,7 +67,6 @@ impl Provider for OpenAiCompatible {
 
         let status = response.status();
         if !status.is_success() {
-            // Nothing of the caller's reaches the provider here: the prompt is this service's own.
             return Err(error_for_status(
                 status.as_u16(),
                 None,
@@ -95,12 +91,14 @@ pub fn request_body(model: &str, prompt: &Prompt, provider_routing: Option<&Valu
     if !reasoning_enabled(prompt.tier) {
         body["reasoning"] = json!({"effort": "none"});
     }
-    // Passed through exactly as the operator wrote it, unset leaves the body exactly as it was
-    // before this field existed — see the struct doc comment above for why this stays opaque.
+    forward_provider_routing_verbatim(&mut body, provider_routing);
+    body
+}
+
+fn forward_provider_routing_verbatim(body: &mut Value, provider_routing: Option<&Value>) {
     if let Some(routing) = provider_routing {
         body["provider"] = routing.clone();
     }
-    body
 }
 
 fn read_completion(body: &Value) -> Result<Completion, CallError> {
@@ -111,11 +109,7 @@ fn read_completion(body: &Value) -> Result<Completion, CallError> {
         return Err(CallError::WorthRetrying(detail.to_owned()));
     };
 
-    // A provider that fails partway through generation still answers 200, with the text it had got
-    // to and the failure carried inside the choice. Measured: a 429 from Google returned
-    // `{"tool_call":null` and `finish_reason: "error"`, and the caller showed that to the person as
-    // the answer. Whatever is in `content` here was cut off mid-token, so it is not a reply.
-    if let Some(detail) = choice_error(choice) {
+    if let Some(detail) = why_this_choice_is_not_an_answer_however_much_text_it_carries(choice) {
         return Err(CallError::WorthRetrying(detail));
     }
 
@@ -143,13 +137,11 @@ fn read_completion(body: &Value) -> Result<Completion, CallError> {
     })
 }
 
-/// Why this choice is not an answer, when the provider reports a failure inside it. Both signals
-/// are checked: some providers set `finish_reason` to `"error"`, some attach an `error` object, and
-/// a provider may send either alone.
-fn choice_error(choice: &Value) -> Option<String> {
-    let reported = choice["finish_reason"].as_str().unwrap_or_default();
+fn why_this_choice_is_not_an_answer_however_much_text_it_carries(choice: &Value) -> Option<String> {
     let error = &choice["error"];
-    if reported != "error" && !error.is_object() {
+    let finish_reason_reports_an_error = choice["finish_reason"].as_str() == Some("error");
+    let an_error_object_is_attached = error.is_object();
+    if !finish_reason_reports_an_error && !an_error_object_is_attached {
         return None;
     }
     let detail = error["message"]
@@ -534,11 +526,8 @@ mod tests {
         assert_eq!(completion.finish_reason, FinishReason::Stop);
     }
 
-    /// Measured against a live 429 from Google: the HTTP reply was 200, `finish_reason` was
-    /// `"error"`, and `content` held `{"tool_call":null` — half a JSON object, which the caller
-    /// could not parse and showed to the person as the answer.
     #[test]
-    fn a_choice_that_reports_an_error_is_not_an_answer_however_much_text_it_carries() {
+    fn a_two_hundred_whose_choice_reports_an_error_is_not_an_answer_however_much_text_it_carries() {
         let body = json!({
             "choices": [{
                 "message": {"content": "{\"tool_call\":null"},
@@ -558,9 +547,8 @@ mod tests {
         );
     }
 
-    /// Some providers attach the error without touching `finish_reason`.
     #[test]
-    fn a_choice_carrying_an_error_object_alone_is_still_not_an_answer() {
+    fn a_choice_carrying_an_error_object_with_no_finish_reason_is_still_not_an_answer() {
         let body = json!({
             "choices": [{
                 "message": {"content": "partial"},
@@ -637,10 +625,7 @@ mod tests {
         );
     }
 
-    // The operator's routing policy is opaque JSON to this service: no field name of it is
-    // spelled out here, on purpose. These fixtures use a shape no real policy would, so the
-    // tests prove pass-through rather than encoding any provider's actual routing vocabulary.
-    fn opaque_operator_policy() -> Value {
+    fn a_policy_shape_no_real_provider_uses() -> Value {
         json!({"an_operator_chosen_field": "an_operator_chosen_value", "nested": {"k": 1}})
     }
 
@@ -657,7 +642,7 @@ mod tests {
 
     #[test]
     fn a_configured_routing_policy_is_forwarded_as_the_provider_field_verbatim() {
-        let policy = opaque_operator_policy();
+        let policy = a_policy_shape_no_real_provider_uses();
 
         let body = request_body(
             "deepseek/deepseek-v4-flash",
@@ -684,7 +669,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_configured_routing_policy_reaches_the_provider_byte_for_byte() {
         let stub = TestProvider::answering(StatusCode::OK, answered_reply()).await;
-        let policy = opaque_operator_policy();
+        let policy = a_policy_shape_no_real_provider_uses();
         let adapter = OpenAiCompatible::new(
             format!("{}/", stub.base_url()),
             TEST_KEY.to_owned(),

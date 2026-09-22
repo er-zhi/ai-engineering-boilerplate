@@ -127,7 +127,7 @@ real, but the round trip through the model to say so is not.
 A hit that fails `ensure_public_url`, loses the race, or was not among the top candidates keeps its
 snippet and gains nothing: prefetching only ever *adds* a `text` field, so it can never turn a
 search into an error — a slow or hostile page degrades to exactly what `web_search` returned before
-this existed. Engine's rendering cap (`MAX_TOOL_RESULT_CHARS` in
+this existed. Engine's rendering cap (`MAX_CHARS_PER_RENDERED_TOOL_RESULT` in
 `services/engine/src/executors/llm.rs`) was raised alongside this change, applied to the whole
 rendered tool result rather than per hit, so the attached pages actually reach the model instead of
 being cut before the model ever sees them.
@@ -246,23 +246,13 @@ chosen value. Agreeing sources confirm each other, and disagreeing ones are a fa
 see, so nothing here averages or picks between them; that judgement belongs to whoever reads the
 result, not to this code.
 
-`compose.yaml` intentionally does **not** mount a declarative-tools file: Compose creates an empty
-*directory* at the bind-mount source when the host path does not exist, which every fresh clone
-hits by default since the file is gitignored and operator-supplied. Rather than ship a mount that
-litters the repo root with a stray directory (or commit a fake file just to keep it happy), an
-operator who wants declarative tools adds the mount and the env var at `up` time with an inline
-override, without creating a second compose file:
+Both files live in `ops/`, which `compose.yaml` mounts read-only at `/etc/tool` and points
+`DECLARATIVE_TOOLS_PATH` and `BUILT_IN_TOOLS_PATH` at unconditionally. A missing file is not an
+error — it is logged and the binary's own declarations stand — so a fresh clone starts with neither,
+and adding one is a file edit and a restart. The files themselves are gitignored: they name live
+endpoints and differ per deployment.
 
-```bash
-# Write declarative-tools.json in the repo root first (rows shaped as above), then:
-docker compose -f compose.yaml -f - up tool <<'EOF'
-services:
-  tool:
-    environment:
-      DECLARATIVE_TOOLS_PATH: /etc/tool/declarative-tools.json
-    volumes:
-      - ./declarative-tools.json:/etc/tool/declarative-tools.json:ro
-EOF
-```
-
-`declarative-tools.json` is gitignored: it is an ops artifact, never a repository file.
+Every `${NAME}` a row uses must also reach the container through `compose.yaml`'s `environment`
+block. A source whose secret is unset is refused, and `read_rows` turns that into a refusal of the
+whole file, so one missing variable loads no declarative tools at all — including the rows that need
+no secret.

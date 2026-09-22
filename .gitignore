@@ -32,5 +32,5 @@ native/tts-ane/*.wav
 
 # Operator-supplied declarative tool rows (services/tool/README.md#declarative-tools) — an ops
 # artifact, never a repository file.
-declarative-tools.json
-built-in-tools.json
+ops/declarative-tools.json
+ops/built-in-tools.json

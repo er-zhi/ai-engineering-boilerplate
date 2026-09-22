@@ -1,58 +1,34 @@
-// What the operator says about the tools compiled into this binary. The declarative rows next door
-// are wholly the operator's; these are not — their code lives here — but which of them are in
-// circulation, and how their coverage is described, is an operating decision rather than a
-// compile-time one.
-//
-// It matters because the catalog is what decides whether a question can be answered at all. A
-// description that says what a source *covers* lets the typed decision route a question to it, or
-// to nothing; one that merely says what the tool *is* leaves the decision no basis, and every
-// question it should have answered is declined instead. Measured on a search tool whose stored
-// material the binary could not describe: 16 of 16 questions routed correctly once the operator
-// wrote what it covers, against nothing reaching it before.
-//
-// What a store holds changes without the binary changing, and which sources an operator is willing
-// to answer from is theirs to set. So both are a file edit, the same way a declarative row is.
+// What the operator says about the tools compiled into this binary: what each one is called, what it covers, and whether it is in circulation.
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// What an operator may say about one built-in tool. Every field is optional: an entry states only
-/// what it changes, and anything left out keeps what the binary declares.
+use crate::service::{MAX_DESCRIPTION_CHARS, MAX_NAME_CHARS};
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Override {
     pub name: Option<String>,
-    /// What this source covers, written for the decision that routes a question to it or to
-    /// nothing. Its subject matter belongs here, in the operator's file, and not in the binary —
-    /// see the repository's "Capabilities, Not Topics" rule.
     pub description: Option<String>,
-    /// `false` takes the tool out of circulation: it is never seeded, and an already-seeded row is
-    /// moved out of the catalog. This is how a source stops being answerable from without a code
-    /// change.
     pub enabled: Option<bool>,
 }
 
-/// Every override, by slug. A missing file, an unreadable one, or one that will not parse yields
-/// none: the binary's own declarations then stand, which is the safe direction — a tool keeps
-/// working, and nothing silently loses the description that makes it reachable.
 #[must_use]
 pub fn load(path: &str) -> BTreeMap<String, Override> {
+    let none_applied_rather_than_half = BTreeMap::new();
     match read_file(path) {
         Ok(overrides) => overrides,
-        // Refusing the file whole beats applying half of it: a partly-applied file leaves some
-        // sources described and others not, and the difference is invisible until a question is
-        // routed to nothing.
         Err(error) => {
             tracing::error!(path, %error, "built-in tool overrides not applied");
-            BTreeMap::new()
+            none_applied_rather_than_half
         }
     }
 }
 
 fn read_file(path: &str) -> Result<BTreeMap<String, Override>, String> {
     let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let overrides = read(&raw).map_err(|error| error.to_string())?;
+    let overrides = read(&raw)?;
     tracing::info!(
         path,
         count = overrides.len(),
@@ -61,8 +37,32 @@ fn read_file(path: &str) -> Result<BTreeMap<String, Override>, String> {
     Ok(overrides)
 }
 
-fn read(raw: &str) -> Result<BTreeMap<String, Override>, serde_json::Error> {
-    serde_json::from_str(raw)
+fn read(raw: &str) -> Result<BTreeMap<String, Override>, String> {
+    let overrides: BTreeMap<String, Override> =
+        serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    for (slug, applied) in &overrides {
+        within(slug, "name", applied.name.as_deref(), MAX_NAME_CHARS)?;
+        within(
+            slug,
+            "description",
+            applied.description.as_deref(),
+            MAX_DESCRIPTION_CHARS,
+        )?;
+    }
+    Ok(overrides)
+}
+
+fn within(slug: &str, field: &str, value: Option<&str>, max_chars: usize) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let chars = value.chars().count();
+    if chars > max_chars {
+        return Err(format!(
+            "{slug}'s {field} is {chars} characters, over the {max_chars} this service stores"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -91,12 +91,28 @@ mod tests {
         assert_eq!(overrides["web_search"].enabled, Some(false));
     }
 
-    /// A misspelled field is a description that will not arrive, and a description that does not
-    /// arrive is a question that cannot be answered. The operator hears about it at startup rather
-    /// than discovering it as a decline weeks later.
     #[test]
-    fn a_field_this_does_not_know_is_refused() {
+    fn a_misspelled_field_is_refused_rather_than_silently_dropped() {
         assert!(read(r#"{"kb_search": {"describtion": "typo"}}"#).is_err());
+    }
+
+    #[test]
+    fn a_description_past_what_the_service_stores_refuses_the_file() {
+        let too_long = "x".repeat(MAX_DESCRIPTION_CHARS + 1);
+        let refusal = read(&format!(
+            r#"{{"kb_search": {{"description": "{too_long}"}}}}"#
+        ))
+        .expect_err("a description this service cannot store is refused");
+
+        assert!(
+            refusal.contains("description") && refusal.contains(&MAX_DESCRIPTION_CHARS.to_string())
+        );
+    }
+
+    #[test]
+    fn a_name_past_its_column_refuses_the_file() {
+        let too_long = "x".repeat(MAX_NAME_CHARS + 1);
+        assert!(read(&format!(r#"{{"kb_search": {{"name": "{too_long}"}}}}"#)).is_err());
     }
 
     #[test]

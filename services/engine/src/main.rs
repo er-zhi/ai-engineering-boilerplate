@@ -73,8 +73,6 @@ fn events_retention_months() -> Option<u32> {
 struct EngineServiceImpl {
     service: Arc<Service>,
     db: sea_orm::DatabaseConnection,
-    /// Shared by every open event stream, so a client hears that an execution moved on when it did
-    /// rather than at the next poll. One listener for the process; see `stream::Wakeups`.
     wakeups: stream::Wakeups,
 }
 
@@ -82,6 +80,10 @@ fn parse_uuid(value: &str, field: &str) -> Result<Uuid, ConnectError> {
     Uuid::parse_str(value).map_err(|_| {
         ConnectError::invalid_argument(format!("{field} is not a valid uuid: {value}"))
     })
+}
+
+fn continued_execution_if_readable(execution_id: Option<&str>) -> Option<Uuid> {
+    execution_id.and_then(|id| Uuid::parse_str(id).ok())
 }
 
 #[allow(refining_impl_trait)]
@@ -110,12 +112,7 @@ impl EngineService for EngineServiceImpl {
     ) -> ServiceResult<StartExecutionResponse> {
         let msg = request.to_owned_message();
         let user_id = principal::from_metadata(ctx.headers()).map(|p| p.user_id);
-        // An unreadable id is treated as absent rather than refused: the continuation is a
-        // convenience, and losing it must not lose the turn.
-        let continues = msg
-            .continues_execution_id
-            .as_deref()
-            .and_then(|id| Uuid::parse_str(id).ok());
+        let continues = continued_execution_if_readable(msg.continues_execution_id.as_deref());
         let execution_id = self
             .service
             .start_continuing(

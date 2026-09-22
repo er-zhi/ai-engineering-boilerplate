@@ -50,7 +50,7 @@ use crate::wire::tier_contracts;
 const COMPLETION_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PARTITION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 const DEFAULT_SYSTEM_ONE_BASE_URL: &str = "https://api.typesafe.ai";
-const DEFAULT_SYSTEM_ONE_MODEL: &str = "jev-latest";
+const DEFAULT_SYSTEM_ONE_MODEL: &str = "jev-1.13.0";
 
 struct LlmRouter {
     inner: Router<OpenAiCompatible, PgAuditLog>,

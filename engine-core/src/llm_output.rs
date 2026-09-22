@@ -6,19 +6,10 @@ use serde_json::Value;
 pub const LLM_STATE_KEY: &str = "llm";
 pub const TOOL_RESULT_STATE_KEY: &str = "tool_result";
 
-/// What an earlier turn of the same conversation found, carried into this one. Deliberately not
-/// `TOOL_RESULT_STATE_KEY`: the gate that decides whether a turn has fetched anything reads that
-/// key, and material inherited from before is not something *this* turn fetched. Sharing the key
-/// would make every follow-up skip the decision that settles whether it may be answered at all.
 pub const PRIOR_MATERIAL_STATE_KEY: &str = "prior_material";
+
+pub const RENDERED_TOOL_RESULTS: usize = 4;
 pub const TOOL_RESULT_ERROR_KEY: &str = "error";
-/// Set on an `llm` node's own output when its executor dispatched a tool itself, outside the
-/// graph's normal `llm` → `tool` → `llm` loop — see `services/engine/src/executors/llm.rs`'s
-/// typed-decision fast path. The node's output is recorded verbatim in its `NodeCompleted` event
-/// and written into the checkpointed state by the node's own reducer either way, so naming this
-/// field once here, rather than inventing it ad hoc in the executor, is what lets `step::charge_budget`
-/// (in the same crate) charge for the call the same way it would have charged the `tool` node this
-/// call stood in for.
 pub const FAST_TOOL_CALL_FIELD: &str = "fast_tool_call";
 
 const TOOL_CALL_FIELD: &str = "tool_call";

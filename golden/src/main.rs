@@ -1,13 +1,4 @@
-//! Runs every golden case against a live stack and writes down what happened. It decides nothing:
-//! the answers are generated text, and comparing generated text to a stored string measures
-//! phrasing rather than behaviour. So this records the facts — how many topics a message opened,
-//! what each was titled and asked, what came back, and how long each took — and the judging is done
-//! afterwards by a model reading the run against `cases.json`'s written expectations. See
-//! `.agents/skills/golden/SKILL.md`.
-//!
-//! Needs the stack up (`docker compose up -d`) and `GATEWAY_AUTH_PASSWORD` in the environment, the
-//! same one `.env` carries. Everything goes through Gateway, so this exercises exactly the path a
-//! person's browser takes, authentication included.
+// Runs every golden case against the live stack through Gateway and writes down what happened, for a model to judge afterwards against `cases.json`'s written expectations.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -15,15 +6,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Where the stack is reachable. Gateway is the only published port, which is the point: a case
-/// that passes here passed through the same door a person uses.
-const DEFAULT_BASE: &str = "http://localhost:8080";
-/// How long one case may take before it is recorded as unfinished. Generous on purpose — a case
-/// that is merely slow is a finding, not a crash, and the judge should see the number.
+const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
 const CASE_DEADLINE: Duration = Duration::from_secs(60);
-/// How often a running turn is asked whether its topics have finished.
-const POLL_INTERVAL: Duration = Duration::from_millis(120);
-/// Long enough for a `Search` against a cold index, short enough that a hung one is obvious.
+const TOPIC_POLL_INTERVAL: Duration = Duration::from_millis(120);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -33,45 +18,47 @@ struct Case {
     #[serde(default)]
     message: String,
     #[serde(default)]
+    messages: Vec<String>,
+    #[serde(default)]
     query: String,
     expect: String,
 }
 
-/// One case's outcome, in the shape the judge reads. Nothing here is a verdict — `expect` travels
-/// with the facts so the two can be read side by side.
 #[derive(Serialize)]
 struct Outcome {
     id: String,
     kind: String,
     asked: String,
     expect: String,
-    /// Milliseconds from the turn being sent to the last topic finishing.
     elapsed_ms: u128,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topics: Vec<TopicOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    turns: Vec<TurnOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     results: Vec<String>,
-    /// Set when the case could not be run at all — the stack refused it, or it never finished.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 #[derive(Serialize)]
+struct TurnOutcome {
+    said: String,
+    topics: Vec<TopicOutcome>,
+}
+
+#[derive(Serialize)]
 struct TopicOutcome {
     title: String,
-    /// The self-contained question the topic was started with. A question still saying "there" is
-    /// visible here and nowhere else.
     question: String,
     status: String,
     answer: String,
-    /// Milliseconds from the turn being sent to this topic finishing, so a judge can see whether
-    /// themes really did arrive independently.
     finished_at_ms: u128,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let base = std::env::var("GOLDEN_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE.to_owned());
+    let base = std::env::var("GOLDEN_BASE_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned());
     let password = std::env::var("GATEWAY_AUTH_PASSWORD")
         .map_err(|_| "set GATEWAY_AUTH_PASSWORD (the same one .env carries)")?;
     let only = std::env::args().nth(1);
@@ -121,8 +108,6 @@ async fn log_in(
     Ok(())
 }
 
-/// Percent-encodes the few characters a password may carry that a form body reads as structure.
-/// The runner has one form field and no need for a url-encoding crate to send it.
 fn urlencoded(value: &str) -> String {
     value
         .bytes()
@@ -137,10 +122,11 @@ fn urlencoded(value: &str) -> String {
 
 async fn run_case(client: &reqwest::Client, base: &str, case: &Case) -> Outcome {
     let started = Instant::now();
+    let said = case.said();
     let asked = if case.kind == "kb" {
         case.query.clone()
     } else {
-        case.message.clone()
+        said.join(" → ")
     };
     let mut outcome = Outcome {
         id: case.id.clone(),
@@ -149,6 +135,7 @@ async fn run_case(client: &reqwest::Client, base: &str, case: &Case) -> Outcome 
         expect: case.expect.clone(),
         elapsed_ms: 0,
         topics: Vec::new(),
+        turns: Vec::new(),
         results: Vec::new(),
         error: None,
     };
@@ -156,9 +143,23 @@ async fn run_case(client: &reqwest::Client, base: &str, case: &Case) -> Outcome 
         "kb" => search_knowledge_base(client, base, &case.query)
             .await
             .map(|results| outcome.results = results),
-        "chat" => send_turn_and_wait(client, base, &case.message)
+        "chat" => replay_a_conversation(client, base, &said)
             .await
-            .map(|topics| outcome.topics = topics),
+            .map(|turns| {
+                // One message stays one topic list, so a judge reads the common case unchanged.
+                if turns.len() == 1 {
+                    outcome.topics = turns
+                        .into_iter()
+                        .next()
+                        .unwrap_or(TurnOutcome {
+                            said: String::new(),
+                            topics: Vec::new(),
+                        })
+                        .topics;
+                } else {
+                    outcome.turns = turns;
+                }
+            }),
         other => Err(format!("unknown case kind {other}").into()),
     };
     if let Err(error) = ran {
@@ -166,6 +167,32 @@ async fn run_case(client: &reqwest::Client, base: &str, case: &Case) -> Outcome 
     }
     outcome.elapsed_ms = started.elapsed().as_millis();
     outcome
+}
+
+impl Case {
+    fn said(&self) -> Vec<String> {
+        if self.messages.is_empty() {
+            vec![self.message.clone()]
+        } else {
+            self.messages.clone()
+        }
+    }
+}
+
+async fn replay_a_conversation(
+    client: &reqwest::Client,
+    base: &str,
+    said: &[String],
+) -> Result<Vec<TurnOutcome>, Box<dyn std::error::Error>> {
+    rpc(client, base, "chat.v1.ChatService/ResetSession", &json!({})).await?;
+    let mut turns = Vec::new();
+    for message in said {
+        turns.push(TurnOutcome {
+            said: message.clone(),
+            topics: send_turn_and_wait(client, base, message).await?,
+        });
+    }
+    Ok(turns)
 }
 
 async fn search_knowledge_base(
@@ -191,14 +218,11 @@ async fn search_knowledge_base(
         .unwrap_or_default())
 }
 
-/// Sends one turn into a session of its own and watches until every topic it opened has settled.
-/// The session is reset first so no case can be answered out of another case's context.
 async fn send_turn_and_wait(
     client: &reqwest::Client,
     base: &str,
     message: &str,
 ) -> Result<Vec<TopicOutcome>, Box<dyn std::error::Error>> {
-    rpc(client, base, "chat.v1.ChatService/ResetSession", &json!({})).await?;
     let started = Instant::now();
     let sent = rpc(
         client,
@@ -208,10 +232,7 @@ async fn send_turn_and_wait(
     )
     .await?;
 
-    // `SendTurn` names every topic the routing decision routed this turn to, so an empty list is a
-    // finished answer — the turn carried no request — and there is nothing to wait for. Waiting out
-    // the deadline instead would record a minute against a case that was settled in milliseconds.
-    let opened: Vec<String> = sent["topicIds"]
+    let topics_this_turn_opened: Vec<String> = sent["topicIds"]
         .as_array()
         .map(|ids| {
             ids.iter()
@@ -219,48 +240,72 @@ async fn send_turn_and_wait(
                 .collect()
         })
         .unwrap_or_default();
-    if opened.is_empty() {
+    let nothing_to_wait_for = topics_this_turn_opened.is_empty();
+    if nothing_to_wait_for {
         return Ok(Vec::new());
     }
+    wait_until_every_topic_settles(client, base, &topics_this_turn_opened, started).await
+}
 
+async fn wait_until_every_topic_settles(
+    client: &reqwest::Client,
+    base: &str,
+    opened: &[String],
+    started: Instant,
+) -> Result<Vec<TopicOutcome>, Box<dyn std::error::Error>> {
     let mut finished_at: BTreeMap<String, u128> = BTreeMap::new();
     loop {
         let session = rpc(client, base, "chat.v1.ChatService/GetSession", &json!({})).await?;
-        // Only the topics this turn opened. A session can hold others, and waiting on those would
-        // attribute their time to this case.
-        let topics: Vec<Value> = session["topics"]
-            .as_array()
-            .map(|topics| {
-                topics
-                    .iter()
-                    .filter(|topic| {
-                        topic["id"]
-                            .as_str()
-                            .is_some_and(|id| opened.iter().any(|wanted| wanted == id))
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let topics = topics_among(&session, opened);
         let settled = topics.len() == opened.len()
-            && topics.iter().all(|topic| {
-                let status = topic["status"].as_str().unwrap_or_default();
-                let done = status != "TOPIC_STATUS_QUEUED" && status != "TOPIC_STATUS_RUNNING";
-                if done {
-                    finished_at
-                        .entry(topic["id"].as_str().unwrap_or_default().to_owned())
-                        .or_insert_with(|| started.elapsed().as_millis());
-                }
-                done
-            });
+            && topics
+                .iter()
+                .all(|topic| note_if_settled(topic, started, &mut finished_at));
         if settled {
             return Ok(described(&topics, &finished_at));
         }
         if started.elapsed() > CASE_DEADLINE {
             return Err("the turn did not finish within the deadline".into());
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(TOPIC_POLL_INTERVAL).await;
     }
+}
+
+fn topics_among(session: &Value, opened: &[String]) -> Vec<Value> {
+    session["topics"]
+        .as_array()
+        .map(|topics| {
+            topics
+                .iter()
+                .filter(|topic| {
+                    topic["id"]
+                        .as_str()
+                        .is_some_and(|id| opened.iter().any(|wanted| wanted == id))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn note_if_settled(
+    topic: &Value,
+    started: Instant,
+    finished_at: &mut BTreeMap<String, u128>,
+) -> bool {
+    let status = topic["status"].as_str().unwrap_or_default();
+    // Anything this harness does not recognise counts as still running, never as done: a status
+    // added to the contract must not make every case complete instantly with an empty answer.
+    let settled = matches!(
+        status,
+        "TOPIC_STATUS_COMPLETED" | "TOPIC_STATUS_FAILED" | "TOPIC_STATUS_CANCELLED"
+    );
+    if settled {
+        finished_at
+            .entry(topic["id"].as_str().unwrap_or_default().to_owned())
+            .or_insert_with(|| started.elapsed().as_millis());
+    }
+    settled
 }
 
 fn described(topics: &[Value], finished_at: &BTreeMap<String, u128>) -> Vec<TopicOutcome> {

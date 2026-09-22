@@ -263,7 +263,7 @@ async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) 
             }
             continue;
         }
-        let definition = definition.overridden_by(&applied);
+        let definition = definition.with_operator_name_and_description(&applied);
         if seeding_already_finished(existing.as_ref(), &definition) {
             continue;
         }
@@ -292,10 +292,10 @@ struct SystemTool {
 }
 
 impl SystemTool {
-    /// Applies what the operator said about this tool. `None` for a field keeps what the binary
-    /// declares; `enabled: false` is not applied here — it is read by the caller, which takes the
-    /// tool out of the catalog rather than seeding it.
-    fn overridden_by(mut self, applied: &tool::built_in_overrides::Override) -> Self {
+    fn with_operator_name_and_description(
+        mut self,
+        applied: &tool::built_in_overrides::Override,
+    ) -> Self {
         if let Some(name) = &applied.name {
             self.name = name.clone();
         }
@@ -306,19 +306,23 @@ impl SystemTool {
     }
 }
 
-/// Takes a tool out of the catalog without deleting it. `list_tools` returns only `Active` rows, so
-/// moving it back to `Draft` is enough: the decision that routes a question can no longer see it,
-/// and re-enabling it in the operator's file seeds it again with its history intact.
 async fn withdraw_system_tool(
     db: &sea_orm::DatabaseConnection,
     slug: &str,
     row: tool::entity::tool::Model,
 ) {
+    let out_of_the_catalog_but_not_deleted = Status::Draft;
     let mut withdrawing: tool::entity::tool::ActiveModel = row.into();
-    withdrawing.status = sea_orm::ActiveValue::Set(Status::Draft);
+    withdrawing.status = sea_orm::ActiveValue::Set(out_of_the_catalog_but_not_deleted);
     match sea_orm::ActiveModelTrait::update(withdrawing, db).await {
         Ok(_) => tracing::info!(slug, "system tool withdrawn from the catalog"),
         Err(error) => tracing::error!(slug, %error, "could not withdraw a system tool"),
+    }
+}
+
+async fn seed_declarative_tools_if_configured(service: &Service, db: &sea_orm::DatabaseConnection) {
+    if let Ok(path) = std::env::var("DECLARATIVE_TOOLS_PATH") {
+        tool::declarative_seed::load(service, db, &path).await;
     }
 }
 
@@ -431,11 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &env("KNOWLEDGE_BASE_URL")?,
     )?;
     seed_system_tools(&service, &db).await;
-
-    // Optional: a deployment with no declarative tools is a working deployment.
-    if let Ok(path) = std::env::var("DECLARATIVE_TOOLS_PATH") {
-        tool::declarative_seed::load(&service, &db, &path).await;
-    }
+    seed_declarative_tools_if_configured(&service, &db).await;
 
     let tool_service = ToolServiceImpl { service };
     let connect = ConnectRouter::new().add_service(Arc::new(tool_service));

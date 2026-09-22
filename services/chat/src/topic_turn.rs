@@ -41,24 +41,9 @@ impl TopicManager {
             .route(&summaries(&topics), focus_topic_id, &content)
             .await
         {
-            // A turn with nothing to act on is answered here and now: creating a topic to ask
-            // "what did you mean?" would cost an Engine execution and a minute's wait for a reply
-            // the session can give instantly. This runs before `lock_turn` below, so two
-            // concurrent retries of one turn_id each publish their own clarification event — that
-            // is accepted and intentional, not an oversight: the event starts nothing and has no
-            // side effect to double up on, so publishing it twice costs nothing a client would
-            // notice.
             Routing::Clarify => {
-                let session = self.session.get_or_create_session(user_id).await?;
-                self.publish(
-                    TopicEvent::session_wide(session.id, TopicEventKind::ClarificationNeeded)
-                        .with_payload(serde_json::json!({
-                            "text": crate::intent::CLARIFICATION_TEXT,
-                            "turn_id": turn_id,
-                            "content": content,
-                        })),
-                )
-                .await;
+                self.publish_clarification_without_starting_a_topic(user_id, turn_id, &content)
+                    .await?;
                 return Ok(Vec::new());
             }
             Routing::Act(actions) => actions,
@@ -66,15 +51,10 @@ impl TopicManager {
 
         let turn_guard = self.session.db.begin().await?;
         lock_turn(&turn_guard, turn_id).await?;
-        // Engine reporting busy is caught here, not propagated: there is nowhere to queue this
-        // turn (see `EngineError::Busy`'s doc and item 5 of the fix wave this belongs to), so
-        // `turn_guard` rolls back with nothing written — the message truly was not delivered — but
-        // the caller must still see `Ok`, with something visible in the transcript in place of the
-        // `internal` error this used to come back as.
         let received = match self.deliver_turn(user_id, turn_id, &content, actions).await {
             Ok(received) => received,
             Err(ChatError::EngineBusy(topic_id, _message)) => {
-                self.note_engine_busy(user_id, topic_id, turn_id, &content)
+                self.note_engine_busy_instead_of_queueing(user_id, topic_id, turn_id, &content)
                     .await?;
                 return Ok(Vec::new());
             }
@@ -84,9 +64,27 @@ impl TopicManager {
         Ok(received)
     }
 
-    /// Publishes a visible stand-in for a turn that could not be delivered because its topic's
-    /// execution was busy — see `send_turn`'s call site.
-    async fn note_engine_busy(
+    async fn publish_clarification_without_starting_a_topic(
+        &self,
+        user_id: Uuid,
+        turn_id: Uuid,
+        content: &str,
+    ) -> Result<(), ChatError> {
+        let session = self.session.get_or_create_session(user_id).await?;
+        self.publish(
+            TopicEvent::session_wide(session.id, TopicEventKind::ClarificationNeeded).with_payload(
+                serde_json::json!({
+                    "text": crate::intent::CLARIFICATION_TEXT,
+                    "turn_id": turn_id,
+                    "content": content,
+                }),
+            ),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn note_engine_busy_instead_of_queueing(
         &self,
         user_id: Uuid,
         topic_id: i64,
@@ -202,14 +200,15 @@ impl TopicManager {
                     let Some(topic) = topics.iter().find(|t| t.id == topic_id) else {
                         continue;
                     };
-                    // The rewritten turn when routing produced one — a bare "where?" reaches a
-                    // topic that is executed with its question and nothing else.
-                    let delivered = if question.is_empty() {
+                    let question_the_topic_is_executed_with = if question.is_empty() {
                         content
                     } else {
                         &question
                     };
-                    match self.apply_continue(user_id, topic, delivered).await? {
+                    match self
+                        .apply_continue(user_id, topic, question_the_topic_is_executed_with)
+                        .await?
+                    {
                         Delivery::Existing(id) => received.push(id),
                         Delivery::Child(id) => {
                             received.push(id);
@@ -265,10 +264,6 @@ impl TopicManager {
         parent: &topic::Model,
         content: &str,
     ) -> Result<i64, ChatError> {
-        // The follow-up travels as the person wrote it. What the earlier turn found travels too,
-        // but through Engine, which holds it — pasting a summary of it into the question here gave
-        // the decision a lossy second copy to route on, and the summary never held what was asked
-        // for, only what came back.
         let title = truncate(content, MAX_TITLE_CHARS);
         let input_json = ExecutionInput::new(content.to_owned()).to_json();
         let (child_id, _status) = self
@@ -284,11 +279,12 @@ impl TopicManager {
     }
 }
 
-// `unavailable` is how Engine reports an execution that is merely mid-tick — see
-// `services/engine/src/error.rs`'s `EngineError::Busy` and its `From` impl. Anything else Engine's
-// `Interrupt` can fail with is a real failure, unchanged from before this distinction existed.
+fn engine_reports_the_execution_mid_tick(error: &connectrpc::ConnectError) -> bool {
+    error.code == connectrpc::ErrorCode::Unavailable
+}
+
 fn engine_call_error(topic_id: i64, error: connectrpc::ConnectError) -> ChatError {
-    if error.code == connectrpc::ErrorCode::Unavailable {
+    if engine_reports_the_execution_mid_tick(&error) {
         ChatError::EngineBusy(topic_id, error.to_string())
     } else {
         ChatError::Engine(error.to_string())
@@ -371,8 +367,6 @@ mod tests {
             .expect("view");
         assert!(topics.is_empty());
 
-        // The guarantee has to survive a reconnect, not just live on the bus: a client that was
-        // never subscribed rebuilds the transcript from what `chat.events` actually stored.
         let session = harness
             .manager
             .session_of_user(OWNER)
@@ -752,10 +746,6 @@ mod tests {
         assert_eq!(stored_turns(&manager, topic_id, turn_id).await, 1);
     }
 
-    // Reproduces the bug live traffic hit: a follow-up sent while its topic's execution is still
-    // running used to come back `internal` in under 200 ms with the message nowhere — no topic
-    // row, no message row, nothing in the transcript. `SendTurn` must return `Ok`, and the user
-    // must see something, without this turning into a queue.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_follow_up_while_engine_is_busy_is_visible_not_lost() {
         let (_test, manager, fake) = manager_with().await;

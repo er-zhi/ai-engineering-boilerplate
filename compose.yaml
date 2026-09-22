@@ -205,7 +205,14 @@ services:
       KNOWLEDGE_BASE_URL: http://knowledge-base:8084
       YOU_SEARCH_API_KEY: ${YOU_SEARCH_API_KEY:-}
       BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      DECLARATIVE_TOOLS_PATH: /etc/tool/declarative-tools.json
+      BUILT_IN_TOOLS_PATH: /etc/tool/built-in-tools.json
+      WEATHERAPI_KEY: ${WEATHERAPI_KEY:-}
+      OPENWEATHERMAP_KEY: ${OPENWEATHERMAP_KEY:-}
+      MARKET_QUOTE_USER_AGENT: ${MARKET_QUOTE_USER_AGENT:-}
       DATABASE_URL: postgres://tool_user:${TOOL_DB_PASSWORD:?set it in .env, see .env.example}@postgres:5432/${POSTGRES_DB:-app}
+    volumes:
+      - ./ops:/etc/tool:ro
     depends_on:
       postgres:
         condition: service_healthy

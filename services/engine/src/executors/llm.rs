@@ -4,6 +4,10 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use buffa::EnumValue;
+use common::agent_replies::{
+    CLARIFY_OPENING, COMPOSE_FAILURE, DECLINE_OPENING, NOTHING_CONNECTED, PROMISE_REFUSED,
+    UNGROUNDED_REFUSED,
+};
 use common::execution_input::ExecutionInput;
 use common::proto::llm_router::v1::{
     Answer, Choice, ChoiceAnswer, ChoiceOption, CompleteRequest, CompleteResponse, DecideRequest,
@@ -13,10 +17,12 @@ use common::proto::llm_router::v1::{
 use common::proto::tools::v1::{ExecuteRequest, ExecuteResponse, ExecuteStatus, ToolServiceClient};
 use connectrpc::client::HttpClient;
 use engine_core::{
-    FAST_TOOL_CALL_FIELD, LlmOutput, PRIOR_MATERIAL_STATE_KEY, TOOL_RESULT_ERROR_KEY,
-    TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
+    FAST_TOOL_CALL_FIELD, LlmOutput, PRIOR_MATERIAL_STATE_KEY, RENDERED_TOOL_RESULTS,
+    TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
 };
 use serde_json::{Value, json};
+
+use chrono::Utc;
 
 use crate::dispatch::NodeKind;
 
@@ -25,19 +31,10 @@ const TOOL_SLUG_PLACEHOLDER: &str = "<tool slug>";
 const ARGUMENT_NAME_PLACEHOLDER: &str = "<argument name>";
 const ARGUMENT_VALUE_PLACEHOLDER: &str = "<argument value>";
 const ANSWER_PLACEHOLDER: &str = "<your answer>";
-/// What the node is being asked for on this call. The typed decision before it has already settled
-/// whether a tool is needed; offering the model that choice again is how a light model comes back
-/// with "I will look that up" and ends the turn having done nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Both outcomes are open and the model picks. The residual case: the decision reached neither
-    /// conclusion confidently.
     Loop,
-    /// A source is needed and only its arguments are missing. Tools are offered; a reply is
-    /// refused.
     ComposeOnly,
-    /// The answer is in material an earlier turn already fetched. No tools are listed — there is
-    /// nothing to fetch — and the reply is judged against that material.
     FromMaterial,
 }
 
@@ -140,79 +137,33 @@ what you knew before: a value you remember is out of date by definition, and a p
 value is worse than none. If a tool result does not contain what was asked, call another tool; if
 nothing gives it to you, say you could not get it rather than supplying it yourself.
 "#;
-const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+const CALL_TIMEOUT: Duration = Duration::from_secs(65);
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
-const RENDERED_TOOL_RESULTS: usize = 4;
-/// Applied to one whole rendered tool result (not per hit within it — see below), so a search that
-/// attached the text of several pages (Task C, `docs/superpowers/plans/2026-09-18-latency-round-two.md`)
-/// is not cut before the model ever sees the pages. Flat-per-result rather than a cap per hit: the
-/// engine has no notion of a "hit" — that shape belongs to the tool that produced the JSON, and
-/// giving the engine a per-hit cap would mean teaching it that shape, which is exactly the kind of
-/// subject-specific knowledge `gate-architecture`'s "Capabilities, Not Topics" forbids landing here.
-/// A flat cap needs no such knowledge and is nearly free: input tokens cost about 0.29 ms each in
-/// this deployment (r = 0.09 against total latency), so raising the ceiling by 8 000 chars (~2 000
-/// tokens) costs under 600 ms in the rare case a result actually reaches it — far less than the
-/// generative round this change exists to remove. 12 000 was chosen as comfortably above two
-/// attached pages' typical readable text (a few thousand characters each) plus the surrounding
-/// title/url/snippet JSON, while still bounding the pathological case (a very long single page).
-const MAX_TOOL_RESULT_CHARS: usize = 12_000;
+const MAX_CHARS_PER_RENDERED_TOOL_RESULT: usize = 12_000;
 const TRUNCATION_MARK: &str = "… (truncated)";
 
-/// `Decide` gets its own deadline, separate from `CALL_TIMEOUT` (`Complete`'s). Same measurement
-/// `services/chat/src/intent.rs`'s `DECIDE_CALL_TIMEOUT` cites: measured in this deployment,
-/// `Decide`'s p50 is about 155 ms against `Complete`'s p50 of about 2000 ms
-/// (`llm_router.decisions.latency_ms` and `llm_router.requests.latency_ms`). 2 s covers a cold
-/// connection and this service's own hop out to llm-router and back — not a generous budget for
-/// the vendor, a bound on how long this node waits before falling back to today's flow.
-/// `services/tool/src/service.rs`'s `VALIDATE_TIMEOUT` reasons the same way but is deliberately
-/// longer, since that path has no fallback to fall back to.
-///
-/// **Must stay strictly above `services/llm-router`'s `adapters::system_one::REQUEST_TIMEOUT`
-/// (1.5 s), for the same reason Chat's matching constant must**: this deadline is asserted as the
-/// `grpc-timeout` header llm-router's connectrpc server parses on receipt, wrapping the *entire*
-/// dispatch to the vendor in a deadline that starts strictly before the adapter's own clock does.
-/// Equal or shorter and this outer deadline always wins that race, silently dropping llm-router's
-/// decision future — audit write included — before the inner timeout ever finishes.
 const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
-/// A wrong or slow tool dispatched on the fast path is exactly one tool call, so it gets the same
-/// budget the normal `tool` node gives one — see `executors::tool::CALL_TIMEOUT`, which this
-/// mirrors (that constant is private to its own module, so this is its own copy, not a shared one).
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 const PROMISE_ID: &str = "promise";
-/// Above this the reply undertakes work rather than reporting any. Set at the midpoint: the guard
-/// only ever replaces a promise with the truth, so an even split is better spent on the honest
-/// answer than on a sentence that reads like success and is not.
-const PROMISE_THRESHOLD: f64 = 0.5;
+const PROMISE_ENOUGH_TO_REFUSE: f64 = 0.5;
 const PROMISE_INSTRUCTIONS: &str = "Does this text undertake to do something, rather than report \
 something already done or known?";
 const PROMISE_WHEN_TRUE: &str = "it says what it is about to do, will do, or needs to do — work \
 that has not happened yet";
 const PROMISE_WHEN_FALSE: &str = "it states what is the case, gives a value, answers, asks the \
 person something, or says plainly that it could not find out";
-/// What replaces a promise. It reports the failure, because the undertaking will not be kept: the
-/// reply ends the turn.
-const PROMISE_REFUSED: &str = "I couldn't get that just now. Ask me again and I'll try.";
 const PROMISE_CORRECTION: &str = r#" It undertook to do something rather than
 reporting what came back. Nothing runs after your reply. Answer from what is already in front of
 you.
 "#;
 
-/// Asked of a composed argument, before anything is dispatched. Not "does the message name it" —
-/// that question refuses a value the message describes rather than spells, and measured at 0.05 for
-/// a place the message pins down exactly. This one asks whether the message *points* at the value,
-/// which a name, an unambiguous description and a normalisation of either all do, and a pronoun
-/// does not.
-///
-/// Measured over 18 pairs: everything the message points at scored 0.82–0.97 — a place named, a
-/// place described ("the capital of Japan"), currency codes normalised from "dollar to euro", an
-/// exchange symbol normalised from "NASDAQ", and a place named in Russian. Everything it does not
-/// scored 0.31–0.70 — four forms of "there", "it", a place invented outright, and a place appearing
-/// where the message named none.
 const POINTED_AT_ID: &str = "pointed_at";
-/// The measured bands are 0.31–0.70 and 0.82–0.97; this sits in the gap.
-const POINTED_AT_THRESHOLD: f64 = 0.8;
+const POINTED_AT_ENOUGH_TO_DISPATCH: f64 = 0.8;
+const BELOW_EVERY_THRESHOLD: f64 = 0.0;
+const FETCHED_AT_FIELD: &str = "fetched_at";
+const CARRIED_MATERIAL_GOES_STALE_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 const POINTED_AT_INSTRUCTIONS: &str = "Does `message` refer to `value`, by that name or by any \
 description that can only mean it?";
 const POINTED_AT_WHEN_TRUE: &str = "the message points at this one thing, whether by naming it or \
@@ -221,18 +172,12 @@ const POINTED_AT_WHEN_FALSE: &str =
     "the message does not point at this thing at all, or points at it only vaguely";
 
 const GROUNDED_ID: &str = "grounded";
-/// Below this the reply says something the material does not. Measured against a reply that named
-/// a place when the material held a temperature (0.05), an invented figure (0.03), and two correct
-/// answers (0.82 and 0.98): the gap is wide, so the midpoint is not a fine judgement.
-const GROUNDED_THRESHOLD: f64 = 0.5;
+const GROUNDED_ENOUGH_TO_SEND: f64 = 0.5;
 const GROUNDED_INSTRUCTIONS: &str = "Is every specific value in the reply present in the material?";
 const GROUNDED_WHEN_TRUE: &str =
     "every name, number and fact in the reply can be found in the material";
 const GROUNDED_WHEN_FALSE: &str =
     "the reply states a name, number or fact the material does not contain";
-/// What replaces an answer nothing supports. A value the material does not hold is worse than no
-/// value, because it reads exactly like one that was looked up.
-const UNGROUNDED_REFUSED: &str = "I got something back but couldn't read the answer out of it.";
 const UNGROUNDED_CORRECTION: &str = r#" Nothing in what came back says it.
 Write the reply again using only the values in front of you, and do not repeat the refused words.
 The question names a subject; what came back holds what was measured about it, and the measurement
@@ -240,98 +185,35 @@ is the answer — never the subject's own name. If what came back does not hold 
 "#;
 const TOOL_QUESTION_ID: &str = "tool";
 const NO_TOOL_OPTION: &str = "none";
-/// Offered only when an earlier turn of the same conversation left something behind. It is a source
-/// like any other in the choice — the question "which source answers this?" has one more answer —
-/// so a follow-up about what was already found is routed rather than declined.
 const PRIOR_OPTION: &str = "already_found";
-/// Measured against three wordings over six follow-ups: this one routed five correctly, including
-/// a question about a value inside the material and one about what was looked up, while still
-/// sending "and what about Osaka?" to fetch afresh and declining what nothing covers.
 const PRIOR_DESCRIPTION: &str = "the material already shown above. Choose this when the answer is \
 somewhere in that material — including what was asked for, which the material records beside each \
 result — so nothing new needs looking up";
 
-/// The one question the whole turn now turns on. It asks which of the sources the operator has
-/// connected covers what is being asked — a question about the catalog — and not whether the model
-/// needs help, which is a question about the model's confidence in its own memory.
-///
-/// That distinction is the whole change. A calibrated decider asked "does this require looking
-/// something up?" answers no whenever the model believes it knows, and believing it knows is
-/// exactly the state in which it is most likely to be confidently wrong. Measured: a question whose
-/// answer the connected store held was answered from memory, incorrectly, because that question
-/// came back confidently false.
-///
-/// Phrased naming no subject: the repo's `gate-architecture` rule "Capabilities, Not Topics"
-/// forbids a domain or topic anywhere in code or prompts. Every subject in this decision arrives
-/// from the catalog at runtime, written by the operator.
 const TOOL_QUESTION_INSTRUCTIONS: &str = "Which of these sources can answer this question? Choose \
 the one whose material covers what is being asked. Choose the option for none of them when none \
 does.";
-/// The `none` option's own description. Without it the decider is left to infer what `none` means
-/// from its name, and the option that has to carry every out-of-scope question is the one that can
-/// least afford to be guessed at.
-/// The decline's own words. They name what can be answered and ask which of it was meant, because a
-/// person who asked something adjacent needs a way back in — a bare refusal leaves them guessing at
-/// what the system is for. Declared in `common` because Chat has to recognise it: a topic that
-/// declined found nothing, and its text is never context for a later turn.
-use common::agent_replies::{CLARIFY_OPENING, DECLINE_OPENING};
 const DECLINE_CLOSING: &str = "Which of those did you mean?";
-/// When the catalog is empty there is nothing to offer, and listing nothing would read as a bug.
-const NOTHING_CONNECTED: &str =
-    "I'm not connected to anything I can answer from at the moment. Please try again shortly.";
-/// The clarification's opening. The turn found a source and could not fill it in; asking is the
-/// only honest move, and it is a question rather than a refusal because the person can answer it in
-/// one word.
-/// When the schema says nothing about the argument, ask in the most general terms there are.
 const MISSING_VALUE_FALLBACK: &str = "to know what to look it up for";
 const NO_TOOL_DESCRIPTION: &str =
     "no source listed here holds what this question asks for, or the message asks for nothing";
 
-/// A pick at or above this is acted on. Measured over 16 questions against a catalog whose entries
-/// describe their coverage: every in-scope question reached its source at 0.88 or better, and every
-/// out-of-scope one reached `none` at 0.91 or better. The gap is wide enough that the exact value
-/// here does not decide anything — which is the point of asking the catalog rather than the model.
-const TOOL_CHOICE_CONFIDENCE_THRESHOLD: f64 = 0.5;
-/// The question is sent to a fast-dispatched tool verbatim, as the whole value of its one string
-/// argument — never composed by a model first. That is only safe for something shaped like a
-/// question: `services/chat/src/topic_turn.rs` builds a follow-up's question as `"Earlier
-/// answer:\n{summary}\n\nFollow-up: {content}"`, multi-line and capable of embedding a previous
-/// answer's whole text. Sending that straight into a tool's query would both wreck the tool's own
-/// result quality and ship a prior answer into a third-party provider's request. A single line
-/// under this length is what "verbatim" was written for; anything longer or multi-line falls
-/// through to today's flow, where the model composes its own query instead.
-const MAX_FAST_DISPATCH_QUESTION_CHARS: usize = 200;
+const TOOL_CHOICE_CONFIDENT_ENOUGH_TO_ACT_ON: f64 = 0.5;
+const MAX_CHARS_SENT_TO_A_TOOL_VERBATIM: usize = 200;
 
-/// Question ids for an argument whose value is a span of the message. Each carries the tool's own
-/// name, because the catalog may offer several such arguments and all of them are asked
-/// speculatively in the one request — the candidate spans depend on the message, not on which tool
-/// turns out to win, so there is nothing to wait for.
 const VALUE_QUESTION_PREFIX: &str = "value::";
 const VALUE_STATED_PREFIX: &str = "stated::";
 const VALUE_ONE_ONLY_PREFIX: &str = "one_only::";
-/// The escape every closed set gets: the options are spans of one message, and the message may
-/// simply not contain the value.
 const NO_VALUE_OPTION: &str = "none";
-/// A pick that loses to its neighbours — "York" against "New York" — lands here rather than being
-/// dispatched, and the turn composes the argument generatively as it does today.
-const VALUE_CHOICE_CONFIDENCE_THRESHOLD: f64 = 0.6;
-/// Absolute, and asked about the message alone: a relative choice ranks *something* first even when
-/// the message names nothing. Measured, this is what catches "the weather in the capital of
-/// Kyrgyzstan" (0.15) and "the weather here" (0.05), where the choice itself is confident and wrong.
-const VALUE_STATED_THRESHOLD: f64 = 0.5;
-/// Also absolute, and the one that catches "weather in Paris and Berlin" (0.08), where the value is
-/// stated outright — twice. Two literal questions combined in code, rather than one question
-/// carrying both judgements.
-const VALUE_ONE_ONLY_THRESHOLD: f64 = 0.5;
-/// How many adjacent words may form one candidate, so a value of more than one word — "New York",
-/// "Rio de Janeiro" — is among the options rather than only its parts.
+const VALUE_CHOICE_CONFIDENT_ENOUGH_TO_DISPATCH: f64 = 0.6;
+const VALUE_STATED_ENOUGH_TO_DISPATCH: f64 = 0.5;
+const VALUE_ONE_ONLY_ENOUGH_TO_DISPATCH: f64 = 0.5;
 const MAX_SPAN_WORDS: usize = 3;
-/// Kept under the decision vendor's 255-option ceiling with room to spare. A message long enough to
-/// exceed it is not one where a single argument is being named anyway, so it falls through.
+const DECIDER_OPTION_CEILING: usize = 255;
 const MAX_SPAN_OPTIONS: usize = 200;
-/// How many message-valued arguments are asked about speculatively in one request. Extra questions
-/// are nearly free, but a catalog is not a licence to send an unbounded number of them.
-const MAX_SPAN_ARGUMENTS: usize = 4;
+const MAX_OPTION_NAME_BYTES: usize = 64;
+const _: () = assert!(MAX_SPAN_OPTIONS < DECIDER_OPTION_CEILING);
+const MAX_ARGUMENTS_ASKED_ABOUT_AT_ONCE: usize = 4;
 
 fn shape_of(output: LlmOutput) -> String {
     serde_json::to_string(&output).expect("an LlmOutput always serializes")
@@ -348,19 +230,10 @@ pub struct LlmNodeConfig {
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct CatalogEntry {
-    /// The slug a call is dispatched by.
     pub name: String,
-    /// What the operator calls this source, for the one place a person reads it: the decline that
-    /// names what can be answered. A slug there reads as a machine dump, and a person told
-    /// `kb_read_document` has been told nothing.
     #[serde(default)]
     pub title: String,
     pub description: String,
-    /// The tool's `input_schema_json`, exactly as `ListTools` published it — read at runtime by
-    /// `single_required_string_field` to decide whether a confident pick may be dispatched without
-    /// a generative turn first. Never inspected for a tool's name: the gate this module's tests
-    /// enforce (`the_tool_use_policy_names_no_subject_and_no_tool`) is about naming a subject in
-    /// code or prompts, not about reading a live catalog's own schema field.
     pub input_schema_json: String,
 }
 
@@ -396,21 +269,18 @@ pub fn build_prompt_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> (S
             Mode::FromMaterial => &FROM_MATERIAL_INSTRUCTIONS,
         });
     }
-    // Nothing is listed when the answer is already in hand: a tool the model cannot see is a tool
-    // it cannot go looking for instead of reading what is in front of it.
-    if !config.available_tools.is_empty() && mode != Mode::FromMaterial {
+    let answer_is_already_in_hand = mode == Mode::FromMaterial;
+    if !config.available_tools.is_empty() && !answer_is_already_in_hand {
         system.push_str("\n\nAvailable tools:\n");
         for tool in &config.available_tools {
             system.push_str(&format!("- {}: {}\n", tool.name, tool.description));
         }
     }
-    if config.tool_calling && mode != Mode::FromMaterial {
+    if config.tool_calling && !answer_is_already_in_hand {
         system.push_str(TOOL_USE_POLICY);
     }
-    // The style block is about a reply, and it is the last thing the model reads. In compose-only
-    // there is no reply to style, and closing with "a bare value is a complete answer" undoes the
-    // instruction the mode opened with.
-    if mode != Mode::ComposeOnly {
+    let there_is_a_reply_to_style = mode != Mode::ComposeOnly;
+    if there_is_a_reply_to_style {
         system.push_str(FINAL_ANSWER_STYLE);
     }
 
@@ -430,15 +300,38 @@ fn rendered_tool_results(state: &Value) -> impl Iterator<Item = (usize, &Value)>
         .get(TOOL_RESULT_STATE_KEY)
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    // Carried material first, this turn's second, and only the last few of the two together: a
-    // model reads the most recent, and everything older is prompt weight.
-    let all: Vec<&Value> = prior.iter().chain(fetched.iter()).collect();
-    let first_rendered = all.len().saturating_sub(RENDERED_TOOL_RESULTS);
-    all.into_iter().enumerate().skip(first_rendered)
+    let carried_then_fetched: Vec<&Value> = prior.iter().chain(fetched.iter()).collect();
+    let first_rendered = carried_then_fetched
+        .len()
+        .saturating_sub(RENDERED_TOOL_RESULTS);
+    carried_then_fetched
+        .into_iter()
+        .enumerate()
+        .skip(first_rendered)
 }
 
-/// What an earlier turn found, as the text a decision and a model will both read. `None` when this
-/// turn inherited nothing, which is every turn that is not a follow-up.
+fn still_fresh(records: Option<&Value>) -> Value {
+    let Some(records) = records.and_then(Value::as_array) else {
+        return Value::Null;
+    };
+    let now = Utc::now();
+    Value::Array(
+        records
+            .iter()
+            .filter(|record| {
+                record
+                    .get(FETCHED_AT_FIELD)
+                    .and_then(Value::as_str)
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .is_some_and(|at| {
+                        now - at.with_timezone(&Utc) < CARRIED_MATERIAL_GOES_STALE_AFTER
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn rendered_prior_material(state: &Value) -> Option<String> {
     let records = state.get(PRIOR_MATERIAL_STATE_KEY)?.as_array()?;
     if records.is_empty() {
@@ -456,11 +349,10 @@ fn rendered_prior_material(state: &Value) -> Option<String> {
 }
 
 fn render_tool_result(index: usize, record: &Value) -> String {
-    // A record written before this shape existed, or by a path that stores the bare output, renders
-    // as it always did.
+    let bare_output_without_the_call = (None, record);
     let (asked, result) = match record.get("result") {
         Some(result) => (record.get("args"), result),
-        None => (None, record),
+        None => bare_output_without_the_call,
     };
     let asked = asked.map_or_else(String::new, |args| format!(" (asked for {args})"));
     match result.get(TOOL_RESULT_ERROR_KEY).and_then(Value::as_str) {
@@ -476,10 +368,13 @@ fn render_tool_result(index: usize, record: &Value) -> String {
 }
 
 fn truncated(text: &str) -> String {
-    if text.chars().count() <= MAX_TOOL_RESULT_CHARS {
+    if text.chars().count() <= MAX_CHARS_PER_RENDERED_TOOL_RESULT {
         return text.to_owned();
     }
-    let kept: String = text.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+    let kept: String = text
+        .chars()
+        .take(MAX_CHARS_PER_RENDERED_TOOL_RESULT)
+        .collect();
     format!("{kept}{TRUNCATION_MARK}")
 }
 
@@ -497,13 +392,6 @@ pub fn parse_llm_output(content: &str) -> Value {
     serde_json::to_value(output).expect("an LlmOutput always serializes")
 }
 
-/// The first `{tool_call, reply}` object in `content`, when the whole of `content` would not parse
-/// as one. A light model sometimes writes a sentence before the envelope, or two envelopes in a
-/// row; whole-string parsing fails on both and the fallback then shows the person the machine text
-/// verbatim — observed live as `Bishkek. {"tool_call": {...}, "reply": null}` in a chat window.
-///
-/// Only a parse succeeding from a `{` counts, so ordinary prose containing a brace is untouched and
-/// still becomes the reply.
 fn first_envelope(content: &str) -> Option<LlmOutput> {
     content
         .char_indices()
@@ -581,9 +469,23 @@ impl TaskExecutor for LlmTaskExecutor {
 
         let request = complete_request(&config, state);
         let output = self.complete_with_retries(&request).await?;
+        let material = everything_fetched_so_far(state);
 
-        Ok(output)
+        Ok(self.checked_against(&request, &material, output).await)
     }
+}
+
+fn everything_fetched_so_far(state: &Value) -> Value {
+    let of = |key: &str| {
+        state
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut records = of(PRIOR_MATERIAL_STATE_KEY);
+    records.extend(of(TOOL_RESULT_STATE_KEY));
+    Value::Array(records)
 }
 
 fn complete_request(config: &LlmNodeConfig, state: &Value) -> CompleteRequest {
@@ -608,44 +510,14 @@ fn complete_request_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> Co
     }
 }
 
-/// What one typed `Decide` call, sent before the first generative call of a turn, resolves to.
-/// `decide_usage` is `Decide`'s own token cost, shaped for `merge_usage` — see
-/// `decide_usage_value` — so `try_fast_path` can fold it into the budget the same way
-/// `merge_usage` already folds the nudge's second `Complete` in.
 enum FastPath {
-    /// `tool` came back confident, named a live catalog entry, that entry's schema takes exactly
-    /// one required string field, and the question is shaped like something safe to send
-    /// verbatim: call it with the question verbatim.
     ToolCall { call: ToolCall, decide_usage: Value },
-    /// `tool` came back confident and named a live catalog entry, but its arguments could not be
-    /// settled by the decision alone. The model is asked for the call and nothing else — it is
-    /// not offered the choice of answering, because that is the choice it gets wrong: given both,
-    /// a light model replies "I will look that up" and the turn ends having called nothing.
     ComposeOnly { tool: String, decide_usage: Value },
-    /// The question asks about what an earlier turn already found, and the decision said so. The
-    /// one answer-only form the design allows: over material this system fetched, never over a bare
-    /// question, and checked against that material afterwards like any other answer.
     FromMaterial { decide_usage: Value },
-    /// No connected source covers the question — `none`, confidently — or the decision could not
-    /// be reached at all. Both end the turn the same way, saying what can be answered and asking
-    /// which of it was meant. They are one variant because they are one outcome for the person:
-    /// nothing here was answered, and nothing was invented in place of an answer.
-    ///
-    /// A decision that does not arrive used to fall through to a loop where the model could answer
-    /// from memory. That fall-through is gone: it is the failure this design exists to remove, and
-    /// keeping it for outages would mean the guarantee holds only while the provider is up.
     Decline { decide_usage: Value },
 }
 
 impl LlmTaskExecutor {
-    /// `Some` when the fast path decided the whole node's outcome — either answer directly.
-    /// `None` means "fall through to today's flow", the fail-safe for every unavailable or
-    /// unconfident `Decide` outcome.
-    ///
-    /// Only tried on the very first generative call of a turn — `config.tool_calling` and no
-    /// `tool_result` yet in state — matching `answered_before_consulting_any_tool`'s own gate: a
-    /// later iteration already has tool results the typed decision was never asked about, so it
-    /// takes today's flow instead.
     async fn try_fast_path(
         &self,
         config: &LlmNodeConfig,
@@ -677,34 +549,23 @@ impl LlmTaskExecutor {
         }
     }
 
-    /// Answers over what an earlier turn found: no tools listed, the material rendered into the
-    /// prompt, and the reply checked against that material afterwards. Safe as answer-only never
-    /// was on a bare question, because here there is something to check it against.
     async fn answer_from_material(
         &self,
         config: &LlmNodeConfig,
         state: &Value,
         decide_usage: &Value,
     ) -> Result<Value, TaskError> {
-        let material = state
-            .get(PRIOR_MATERIAL_STATE_KEY)
-            .cloned()
-            .unwrap_or(Value::Null);
+        let material = still_fresh(state.get(PRIOR_MATERIAL_STATE_KEY));
+        if material.as_array().is_none_or(Vec::is_empty) {
+            tracing::info!("what the earlier turn found has gone stale, declining instead");
+            return Ok(decline(config, decide_usage));
+        }
         let request = complete_request_for(config, state, Mode::FromMaterial);
         let output = self.complete_with_retries(&request).await?;
         let output = self.checked_against(&request, &material, output).await;
         Ok(merge_usage(decide_usage, without_tool_call(output)))
     }
 
-    /// The last thing between a promise and the person. Twice offered tools and twice answering
-    /// without calling one, the model has either answered from what it knows — which is fine — or
-    /// undertaken to do something, which is not: nothing runs after a reply, so the undertaking is
-    /// never kept and the turn ends looking like it succeeded.
-    ///
-    /// Only a typed decision can tell the two apart, and it is asked about the finished reply
-    /// rather than the question. A promise is replaced with the plain truth. An unavailable or
-    /// unconfident decision leaves the reply exactly as it was: this guard may only remove a
-    /// promise, never invent a failure.
     async fn checked_against(
         &self,
         request: &CompleteRequest,
@@ -714,42 +575,49 @@ impl LlmTaskExecutor {
         let Some(faults) = self.faults_in(material, &output).await else {
             return output;
         };
+        let output = merge_usage(&faults.spent, output);
         if faults.sound() {
             return output;
         }
-        // One more ask, with the fault stated. A reply that named the wrong thing usually has the
-        // right thing in front of it and reached past it; told so, it reaches for it again. This is
-        // worth one generative call because the alternative is telling the person nothing when the
-        // answer was already in hand.
         tracing::info!(
             ?faults,
             "the reply did not hold up against what came back, asking again"
         );
-        let rejected = output
-            .get("reply")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let mut again = request.clone();
-        again.system_prompt.push_str(&faults.correction(&rejected));
-        let Ok(second) = self.complete_with_retries(&again).await else {
+        let Ok(second) = self.asked_again_with(request, &faults, &output).await else {
             return refused(output, faults.refusal());
         };
         let second = merge_usage(&output, second);
         match self.faults_in(material, &second).await {
-            Some(faults) if !faults.sound() => {
+            Some(again) if !again.sound() => {
                 tracing::warn!(
-                    ?faults,
+                    ?again,
                     "the second reply did not hold up either, answering plainly"
                 );
-                refused(second, faults.refusal())
+                refused(merge_usage(&again.spent, second), again.refusal())
             }
-            _ => second,
+            Some(again) => merge_usage(&again.spent, second),
+            None => second,
         }
     }
 
-    /// One compose-only `Complete`, and a second with the refusal stated if the first carried no
-    /// call. Returns what was spent either way; the caller reads the call out of it.
+    async fn asked_again_with(
+        &self,
+        request: &CompleteRequest,
+        faults: &Faults,
+        rejected_in: &Value,
+    ) -> Result<Value, TaskError> {
+        let rejected = rejected_in
+            .get("reply")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut asked_again_with_the_fault_stated = request.clone();
+        asked_again_with_the_fault_stated
+            .system_prompt
+            .push_str(&faults.correction(rejected));
+        self.complete_with_retries(&asked_again_with_the_fault_stated)
+            .await
+    }
+
     async fn composed(
         &self,
         config: &LlmNodeConfig,
@@ -765,14 +633,16 @@ impl LlmTaskExecutor {
             tool,
             "compose-only reply carried no tool call, asking once more"
         );
-        let mut again = request;
-        again.system_prompt.push_str(COMPOSE_REFUSAL);
-        let second = self.complete_with_retries(&again).await?;
+        let mut asked_again_with_the_refusal_stated = request;
+        asked_again_with_the_refusal_stated
+            .system_prompt
+            .push_str(COMPOSE_REFUSAL);
+        let second = self
+            .complete_with_retries(&asked_again_with_the_refusal_stated)
+            .await?;
         Ok(merge_usage(&spent, second))
     }
 
-    /// `Some(a question back)` when the message points at no such value as the one composed, and
-    /// the turn asks for it instead of dispatching.
     async fn asked_for_instead(
         &self,
         config: &LlmNodeConfig,
@@ -788,29 +658,34 @@ impl LlmTaskExecutor {
         Some(clarify(self.schema_of(config, &call.name), &Value::Null))
     }
 
-    /// `Some(the composed value)` when the message points at no such thing. This is the only guard
-    /// that can reach a wrong argument: dispatched, the source answers for whatever it was asked,
-    /// the reply is faithfully grounded in that answer, and every later check passes. Measured, the
-    /// composed value `"there"` reached a village of that name and its weather scored 0.96 on
-    /// grounding.
-    ///
-    /// Spent only on the composing path, which already costs a generative call; the dispatch path
-    /// settles its argument from the decision and pays nothing.
-    async fn not_pointed_at(&self, state: &Value, call: &ToolCall) -> Option<String> {
-        let question = ExecutionInput::in_state(state).question;
-        let request = pointed_at_request(&question, &call.args)?;
-        let decided = match self.decider.decide(request).await {
-            Ok(response) => response.into_owned(),
+    async fn decided_once_more_on_error(&self, request: DecideRequest) -> Option<DecideResponse> {
+        let second = request.clone();
+        match self.decider.decide(request).await {
+            Ok(response) => return Some(response.into_owned()),
+            Err(error) => tracing::info!(%error, "the check did not answer, asking once more"),
+        }
+        match self.decider.decide(second).await {
+            Ok(response) => Some(response.into_owned()),
             Err(error) => {
-                tracing::warn!(%error, "could not check the composed value, dispatching it as it is");
-                return None;
+                tracing::warn!(%error, "the check did not answer twice");
+                None
             }
-        };
-        let pointed = find_noul(&decided.answers, POINTED_AT_ID)?;
-        (pointed < POINTED_AT_THRESHOLD).then(|| call.args.to_string())
+        }
     }
 
-    /// The chosen tool's published schema, for wording the question back to the person.
+    async fn not_pointed_at(&self, state: &Value, call: &ToolCall) -> Option<String> {
+        let question = ExecutionInput::in_state(state).question;
+        let Some(request) = pointed_at_request(&question, &call.args) else {
+            return Some(call.args.to_string());
+        };
+        let Some(decided) = self.decided_once_more_on_error(request).await else {
+            tracing::warn!("could not check the composed value, asking for it instead");
+            return Some(call.args.to_string());
+        };
+        let pointed = find_noul(&decided.answers, POINTED_AT_ID).unwrap_or(BELOW_EVERY_THRESHOLD);
+        (pointed < POINTED_AT_ENOUGH_TO_DISPATCH).then(|| call.args.to_string())
+    }
+
     fn schema_of<'a>(&self, config: &'a LlmNodeConfig, name: &str) -> &'a str {
         config
             .available_tools
@@ -819,9 +694,6 @@ impl LlmTaskExecutor {
             .map_or("", |tool| tool.input_schema_json.as_str())
     }
 
-    /// Both judgements in one `Decide`: whether the reply only undertakes work, and whether every
-    /// specific thing in it is present in what came back. `None` when there is nothing to judge or
-    /// the decider could not be reached — these guards may only catch a fault, never invent one.
     async fn faults_in(&self, material: &Value, output: &Value) -> Option<Faults> {
         let reply = output
             .get("reply")
@@ -839,16 +711,13 @@ impl LlmTaskExecutor {
         };
         Some(Faults {
             promises: find_noul(&decided.answers, PROMISE_ID)
-                .is_some_and(|value| value > PROMISE_THRESHOLD),
+                .is_some_and(|value| value > PROMISE_ENOUGH_TO_REFUSE),
             ungrounded: find_noul(&decided.answers, GROUNDED_ID)
-                .is_some_and(|value| value < GROUNDED_THRESHOLD),
+                .is_some_and(|value| value < GROUNDED_ENOUGH_TO_SEND),
+            spent: decide_usage_value(&decided),
         })
     }
 
-    /// One `Complete` in compose-only mode, then the dispatch the decision already committed to.
-    /// A response carrying no `tool_call` is refused and asked again once with the refusal stated;
-    /// a second refusal is answered honestly rather than with the promise the model wanted to
-    /// make, because a promise ends the turn and nothing keeps it.
     async fn compose_tool_call(
         &self,
         config: &LlmNodeConfig,
@@ -877,19 +746,13 @@ impl LlmTaskExecutor {
         let result = self.dispatch_tool_fast(&call, idempotency_key).await;
         let state_with_result =
             state_with_extra_tool_result(state, tool_record(&call, result.clone()));
-        // Loop, not answer-only: a failed call is shown as an ERROR result, and only the loop's
-        // instructions say that this means call again rather than that the task is over.
-        let request = complete_request(config, &state_with_result);
+        let request = complete_request_for(config, &state_with_result, Mode::Loop);
         let output = self.complete_with_retries(&request).await?;
         let output = self.checked_against(&request, &result, output).await;
         let output = merge_usage(decide_usage, merge_usage(&spent, output));
         Ok(attach_fast_tool_call(output, &call, result))
     }
 
-    /// Dispatches the fast-chosen tool, folds its result into the prompt for one `Complete` call,
-    /// merges in both spent calls' token usage, and records the call on the node's own output
-    /// under `FAST_TOOL_CALL_FIELD` — see that constant's doc for why that alone makes the call
-    /// event-logged, checkpointed and budget-charged by the ordinary per-node machinery.
     async fn run_fast_tool_call(
         &self,
         config: &LlmNodeConfig,
@@ -901,23 +764,21 @@ impl LlmTaskExecutor {
         let result = self.dispatch_tool_fast(call, idempotency_key).await;
         let state_with_result =
             state_with_extra_tool_result(state, tool_record(call, result.clone()));
-        let request = complete_request(config, &state_with_result);
+        let request = complete_request_for(config, &state_with_result, Mode::Loop);
         let output = self.complete_with_retries(&request).await?;
         let output = self.checked_against(&request, &result, output).await;
         let output = merge_usage(decide_usage, output);
         Ok(attach_fast_tool_call(output, call, result))
     }
 
-    /// Sends one `Decide` over the question, and over what an earlier turn found when there is any.
-    /// Not the whole execution state, per the vendor's own guidance. Any error or timeout is
-    /// `FastPath::Decline`, which is what keeps a decider outage from answering from memory.
     async fn decide_fast_path(
         &self,
         config: &LlmNodeConfig,
         question: &str,
-        prior: Option<&str>,
+        rendered_prior: Option<&str>,
     ) -> FastPath {
-        let Some(request) = decide_request(question, &config.available_tools, prior) else {
+        let Some(request) = decide_request(question, &config.available_tools, rendered_prior)
+        else {
             return FastPath::Decline {
                 decide_usage: Value::Null,
             };
@@ -927,7 +788,7 @@ impl LlmTaskExecutor {
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    "typed decision failed, falling back to today's flow with the nudge enabled"
+                    "the scope decision did not answer, so the turn declines"
                 );
                 return FastPath::Decline {
                     decide_usage: Value::Null,
@@ -947,8 +808,6 @@ impl LlmTaskExecutor {
                 &decided.answers,
             ) {
                 Some(call) => FastPath::ToolCall { call, decide_usage },
-                // The tool is needed and it exists; only its arguments are open. That is a
-                // composing job, not a decision to revisit.
                 None if names_a_live_tool(choice, &config.available_tools) => {
                     FastPath::ComposeOnly {
                         tool: choice.choice.clone(),
@@ -961,11 +820,6 @@ impl LlmTaskExecutor {
         FastPath::Decline { decide_usage }
     }
 
-    /// Runs the fast-dispatched tool the same way a failed normal tool call would be shown to the
-    /// model: as an observation, either the raw output or `{"error": ...}` — never a hard failure.
-    /// A wrong pick on this path costs one tool call, not the turn, so nothing here can fail the
-    /// node; the answering `Complete` that follows sees whatever this returns and can recover from
-    /// it exactly as it recovers from a normal tool node's error.
     async fn dispatch_tool_fast(&self, call: &ToolCall, idempotency_key: &str) -> Value {
         let request = ExecuteRequest {
             slug: call.name.clone(),
@@ -980,18 +834,10 @@ impl LlmTaskExecutor {
     }
 }
 
-/// `Decide`'s own token cost, shaped like a node output's `usage` object so `merge_usage` — built
-/// to fold the nudge's second `Complete` into the first — folds this in the same way. Every
-/// fast-path turn spends this call and the budget must see it, same as any other.
 fn decide_usage_value(decided: &DecideResponse) -> Value {
     json!({"usage": {"tokens_in": decided.tokens_in, "tokens_out": decided.tokens_out}})
 }
 
-/// Records the fast-dispatched call on the node's own output — name, args and result, under
-/// `FAST_TOOL_CALL_FIELD` — which `engine-core::step::apply_output` then records verbatim in this
-/// node's `NodeCompleted` event and writes into the checkpointed state through the node's own
-/// reducer, and `engine-core::step::charge_budget` reads to charge the extra `tool_calls_remaining`
-/// unit a `tool` node would otherwise have earned.
 fn attach_fast_tool_call(mut output: Value, call: &ToolCall, result: Value) -> Value {
     if let Some(object) = output.as_object_mut() {
         object.insert(
@@ -1022,12 +868,13 @@ fn no_tool_results_yet(state: &Value) -> bool {
         .is_none_or(Vec::is_empty)
 }
 
-/// What one dispatch is remembered as: the call and what came back, together. The call is half the
-/// record — "where?" is answered by the argument, not by the temperature — and without it a
-/// follow-up about what was looked up has nothing to read, and the grounding guard judges a reply
-/// against only half of what produced it.
 fn tool_record(call: &ToolCall, result: Value) -> Value {
-    json!({"name": call.name, "args": call.args, "result": result})
+    json!({
+        "name": call.name,
+        "args": call.args,
+        "result": result,
+        FETCHED_AT_FIELD: Utc::now().to_rfc3339(),
+    })
 }
 
 fn state_with_extra_tool_result(state: &Value, result: Value) -> Value {
@@ -1044,32 +891,23 @@ fn state_with_extra_tool_result(state: &Value, result: Value) -> Value {
     state
 }
 
-/// The JSON `Decide` reads: the question alone, not the whole execution state — see
-/// `try_fast_path`'s doc for why. Two questions ride the same call: `needs_external_information`
-/// is read only when no confident, schema-eligible tool pick is found — see `decide_fast_path`.
 fn decide_request(
     question: &str,
     available_tools: &[CatalogEntry],
-    prior: Option<&str>,
+    rendered_prior: Option<&str>,
 ) -> Option<DecideRequest> {
-    // The material travels as the rendered text, not as an object: `google.protobuf.Value` re-sorts
-    // an object's keys and widens its numbers, and the decision should judge what the model will
-    // read.
-    let state = match prior {
-        Some(prior) => json!({"message": question, "already_found": prior}),
+    let state = match rendered_prior {
+        Some(rendered) => json!({"message": question, "already_found": rendered}),
         None => json!(question),
     };
     let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
-    request.questions = vec![tool_question(available_tools, prior.is_some())?];
+    request.questions = vec![tool_question(available_tools, rendered_prior.is_some())?];
     request
         .questions
         .extend(decidable_questions(question, available_tools));
     Some(request)
 }
 
-/// The message's own words, and every run of up to `MAX_SPAN_WORDS` adjacent words, deduplicated.
-/// Trailing punctuation is trimmed so `Bishkek?` offers `Bishkek`, which is the normalisation step
-/// the pattern expects of the code around the pick, not a rule about what a value looks like.
 fn spans(message: &str) -> Vec<String> {
     let words: Vec<&str> = message
         .split_whitespace()
@@ -1079,43 +917,31 @@ fn spans(message: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for size in 1..=MAX_SPAN_WORDS {
         for run in words.windows(size) {
-            let candidate = run.join(" ");
-            if !found.contains(&candidate) {
-                found.push(candidate);
+            if found.len() >= MAX_SPAN_OPTIONS {
+                return found;
             }
+            let candidate = run.join(" ");
+            let collides_with_the_sentinel = candidate.eq_ignore_ascii_case(NO_VALUE_OPTION);
+            let too_long_to_offer = candidate.len() > MAX_OPTION_NAME_BYTES;
+            if collides_with_the_sentinel || too_long_to_offer || found.contains(&candidate) {
+                continue;
+            }
+            found.push(candidate);
         }
     }
     found
 }
 
-/// `Some((field, description))` when a tool's schema names exactly one required string field and
-/// that field says its value appears among the words of the message. The description is the
-/// field's own, so the question asks about the meaning the operator wrote rather than about the
-/// parameter's name — a question named after its parameter gives the message nothing to match.
-/// The field and its description, when a typed decision can settle its value at all — whichever
-/// kind of options it turns out to have.
 fn decidable_argument(input_schema_json: &str) -> Option<(String, String)> {
     let (field, description, _) = decidable_field(input_schema_json)?;
     Some((field, description))
 }
 
-/// Where a decidable argument's options come from. A closed list is the stronger claim of the two:
-/// the schema itself says what the endpoint will accept, so whatever comes back is a value it
-/// accepts. A span is the weaker one: the value is a word of the message, which the message might
-/// not contain at all.
 enum Options {
-    /// A closed list, optionally with a line per value — `oneOf` entries of `{const, description}`,
-    /// or a bare `enum` of strings.
     Closed(Vec<(String, Option<String>)>),
-    /// Built per message, from its own words.
     Spans,
 }
 
-/// `Some((field, description, options))` when a tool's schema names exactly one required string
-/// field whose value a typed decision can settle: either because the schema lists what it may be,
-/// or because the field says it appears among the words of the message. The description is the
-/// field's own, so the question asks about the meaning the operator wrote rather than about the
-/// parameter's name — a question named after its parameter gives the message nothing to match.
 fn decidable_field(input_schema_json: &str) -> Option<(String, String, Options)> {
     let schema: Value = serde_json::from_str(input_schema_json).ok()?;
     let required = schema.get("required")?.as_array()?;
@@ -1138,9 +964,6 @@ fn decidable_field(input_schema_json: &str) -> Option<(String, String, Options)>
     Some((field.to_owned(), description.to_owned(), options))
 }
 
-/// A property's closed list, if it has one. `oneOf` of `{const, description}` is preferred because
-/// it carries a line per value, which is what lets the decision tell two near-identical symbols
-/// apart; a bare `enum` of strings works and simply offers no such line.
 fn closed_list(property: &Value) -> Option<Vec<(String, Option<String>)>> {
     if let Some(variants) = property.get("oneOf").and_then(Value::as_array) {
         let listed: Vec<(String, Option<String>)> = variants
@@ -1165,10 +988,6 @@ fn closed_list(property: &Value) -> Option<Vec<(String, Option<String>)>> {
     (!listed.is_empty()).then_some(listed)
 }
 
-/// Three questions per eligible argument, all over the same message and all in the one request the
-/// turn already sends: which span is the value, whether the message states it at all, and whether
-/// it states only one. The first is relative and will rank something regardless; the other two are
-/// absolute and are what make a wrong pick visible.
 fn decidable_questions(message: &str, available_tools: &[CatalogEntry]) -> Vec<Question> {
     let candidates = spans(message);
     available_tools
@@ -1185,7 +1004,7 @@ fn decidable_questions(message: &str, available_tools: &[CatalogEntry]) -> Vec<Q
                 listed,
             ))
         })
-        .take(MAX_SPAN_ARGUMENTS)
+        .take(MAX_ARGUMENTS_ASKED_ABOUT_AT_ONCE)
         .flat_map(|(name, description, listed)| {
             question_set_for(name, &description, &listed).unwrap_or_default()
         })
@@ -1250,20 +1069,17 @@ fn question_set_for(
     Some(vec![value, stated, one_only])
 }
 
-/// The span the decision picked for `tool`, once all three of its questions agree it is safe to
-/// use: the choice is confident and is not the escape, the message states the value outright, and
-/// it states only one. Any of those failing leaves the argument to be composed generatively, which
-/// costs one call and nothing else.
 fn picked_value(answers: &[Answer], tool: &str) -> Option<String> {
     let choice = find_choice(answers, &format!("{VALUE_QUESTION_PREFIX}{tool}"))?;
-    if choice.choice == NO_VALUE_OPTION
-        || choice.confidence < VALUE_CHOICE_CONFIDENCE_THRESHOLD
-        || find_noul(answers, &format!("{VALUE_STATED_PREFIX}{tool}"))? < VALUE_STATED_THRESHOLD
-        || find_noul(answers, &format!("{VALUE_ONE_ONLY_PREFIX}{tool}"))? < VALUE_ONE_ONLY_THRESHOLD
-    {
-        return None;
-    }
-    Some(choice.choice.clone())
+    let a_value_was_chosen = choice.choice != NO_VALUE_OPTION
+        && choice.confidence >= VALUE_CHOICE_CONFIDENT_ENOUGH_TO_DISPATCH;
+    let the_message_states_it = find_noul(answers, &format!("{VALUE_STATED_PREFIX}{tool}"))?
+        >= VALUE_STATED_ENOUGH_TO_DISPATCH;
+    let the_message_states_only_one =
+        find_noul(answers, &format!("{VALUE_ONE_ONLY_PREFIX}{tool}"))?
+            >= VALUE_ONE_ONLY_ENOUGH_TO_DISPATCH;
+    (a_value_was_chosen && the_message_states_it && the_message_states_only_one)
+        .then(|| choice.choice.clone())
 }
 
 fn instructed(id: &str, instructions: Value) -> Option<Question> {
@@ -1273,8 +1089,6 @@ fn instructed(id: &str, instructions: Value) -> Option<Question> {
     Some(question)
 }
 
-/// Asked of the finished reply, never of the question. Phrased about what the sentence does, so it
-/// names no subject and no tool — the `gate-architecture` rule holds here as everywhere.
 fn reply_check_request(material: &Value, reply: &str) -> Option<DecideRequest> {
     let state = json!({"material": material, "reply": reply});
     let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
@@ -1311,23 +1125,19 @@ fn noul_question(
     Some(question)
 }
 
-/// What the two guards found. Kept together because they are one `Decide` and one decision about
-/// what the person is shown.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Faults {
     promises: bool,
     ungrounded: bool,
+    spent: Value,
 }
 
 impl Faults {
-    fn sound(self) -> bool {
+    fn sound(&self) -> bool {
         !self.promises && !self.ungrounded
     }
 
-    /// What to tell the model on the second ask. The rejected reply is quoted back: told only that
-    /// it was wrong, a light model writes the same thing again — measured, twice in a row — because
-    /// it cannot tell which part was refused. Shown its own words, it does not repeat them.
-    fn correction(self, rejected: &str) -> String {
+    fn correction(&self, rejected: &str) -> String {
         let fault = if self.ungrounded {
             UNGROUNDED_CORRECTION
         } else {
@@ -1336,9 +1146,7 @@ impl Faults {
         format!("\n\nYour previous reply was refused: \"{rejected}\".{fault}")
     }
 
-    /// What the person is told when the second ask fails too. Reporting the failure beats sending
-    /// either an undertaking nothing will keep or a value nothing supports.
-    fn refusal(self) -> &'static str {
+    fn refusal(&self) -> &'static str {
         if self.ungrounded {
             UNGROUNDED_REFUSED
         } else {
@@ -1347,14 +1155,6 @@ impl Faults {
     }
 }
 
-/// Whether the message points at every value this call was composed with. A composed argument is
-/// the one place the model may put a word of its own into a request that then comes back looking
-/// like fact: dispatched, the source answers for whatever it was asked, the answer is faithfully
-/// grounded in that, and nothing downstream can tell. Measured: "weather there?" composed
-/// `place: "there"`, a real village in Pakistan, and every later guard passed its weather at 0.96.
-///
-/// An unreachable decider leaves the call alone, the same as every other guard here: this may stop
-/// a call, never invent a reason to.
 fn pointed_at_request(question: &str, args: &Value) -> Option<DecideRequest> {
     let state = json!({"message": question, "value": args});
     let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
@@ -1367,9 +1167,6 @@ fn pointed_at_request(question: &str, args: &Value) -> Option<DecideRequest> {
     Some(request)
 }
 
-/// What the turn asks for when a value was needed and the message pointed at none. The wording of
-/// the argument comes from the tool's own schema — operator data — so this names no subject and
-/// costs no generative call.
 fn clarify(input_schema_json: &str, decide_usage: &Value) -> Value {
     let wanted = decidable_argument(input_schema_json)
         .map(|(_, description)| description)
@@ -1381,7 +1178,6 @@ fn clarify(input_schema_json: &str, decide_usage: &Value) -> Value {
     )
 }
 
-/// Replaces a reply that did not hold up, keeping everything else the output carried.
 fn refused(mut output: Value, reply: &str) -> Value {
     if let Some(object) = output.as_object_mut() {
         object.insert("reply".to_owned(), json!(reply));
@@ -1389,8 +1185,6 @@ fn refused(mut output: Value, reply: &str) -> Value {
     output
 }
 
-/// One option per entry in the live catalog the dispatcher injected, plus `NO_TOOL_OPTION` — read
-/// from `available_tools` at runtime, never a name written in Rust.
 fn tool_question(available_tools: &[CatalogEntry], has_prior: bool) -> Option<Question> {
     let mut options: Vec<ChoiceOption> = available_tools
         .iter()
@@ -1421,21 +1215,13 @@ fn tool_question(available_tools: &[CatalogEntry], has_prior: bool) -> Option<Qu
     Some(question)
 }
 
-/// The `tool` choice, if it names something other than `NO_TOOL_OPTION` at or above the
-/// confidence threshold — regardless of whether it goes on to qualify for fast dispatch. A
-/// confident pick here means the decider has judged a tool necessary, and callers must treat that
-/// as vetoing `FastPath::NoToolNeeded` even when the pick itself cannot be fast-dispatched — see
-/// `decide_fast_path`.
 fn confident_tool_choice(answers: &[Answer]) -> Option<&ChoiceAnswer> {
     find_choice(answers, TOOL_QUESTION_ID).filter(|choice| {
-        choice.choice != NO_TOOL_OPTION && choice.confidence >= TOOL_CHOICE_CONFIDENCE_THRESHOLD
+        choice.choice != NO_TOOL_OPTION
+            && choice.confidence >= TOOL_CHOICE_CONFIDENT_ENOUGH_TO_ACT_ON
     })
 }
 
-/// A confident `tool` pick additionally qualifies for the fast path only when it names a live
-/// catalog entry whose `input_schema` takes exactly one required string field — decided by the
-/// schema, never by the tool's name — and `question` is shaped like something safe to send
-/// verbatim (see `MAX_FAST_DISPATCH_QUESTION_CHARS`'s doc). `question` becomes that field's value.
 fn fast_dispatchable_tool_call(
     choice: &ChoiceAnswer,
     available_tools: &[CatalogEntry],
@@ -1445,51 +1231,38 @@ fn fast_dispatchable_tool_call(
     let tool = available_tools
         .iter()
         .find(|tool| tool.name == choice.choice)?;
+    call_with_the_picked_value(tool, answers)
+        .or_else(|| call_with_the_question_verbatim(tool, question))
+}
 
-    // An argument that takes a word or two of the message is tried first: it is the narrower claim
-    // of the two, and the same decision already carries its answer.
-    if let Some((field, _)) = decidable_argument(&tool.input_schema_json)
-        && let Some(value) = picked_value(answers, &tool.name)
-    {
-        return Some(ToolCall {
-            name: tool.name.clone(),
-            args: json!({ field: value }),
-        });
-    }
+fn call_with_the_picked_value(tool: &CatalogEntry, answers: &[Answer]) -> Option<ToolCall> {
+    let (field, _) = decidable_argument(&tool.input_schema_json)?;
+    let value = picked_value(answers, &tool.name)?;
+    Some(ToolCall {
+        name: tool.name.clone(),
+        args: json!({ field: value }),
+    })
+}
 
-    if !fits_fast_dispatch(question) {
+fn call_with_the_question_verbatim(tool: &CatalogEntry, question: &str) -> Option<ToolCall> {
+    if !safe_to_send_verbatim(question) {
         return None;
     }
-    let field = single_required_string_field(&tool.input_schema_json)?;
+    let field = single_required_free_text_field(&tool.input_schema_json)?;
     Some(ToolCall {
         name: tool.name.clone(),
         args: json!({ field: question }),
     })
 }
 
-/// Whether `question` is short enough and shaped enough (one line) to hand a fast-dispatched tool
-/// verbatim as its whole one-string argument. See `MAX_FAST_DISPATCH_QUESTION_CHARS`'s doc for why
-/// this exists: a follow-up's question is not always a question.
-fn fits_fast_dispatch(question: &str) -> bool {
+fn safe_to_send_verbatim(question: &str) -> bool {
     let trimmed = question.trim();
     !trimmed.is_empty()
         && !trimmed.contains('\n')
-        && trimmed.chars().count() <= MAX_FAST_DISPATCH_QUESTION_CHARS
+        && trimmed.chars().count() <= MAX_CHARS_SENT_TO_A_TOOL_VERBATIM
 }
 
-/// `Some(field)` when `input_schema_json` is a JSON Schema object whose `required` names exactly
-/// one field, that field's own schema is `"type": "string"`, and it is annotated as taking free
-/// text. A tool needing structured arguments — two required fields, a non-string field, or a schema
-/// this cannot parse — is `None`, so it never takes the fast path regardless of how confidently it
-/// was chosen.
-///
-/// The annotation is the load-bearing part, and it is read from the tool's own declaration rather
-/// than decided here, so a new capability is still a file the operator writes and not a branch in
-/// this function. Without it, an argument that wants a value — a place, a pair, a code — is handed
-/// the user's whole sentence, and the request was never going to work: measured at ~850 ms spent
-/// reaching a third party that rejects it, against ~321 ms for the generative call that composes
-/// the argument properly. See `common::tool_schema::ACCEPTS_FREE_TEXT` for why absent means no.
-fn single_required_string_field(input_schema_json: &str) -> Option<String> {
+fn single_required_free_text_field(input_schema_json: &str) -> Option<String> {
     let schema: Value = serde_json::from_str(input_schema_json).ok()?;
     let required = schema.get("required")?.as_array()?;
     let [only] = required.as_slice() else {
@@ -1550,53 +1323,27 @@ fn merge_usage(first: &Value, mut second: Value) -> Value {
     second
 }
 
-/// Appended when a compose-only response came back without a call. It states the refusal rather
-/// than repeating the instruction: the model has already read the instruction once.
 const COMPOSE_REFUSAL: &str = r#"
 
 Your previous response was refused: it carried no tool call. Saying that you will look something
 up does nothing — nothing runs after your reply. Call the tool now.
 "#;
 
-/// What the turn says when the model would not compose the call twice. It reports the failure
-/// instead of promising the work, because a promise is what the model was trying to send and no
-/// promise made here is ever kept.
-const COMPOSE_FAILURE: &str = "I couldn't work out what to look up for that. Could you say it \
-                               again with the name in it?";
-
-/// Whether `choice` names a tool the live catalog actually carries. A pick for something absent is
-/// not a composing job — there is nothing to compose arguments for.
 fn names_a_live_tool(choice: &ChoiceAnswer, available_tools: &[CatalogEntry]) -> bool {
     available_tools
         .iter()
         .any(|tool| tool.name == choice.choice)
 }
 
-/// What the turn says when no connected source covers the question. Composed from the catalog's own
-/// `name`s at runtime — the code names nothing, and a deployment that connects different sources
-/// gets a different sentence without being rebuilt.
-///
-/// No generative call is spent on it. Asking a model to phrase the refusal costs a second and
-/// invites it to answer the question inside the refusal, which is the failure being refused.
 fn decline(config: &LlmNodeConfig, decide_usage: &Value) -> Value {
-    let mut names: Vec<&str> = Vec::new();
-    for tool in &config.available_tools {
-        // The slug is the fallback, not the choice: a catalog that publishes no title leaves the
-        // person something to name rather than nothing.
-        let name = Some(tool.title.as_str())
-            .filter(|title| !title.is_empty())
-            .unwrap_or(tool.name.as_str());
-        // Several tools can reach one source — searching it and reading from it are two entries in
-        // the catalog and one thing to a person. An operator names them alike, and naming the same
-        // thing twice in a list reads as a fault.
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
+    let names = sources_named_once_each(config);
     let reply = if names.is_empty() {
         NOTHING_CONNECTED.to_owned()
     } else {
-        format!("{DECLINE_OPENING}{}. {DECLINE_CLOSING}", listed(&names))
+        format!(
+            "{DECLINE_OPENING}{}. {DECLINE_CLOSING}",
+            listed_in_a_sentence(&names)
+        )
     };
     merge_usage(
         decide_usage,
@@ -1604,8 +1351,24 @@ fn decline(config: &LlmNodeConfig, decide_usage: &Value) -> Value {
     )
 }
 
-/// Joins names the way a sentence does, so the reply reads as one rather than as a dump.
-fn listed(names: &[&str]) -> String {
+fn sources_named_once_each(config: &LlmNodeConfig) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    for tool in &config.available_tools {
+        let name = as_the_operator_named_it(tool);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn as_the_operator_named_it(tool: &CatalogEntry) -> &str {
+    Some(tool.title.as_str())
+        .filter(|title| !title.is_empty())
+        .unwrap_or(tool.name.as_str())
+}
+
+fn listed_in_a_sentence(names: &[&str]) -> String {
     match names {
         [] => String::new(),
         [only] => (*only).to_owned(),
@@ -1613,8 +1376,6 @@ fn listed(names: &[&str]) -> String {
     }
 }
 
-/// Clears a `tool_call` from a reply that was meant to be an answer. The graph edges `llm -> tool`
-/// on that field, so leaving one would send the turn fetching after it had already answered.
 fn without_tool_call(mut output: Value) -> Value {
     if let Some(object) = output.as_object_mut() {
         object.insert("tool_call".to_owned(), Value::Null);
@@ -1622,9 +1383,6 @@ fn without_tool_call(mut output: Value) -> Value {
     output
 }
 
-/// Whether a composed call names something this node's catalog actually carries. A slug from
-/// elsewhere is not a source: it cannot be dispatched, and sending it anyway would bypass the
-/// per-node scoping `available_tools` exists to express.
 fn in_catalog(config: &LlmNodeConfig, call: &ToolCall) -> bool {
     let known = config
         .available_tools
@@ -1639,25 +1397,39 @@ fn in_catalog(config: &LlmNodeConfig, call: &ToolCall) -> bool {
     known
 }
 
-/// The `tool_call` a compose-only response carries, if it carries one.
 fn composed_call(output: &Value) -> Option<ToolCall> {
     let written: LlmOutput = serde_json::from_value(output.clone()).ok()?;
     serde_json::from_value(written.tool_call).ok()
 }
 
-#[must_use]
-pub fn answered_before_consulting_any_tool(
-    config: &LlmNodeConfig,
-    state: &Value,
-    output: &Value,
-) -> bool {
-    let written: LlmOutput = serde_json::from_value(output.clone()).unwrap_or_default();
-    config.tool_calling && written.tool_call.is_null() && no_tool_results_yet(state)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR: Duration = Duration::from_millis(1500);
+    const LLM_ROUTER_COMPLETION_REQUEST_TIMEOUT_MIRROR: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn the_engines_outer_decide_deadline_stays_strictly_above_llm_routers_inner_one() {
+        assert!(
+            DECIDE_CALL_TIMEOUT > LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR,
+            "this node's outer Decide deadline is asserted as the grpc-timeout llm-router's \
+             server starts before its own adapter's inner one, so equal or shorter and the outer \
+             always wins the race, dropping llm-router's decision future and its audit write: \
+             {DECIDE_CALL_TIMEOUT:?} vs {LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR:?}"
+        );
+    }
+
+    #[test]
+    fn the_engines_outer_completion_deadline_stays_strictly_above_llm_routers_inner_one() {
+        assert!(
+            CALL_TIMEOUT > LLM_ROUTER_COMPLETION_REQUEST_TIMEOUT_MIRROR,
+            "the same race as the Decide pair above, and the same cost: equal deadlines mean the \
+             outer always wins, so llm-router's audit row is dropped for exactly the slow \
+             completion worth investigating: {CALL_TIMEOUT:?} vs \
+             {LLM_ROUTER_COMPLETION_REQUEST_TIMEOUT_MIRROR:?}"
+        );
+    }
 
     fn config_of(value: Value) -> LlmNodeConfig {
         LlmNodeConfig::parse(&value).expect("usable config")
@@ -1736,19 +1508,17 @@ mod tests {
 
     #[test]
     fn build_prompt_truncates_one_oversized_tool_result() {
-        let state =
-            json!({"question": "q", "tool_result": ["x".repeat(MAX_TOOL_RESULT_CHARS * 2)]});
+        let state = json!({"question": "q", "tool_result": ["x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT * 2)]});
 
         let (_, user) = build_prompt(&config_of(json!({})), &state);
 
         assert!(user.contains(TRUNCATION_MARK), "{user}");
-        assert!(user.chars().count() < MAX_TOOL_RESULT_CHARS * 2, "{user}");
+        assert!(
+            user.chars().count() < MAX_CHARS_PER_RENDERED_TOOL_RESULT * 2,
+            "{user}"
+        );
     }
 
-    // A search that attached the readable text of its top two hits (Task C: a search returns the
-    // pages it found) produces one tool result whose combined text runs well past the old 4 000
-    // char cap — raised so those pages actually reach the model instead of being cut before the
-    // model ever sees them. Two pages of 5 000 chars each (10 000 total) must survive whole.
     #[test]
     fn build_prompt_carries_two_attached_pages_through_the_rendering_cap() {
         let first_page = "alpha ".repeat(900);
@@ -1887,8 +1657,6 @@ mod tests {
         assert!(system.contains("call a different tool"), "{system}");
     }
 
-    /// Observed live: the model wrote a sentence and then the envelope, and the person was shown
-    /// `Bishkek. {"tool_call": {...}, "reply": null}` as the answer. The call is what it meant.
     #[test]
     fn parse_llm_output_recovers_an_envelope_written_after_a_sentence() {
         let output = parse_llm_output(
@@ -1897,7 +1665,6 @@ mod tests {
         assert_eq!(output["tool_call"]["name"], json!("weather_now"));
     }
 
-    /// Two envelopes in a row parse as neither. The first is the one that was asked for.
     #[test]
     fn parse_llm_output_takes_the_first_of_two_envelopes() {
         let output = parse_llm_output(
@@ -1907,7 +1674,6 @@ mod tests {
         assert_eq!(output["tool_call"]["name"], json!("weather_now"));
     }
 
-    /// Prose that merely contains a brace is still prose, and is still the reply.
     #[test]
     fn parse_llm_output_leaves_prose_containing_a_brace_alone() {
         let content = "Write {name} where the placeholder is.";
@@ -1956,30 +1722,24 @@ mod tests {
         RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
     };
 
+    const CONFIDENTLY_FALSE: f64 = 0.02;
     const FAKE_TOKENS_IN: i32 = 17;
     const FAKE_TOKENS_OUT: i32 = 23;
     const FAKE_DECIDE_TOKENS_IN: i32 = 5;
     const FAKE_DECIDE_TOKENS_OUT: i32 = 2;
-    /// Stands in for a tool service this test never expects to be called — any decide/dispatch
-    /// path that did reach it would fail loudly, since nothing is listening here.
-    const UNREACHABLE: &str = "http://127.0.0.1:1";
+    const UNREACHABLE_TOOL_SERVICE: &str = "http://127.0.0.1:1";
 
     struct FakeLlmRouter {
         received: Mutex<Vec<CompleteRequest>>,
         reply: String,
         then_reply: Option<String>,
         decide_tool: Mutex<Option<(String, f64)>>,
-        /// The span pick, its confidence, and the two absolute gates, answered for whichever tool
-        /// is asked about: `(choice, confidence, stated, one_only)`.
         decide_span: Mutex<Option<(String, f64, f64, f64)>>,
         decide_needs_external_info: Mutex<Option<f64>>,
         decide_promise: Mutex<Option<f64>>,
-        /// One verdict per check, in order; the last stands for every check after it. A retry only
-        /// means anything if the second look can come back different.
         decide_grounded: Mutex<Vec<f64>>,
         decide_pointed_at: Mutex<Option<f64>>,
         grounded_checks: Mutex<usize>,
-        decide_calls: Mutex<usize>,
         decide_hangs: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     }
 
@@ -1996,7 +1756,6 @@ mod tests {
                 decide_grounded: Mutex::new(Vec::new()),
                 decide_pointed_at: Mutex::new(None),
                 grounded_checks: Mutex::new(0),
-                decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
             }
         }
@@ -2013,7 +1772,6 @@ mod tests {
                 decide_grounded: Mutex::new(Vec::new()),
                 decide_pointed_at: Mutex::new(None),
                 grounded_checks: Mutex::new(0),
-                decide_calls: Mutex::new(0),
                 decide_hangs: Mutex::new(None),
             }
         }
@@ -2022,20 +1780,12 @@ mod tests {
             self.received.lock().expect("lock").len()
         }
 
-        fn decide_calls(&self) -> usize {
-            *self.decide_calls.lock().expect("lock")
-        }
-
-        /// The system prompt of the nth `Complete`, so a test can check what a mode offered.
         fn system_prompt(&self, nth: usize) -> String {
             self.received.lock().expect("lock")[nth]
                 .system_prompt
                 .clone()
         }
 
-        /// Arms `Decide`'s `tool` answer. Leaving both this and
-        /// `answer_decide_needs_external_info` unset makes `decide` fail, matching an unarmed
-        /// `Complete` — the fail-safe every non-scripted existing test in this module exercises.
         fn answer_decide_span(&self, choice: &str, confidence: f64, stated: f64, one_only: f64) {
             *self.decide_span.lock().expect("lock") =
                 Some((choice.to_owned(), confidence, stated, one_only));
@@ -2049,23 +1799,18 @@ mod tests {
             *self.decide_needs_external_info.lock().expect("lock") = Some(noul);
         }
 
-        /// Arms the guard's verdict over a finished reply.
         fn answer_decide_promise(&self, noul: f64) {
             *self.decide_promise.lock().expect("lock") = Some(noul);
         }
 
-        /// Arms whether the message points at the composed value.
         fn answer_decide_pointed_at(&self, noul: f64) {
             *self.decide_pointed_at.lock().expect("lock") = Some(noul);
         }
 
-        /// Arms whether the reply's values were found in what came back, one verdict per check.
-        fn answer_decide_grounded(&self, nouls: &[f64]) {
-            *self.decide_grounded.lock().expect("lock") = nouls.to_vec();
+        fn answer_decide_grounded(&self, one_verdict_per_check: &[f64]) {
+            *self.decide_grounded.lock().expect("lock") = one_verdict_per_check.to_vec();
         }
 
-        /// Accepts a `Decide` call and then never answers it, so a test can observe it abandoned
-        /// at `DECIDE_CALL_TIMEOUT` rather than any particular answer.
         fn hang_decide(&self, barrier: Arc<tokio::sync::Barrier>) {
             *self.decide_hangs.lock().expect("lock") = Some(barrier);
         }
@@ -2111,7 +1856,6 @@ mod tests {
             _ctx: RequestContext,
             request: ServiceRequest<'_, DecideRequest>,
         ) -> ServiceResult<DecideResponse> {
-            *self.decide_calls.lock().expect("lock") += 1;
             let barrier = self.decide_hangs.lock().expect("lock").clone();
             if let Some(barrier) = barrier {
                 barrier.wait().await;
@@ -2227,8 +1971,6 @@ mod tests {
         }
     }
 
-    // `FakeLlmRouter` implements both traits on one type, so `add_service` needs the register
-    // marker for each — see `services/chat/src/fakes.rs::router_service` for the same idiom.
     fn router_service(fake: Arc<FakeLlmRouter>) -> ConnectRouter {
         ConnectRouter::new()
             .add_service::<_, LlmRouterServiceRegisterMarker>(Arc::clone(&fake))
@@ -2262,8 +2004,6 @@ mod tests {
             self.received.lock().expect("lock").len()
         }
 
-        /// The arguments the first dispatch carried, so a test can tell a composed call from one
-        /// that was handed the question verbatim.
         fn first_args(&self) -> Value {
             let received = self.received.lock().expect("lock");
             let first = received.first().expect("a dispatch");
@@ -2329,9 +2069,7 @@ mod tests {
         format!("http://{address}")
     }
 
-    /// A tool whose one required argument is the asking words themselves — the only shape that may
-    /// be handed a message verbatim, and the only shape the fast path accepts.
-    fn single_field_tool(name: &str, field: &str) -> CatalogEntry {
+    fn free_text_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
             title: name.to_owned(),
@@ -2345,9 +2083,7 @@ mod tests {
         }
     }
 
-    /// The same shape but for an argument that wants a value rather than a query. It qualifies on
-    /// every count the fast path used to check, and must still not be dispatched verbatim.
-    fn single_value_field_tool(name: &str, field: &str) -> CatalogEntry {
+    fn value_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
             title: name.to_owned(),
@@ -2375,16 +2111,13 @@ mod tests {
         }
     }
 
-    /// The generative loop as it now exists: reached only once a source has run, where the state
-    /// already carries a result. Before that, the turn either dispatches or declines, so there is
-    /// no longer any way to arrive here on a bare question.
     #[tokio::test]
-    async fn execute_sends_the_built_prompt_and_parses_a_tool_call_reply() {
+    async fn execute_sends_the_built_prompt_and_parses_a_tool_call_reply_once_a_source_has_run() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": {"name": "web_search", "args": {"query": "sf weather"}}}"#,
         ));
         let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
         let output = executor
             .execute(
@@ -2414,41 +2147,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_nudge_condition_is_a_tool_less_first_answer_whatever_the_wording() {
-        let tool_calling = LlmNodeConfig::parse(&json!({"tool_calling": true})).expect("config");
-        let plain = LlmNodeConfig::parse(&json!({})).expect("config");
-        let answered = json!({"tool_call": Value::Null, "reply": "anything at all"});
-        let called_a_tool = json!({"tool_call": {"name": "some_tool"}, "reply": Value::Null});
-        let no_tool_yet = json!({"question": "q"});
-        let after_a_tool = json!({"question": "q", "tool_result": [{"ok": true}]});
-
-        assert!(answered_before_consulting_any_tool(
-            &tool_calling,
-            &no_tool_yet,
-            &answered
-        ));
-        assert!(
-            !answered_before_consulting_any_tool(&tool_calling, &after_a_tool, &answered),
-            "a reply that follows a real tool result is the answer the loop was for"
-        );
-        assert!(
-            !answered_before_consulting_any_tool(&tool_calling, &no_tool_yet, &called_a_tool),
-            "the model did use a tool"
-        );
-        assert!(
-            !answered_before_consulting_any_tool(&plain, &no_tool_yet, &answered),
-            "a node with no tools offered has nothing to be nudged towards"
-        );
-    }
-
     #[tokio::test]
     async fn an_answer_that_follows_a_tool_result_is_never_nudged() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": null, "reply": "62F and foggy."}"#,
         ));
         let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
         let output = executor
             .execute(
@@ -2470,7 +2175,7 @@ mod tests {
             r#"{"tool_call": null, "reply": "Four."}"#,
         ));
         let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
         executor
             .execute("llm", &json!({}), &json!({"question": "2+2?"}), "e:llm:0")
@@ -2484,7 +2189,7 @@ mod tests {
     async fn execute_reports_the_routers_token_usage_for_the_budget_to_charge() {
         let fake = Arc::new(FakeLlmRouter::always("Four."));
         let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
         let output = executor
             .execute("llm", &json!({}), &json!({"question": "2+2?"}), "e:llm:0")
@@ -2501,7 +2206,7 @@ mod tests {
     async fn execute_without_tool_calling_asks_for_no_response_format() {
         let fake = Arc::new(FakeLlmRouter::always("Four."));
         let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
         let output = executor
             .execute("llm", &json!({}), &json!({"question": "2+2?"}), "e:llm:0")
@@ -2518,7 +2223,7 @@ mod tests {
     }
 
     #[test]
-    fn single_required_string_field_accepts_exactly_one_required_string() {
+    fn single_required_free_text_field_accepts_exactly_one_required_string() {
         let schema = json!({
             "type": "object",
             "required": ["query"],
@@ -2526,17 +2231,13 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            single_required_string_field(&schema),
+            single_required_free_text_field(&schema),
             Some("query".to_owned())
         );
     }
 
-    // The shape every tool that actually qualifies in production has: one required string field
-    // plus an optional sibling — e.g. web_search / kb_search's real `{"required": ["query"],
-    // "properties": {"query": {...}, "limit": {...}}}`. A bare one-field schema with no sibling,
-    // as the other tests here use, is not what a live catalog entry looks like.
     #[test]
-    fn single_required_string_field_accepts_a_required_string_alongside_an_optional_sibling() {
+    fn one_required_string_of_a_live_catalog_entry_beside_an_optional_sibling_is_accepted() {
         let schema = json!({
             "type": "object",
             "required": ["query"],
@@ -2547,20 +2248,20 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            single_required_string_field(&schema),
+            single_required_free_text_field(&schema),
             Some("query".to_owned())
         );
     }
 
     #[test]
-    fn single_required_string_field_rejects_two_required_fields() {
+    fn single_required_free_text_field_rejects_two_required_fields() {
         let schema = json!({
             "type": "object",
             "required": ["a", "b"],
             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
         })
         .to_string();
-        assert_eq!(single_required_string_field(&schema), None);
+        assert_eq!(single_required_free_text_field(&schema), None);
     }
 
     fn span_field_tool(name: &str, field: &str) -> CatalogEntry {
@@ -2582,6 +2283,43 @@ mod tests {
     }
 
     #[test]
+    fn a_span_equal_to_the_no_value_sentinel_is_never_offered() {
+        let offered = spans("none of those, what about Bishkek?");
+
+        assert!(
+            !offered.iter().any(|span| span == NO_VALUE_OPTION),
+            "the sentinel and the message's own words share one option namespace, and a \
+             duplicate name is refused by the decider — taking the whole turn down: {offered:?}"
+        );
+        assert!(offered.iter().any(|span| span == "Bishkek"));
+    }
+
+    #[test]
+    fn a_span_longer_than_an_option_name_may_be_is_dropped() {
+        let one_long_word = "x".repeat(MAX_OPTION_NAME_BYTES + 1);
+
+        let offered = spans(&format!("{one_long_word} and Bishkek"));
+
+        assert!(
+            offered
+                .iter()
+                .all(|span| span.len() <= MAX_OPTION_NAME_BYTES),
+            "an over-long option is refused by the decider, and a script that whitespace does \
+             not segment yields one span per clause: {offered:?}"
+        );
+    }
+
+    #[test]
+    fn spans_stop_at_the_number_of_options_the_decider_accepts() {
+        let many_words = (0..500)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(spans(&many_words).len() <= MAX_SPAN_OPTIONS);
+    }
+
+    #[test]
     fn spans_offers_each_word_and_the_runs_of_words_beside_it() {
         assert_eq!(
             spans("weather in Bishkek?"),
@@ -2596,8 +2334,6 @@ mod tests {
         );
     }
 
-    /// A value of more than one word must be among the options, not only its parts, or the pick can
-    /// only ever be half of it.
     #[test]
     fn a_multi_word_value_is_itself_an_option() {
         assert!(spans("weather in New York").contains(&"New York".to_owned()));
@@ -2641,8 +2377,6 @@ mod tests {
         );
     }
 
-    /// The escape every closed set gets: the options are spans of one message, and the message may
-    /// not contain the value at all.
     #[test]
     fn the_pick_offers_a_way_to_say_none_of_these() {
         let questions = decidable_questions(
@@ -2653,9 +2387,6 @@ mod tests {
         assert!(rendered.contains(NO_VALUE_OPTION), "{rendered}");
     }
 
-    /// A schema that lists what the endpoint accepts is the stronger claim of the two: whatever the
-    /// decision returns is a value the endpoint takes, because it could only choose from that list.
-    /// No annotation is needed — JSON Schema already has the vocabulary.
     fn listed_field_tool(name: &str, field: &str) -> CatalogEntry {
         CatalogEntry {
             name: name.to_owned(),
@@ -2699,7 +2430,6 @@ mod tests {
         );
     }
 
-    /// A bare `enum` works too and simply offers no line per value.
     #[test]
     fn a_bare_enum_is_a_closed_list_as_well() {
         let schema = json!({
@@ -2711,8 +2441,6 @@ mod tests {
         assert!(decidable_argument(&schema).is_some());
     }
 
-    /// The listed values win over the message's words when a schema says both: the schema knows
-    /// what the endpoint accepts, and the message only knows what was typed.
     #[test]
     fn a_listed_argument_is_preferred_to_the_messages_words() {
         let schema = json!({
@@ -2731,7 +2459,6 @@ mod tests {
         assert!(matches!(options, Options::Closed(_)));
     }
 
-    /// A field that says neither is left alone, and its argument is composed as before.
     #[test]
     fn a_field_with_neither_a_list_nor_the_annotation_is_not_decided() {
         let schema = json!({
@@ -2785,10 +2512,6 @@ mod tests {
         );
     }
 
-    /// Each gate catches a different way of being confidently wrong, measured against the live
-    /// decider: a value that is only implied ("the capital of Kyrgyzstan"), one that is not there at
-    /// all ("here"), and two of them at once ("Paris and Berlin"). The choice is confident in all
-    /// three; only the absolute questions tell them apart.
     #[test]
     fn each_gate_refuses_a_confident_pick_on_its_own() {
         for (label, answers) in [
@@ -2813,48 +2536,44 @@ mod tests {
         }
     }
 
-    // The shape the whole annotation exists for: one required string field that wants a *value* —
-    // a place, a pair, a code — not the asking words. Handing it the message verbatim produces a
-    // request that was never going to work, so it must not qualify however confidently the tool
-    // was chosen. Absent is the default, which is why this schema says nothing at all.
     #[test]
-    fn single_required_string_field_rejects_a_string_that_does_not_take_free_text() {
+    fn single_required_free_text_field_rejects_a_string_that_does_not_take_free_text() {
         let schema = json!({
             "type": "object",
             "required": ["place"],
             "properties": {"place": {"type": "string"}},
         })
         .to_string();
-        assert_eq!(single_required_string_field(&schema), None);
+        assert_eq!(single_required_free_text_field(&schema), None);
     }
 
     #[test]
-    fn single_required_string_field_rejects_free_text_declared_as_anything_but_true() {
+    fn single_required_free_text_field_rejects_free_text_declared_as_anything_but_true() {
         let schema = json!({
             "type": "object",
             "required": ["place"],
             "properties": {"place": {"type": "string", "x-accepts-free-text": "yes"}},
         })
         .to_string();
-        assert_eq!(single_required_string_field(&schema), None);
+        assert_eq!(single_required_free_text_field(&schema), None);
     }
 
     #[test]
-    fn single_required_string_field_rejects_a_non_string_required_field() {
+    fn single_required_free_text_field_rejects_a_non_string_required_field() {
         let schema = json!({
             "type": "object",
             "required": ["count"],
             "properties": {"count": {"type": "number"}},
         })
         .to_string();
-        assert_eq!(single_required_string_field(&schema), None);
+        assert_eq!(single_required_free_text_field(&schema), None);
     }
 
     #[test]
-    fn single_required_string_field_rejects_a_schema_it_cannot_read() {
-        assert_eq!(single_required_string_field("not json"), None);
-        assert_eq!(single_required_string_field("{}"), None);
-        assert_eq!(single_required_string_field(r#"{"required": []}"#), None);
+    fn single_required_free_text_field_rejects_a_schema_it_cannot_read() {
+        assert_eq!(single_required_free_text_field("not json"), None);
+        assert_eq!(single_required_free_text_field("{}"), None);
+        assert_eq!(single_required_free_text_field(r#"{"required": []}"#), None);
     }
 
     async fn dispatched_fast_tool_call() -> (Value, Arc<FakeLlmRouter>, Arc<FakeToolService>) {
@@ -2868,7 +2587,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
+            available_tools: vec![free_text_field_tool("some_tool", "query")],
             ..Default::default()
         }
         .to_json();
@@ -2885,9 +2604,6 @@ mod tests {
         (output, fake, tool)
     }
 
-    /// End to end: the argument is a word of the message, the decision picks it, and the tool is
-    /// reached with that word — no generative call composes anything, and the whole question is
-    /// nowhere near the tool.
     #[tokio::test]
     async fn a_span_valued_argument_is_dispatched_with_the_picked_word_not_the_question() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -2932,8 +2648,6 @@ mod tests {
         assert_eq!(output["reply"], json!("clear, 15C"));
     }
 
-    /// The same tool, the same confident choice, but the gates refuse the pick. Nothing is
-    /// dispatched and the turn composes the argument the way it does today.
     #[tokio::test]
     async fn a_span_the_gates_refuse_leaves_the_argument_to_be_composed() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -2966,10 +2680,6 @@ mod tests {
         assert!(output.get("fast_tool_call").is_none(), "{output}");
     }
 
-    /// The counterpart, end to end: a tool whose one required string argument wants a value rather
-    /// than the asking words is *not* dispatched verbatim, however confidently it was chosen. It
-    /// satisfies every other condition the fast path checks, so only the annotation stands between
-    /// the turn and a request that was never going to work.
     #[tokio::test]
     async fn a_tool_whose_argument_is_a_value_is_not_dispatched_with_the_question_verbatim() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -2982,7 +2692,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_value_field_tool("some_tool", "place")],
+            available_tools: vec![value_field_tool("some_tool", "place")],
             ..Default::default()
         }
         .to_json();
@@ -3039,8 +2749,6 @@ mod tests {
         );
     }
 
-    // The evidence Critical finding 1 asked for: the fast-dispatched call must be durable, not
-    // just used to answer and then dropped.
     #[tokio::test]
     async fn a_fast_dispatched_tool_call_is_recorded_on_the_nodes_own_output() {
         let (output, ..) = dispatched_fast_tool_call().await;
@@ -3058,15 +2766,51 @@ mod tests {
         );
         assert_eq!(
             output["usage"]["tokens_in"],
-            json!(i64::from(FAKE_TOKENS_IN + FAKE_DECIDE_TOKENS_IN)),
-            "the Decide call this path spends must be charged too, the same as the nudge's \
-             second Complete call already is via merge_usage"
+            json!(i64::from(FAKE_TOKENS_IN + FAKE_DECIDE_TOKENS_IN * 2)),
+            "every Decide this path spends is charged: the one that chose the source, and the \
+             one that checked the reply it produced"
         );
     }
 
-    /// The question the whole design turns on: a source covers it, or nothing does. When nothing
-    /// does, the turn says so and names what it can answer — and spends no generative call doing
-    /// it, because asking a model to phrase a refusal invites it to answer inside the refusal.
+    #[tokio::test]
+    async fn material_older_than_it_may_be_is_declined_rather_than_answered_from() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "29.6"}"#,
+        ));
+        fake.answer_decide_tool(PRIOR_OPTION, 0.95);
+        let llm_url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&llm_url, UNREACHABLE_TOOL_SERVICE).expect("client");
+        let config = LlmNodeConfig {
+            tool_calling: true,
+            available_tools: vec![free_text_field_tool("a_source", "query")],
+            ..Default::default()
+        }
+        .to_json();
+        let long_ago = (Utc::now() - CARRIED_MATERIAL_GOES_STALE_AFTER * 2).to_rfc3339();
+        let state = json!({
+            "question": "and the humidity?",
+            PRIOR_MATERIAL_STATE_KEY: [{
+                "name": "a_source",
+                "args": {"query": "q"},
+                "result": {"temp": 29.6},
+                FETCHED_AT_FIELD: long_ago,
+            }],
+        });
+
+        let output = executor
+            .execute("llm", &config, &state, "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_ne!(
+            output["reply"],
+            json!("29.6"),
+            "a price or a temperature an hour old is still present in the material, so the \
+             grounding guard approves it — freshness is the one thing no later check can see"
+        );
+        assert_eq!(fake.calls(), 0, "and nothing is spent answering from it");
+    }
+
     #[tokio::test]
     async fn a_question_no_connected_source_covers_is_declined_without_a_generative_call() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3077,7 +2821,7 @@ mod tests {
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
-        let mut entry = single_field_tool("some_slug", "query");
+        let mut entry = free_text_field_tool("some_slug", "query");
         entry.title = "What the operator calls it".to_owned();
         let config = LlmNodeConfig {
             tool_calling: true,
@@ -3109,8 +2853,6 @@ mod tests {
         );
     }
 
-    /// Several catalog entries can reach one source: searching it and reading from it are two rows
-    /// and one thing to the person reading the decline.
     #[tokio::test]
     async fn the_decline_names_one_source_once_however_many_tools_reach_it() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3118,10 +2860,10 @@ mod tests {
         ));
         fake.answer_decide_tool(NO_TOOL_OPTION, 0.97);
         let llm_url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&llm_url, UNREACHABLE).expect("client");
-        let mut searching = single_field_tool("search_it", "query");
+        let executor = LlmTaskExecutor::new(&llm_url, UNREACHABLE_TOOL_SERVICE).expect("client");
+        let mut searching = free_text_field_tool("search_it", "query");
         searching.title = "The stored material".to_owned();
-        let mut reading = single_field_tool("read_it", "query");
+        let mut reading = free_text_field_tool("read_it", "query");
         reading.title = "The stored material".to_owned();
         let config = LlmNodeConfig {
             tool_calling: true,
@@ -3143,22 +2885,18 @@ mod tests {
         );
     }
 
-    /// The guarantee cannot hold only while the decider is up. A decision that never arrives used
-    /// to fall through to a loop where the model answered from memory; that was the failure, and an
-    /// outage is exactly when it would go unnoticed.
     #[tokio::test]
     async fn a_decision_that_never_arrives_declines_rather_than_answering_from_memory() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": null, "reply": "Bishkek."}"#,
         ));
-        // Nothing arms the decider, so `decide` fails the way an outage fails.
         let llm_url = serve(Arc::clone(&fake)).await;
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            available_tools: vec![free_text_field_tool("Current weather for a place", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3182,8 +2920,6 @@ mod tests {
         );
     }
 
-    /// A pick the live catalog does not carry is not a source. It cannot be dispatched and it
-    /// cannot license an answer, so it declines like any other unanswerable question.
     #[tokio::test]
     async fn a_pick_naming_a_tool_the_catalog_does_not_carry_declines() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3196,7 +2932,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            available_tools: vec![free_text_field_tool("Current weather for a place", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3214,8 +2950,6 @@ mod tests {
         assert_ne!(output["reply"], json!("Bishkek."));
     }
 
-    /// A lean is not a pick. Below the threshold no source has been named, and naming none is what
-    /// declining means.
     #[tokio::test]
     async fn a_pick_too_weak_to_act_on_declines() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3228,7 +2962,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            available_tools: vec![free_text_field_tool("Current weather for a place", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3242,14 +2976,13 @@ mod tests {
         assert_ne!(output["reply"], json!("Bishkek."));
     }
 
-    /// With nothing connected there is nothing to offer, and listing nothing would read as a bug.
     #[tokio::test]
     async fn an_empty_catalog_says_so_rather_than_listing_nothing() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": null, "reply": "x"}"#,
         ));
         let llm_url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&llm_url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&llm_url, UNREACHABLE_TOOL_SERVICE).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
             ..Default::default()
@@ -3264,9 +2997,6 @@ mod tests {
         assert_eq!(output["reply"], json!(NOTHING_CONNECTED));
     }
 
-    /// The failure that reached a person: "weather there?" composed `place: "there"`, which is a
-    /// real village, and its weather was returned as the answer. No guard over the reply can see
-    /// this — the reply is faithful to material that is faithful to a question nobody asked.
     #[tokio::test]
     async fn a_value_the_message_points_at_nothing_for_is_asked_about_rather_than_dispatched() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3278,7 +3008,7 @@ mod tests {
         let tool = Arc::new(FakeToolService::ok(r#"{"temp": 25.9}"#));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
-        let mut entry = single_field_tool("weather", "place");
+        let mut entry = free_text_field_tool("weather", "place");
         entry.input_schema_json = json!({
             "type": "object",
             "required": ["place"],
@@ -3319,8 +3049,6 @@ mod tests {
         );
     }
 
-    /// A value the message describes without spelling out is pointed at, and must still dispatch —
-    /// "the capital of Japan" names one place and only one.
     #[tokio::test]
     async fn a_value_the_message_describes_unambiguously_is_dispatched() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3335,7 +3063,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("weather", "place")],
+            available_tools: vec![free_text_field_tool("weather", "place")],
             ..Default::default()
         }
         .to_json();
@@ -3357,9 +3085,6 @@ mod tests {
         );
     }
 
-    /// Measured live: asked for the weather in a capital named indirectly, the source returned a
-    /// temperature and the model replied with the city's name — answering a question nobody asked,
-    /// with a word the material does not contain. Told so, it answers from what is in front of it.
     #[tokio::test]
     async fn a_reply_stating_what_the_material_does_not_hold_is_asked_again() {
         let fake = Arc::new(FakeLlmRouter::then(
@@ -3374,7 +3099,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("weather", "query")],
+            available_tools: vec![free_text_field_tool("weather", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3393,8 +3118,6 @@ mod tests {
         );
     }
 
-    /// Twice ungrounded, the turn says so. A value the material does not hold is worse than no
-    /// value, because it reads exactly like one that was looked up.
     #[tokio::test]
     async fn a_reply_that_stays_ungrounded_is_refused_rather_than_sent() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3408,7 +3131,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("weather", "query")],
+            available_tools: vec![free_text_field_tool("weather", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3421,8 +3144,6 @@ mod tests {
         assert_eq!(output["reply"], json!(UNGROUNDED_REFUSED));
     }
 
-    /// The guards may only catch a fault, never invent one. A grounded, finished answer passes
-    /// untouched however short it is — a bare value is what this system answers with.
     #[tokio::test]
     async fn a_grounded_answer_passes_untouched() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3437,7 +3158,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("weather", "query")],
+            available_tools: vec![free_text_field_tool("weather", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3451,8 +3172,6 @@ mod tests {
         assert_eq!(fake.calls(), 1, "and costs no second generative call");
     }
 
-    /// The promise guard now sits where a promise is still possible: after a source has run, over
-    /// the reply that was written from its result.
     #[tokio::test]
     async fn a_promise_written_after_a_source_ran_is_replaced_with_the_plain_truth() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3466,7 +3185,7 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("Current weather for a place", "query")],
+            available_tools: vec![free_text_field_tool("Current weather for a place", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3484,15 +3203,13 @@ mod tests {
         );
     }
 
-    /// A tool whose schema needs two fields cannot be handed the question verbatim, but the
-    /// decision that a tool is needed still stands. The model composes the arguments; what it must
-    /// not be given back is the choice of whether to call at all.
     #[tokio::test]
     async fn a_tool_needing_two_fields_is_composed_rather_than_dispatched_verbatim() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": {"name": "two_field_tool", "args": {"a": "x", "b": "y"}}}"#,
         ));
         fake.answer_decide_tool("two_field_tool", 0.95);
+        fake.answer_decide_pointed_at(0.95);
         let llm_url = serve(Arc::clone(&fake)).await;
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
@@ -3530,8 +3247,6 @@ mod tests {
         );
     }
 
-    /// The whole point of the compose-only mode: a light model handed both options answers "I will
-    /// look that up", which runs nothing and ends the turn. Refused and asked again, it calls.
     #[tokio::test]
     async fn a_compose_only_reply_without_a_call_is_refused_and_asked_again() {
         let fake = Arc::new(FakeLlmRouter::then(
@@ -3539,6 +3254,7 @@ mod tests {
             r#"{"tool_call": {"name": "two_field_tool", "args": {"a": "x", "b": "y"}}}"#,
         ));
         fake.answer_decide_tool("two_field_tool", 0.95);
+        fake.answer_decide_pointed_at(0.95);
         let llm_url = serve(Arc::clone(&fake)).await;
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
@@ -3566,8 +3282,6 @@ mod tests {
         );
     }
 
-    /// Twice refused, the turn says so. It must not send the promise instead: nothing runs after a
-    /// reply, so a promise made here is never kept.
     #[tokio::test]
     async fn a_compose_only_reply_refused_twice_answers_plainly_instead_of_promising() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3600,16 +3314,14 @@ mod tests {
         assert_eq!(fake.calls(), 2, "asked twice, not a third time");
     }
 
-    // The vendor evaluates `tool` and `needs_external_information` independently, so a confident
-    // tool pick that the schema gate disqualifies and a confidently-false need-for-information can
-    // co-occur. A confident tool pick must veto NoToolNeeded too, not just block ToolCall.
     #[tokio::test]
     async fn a_confident_schema_disqualified_tool_pick_vetoes_no_tool_needed_too() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": {"name": "two_field_tool", "args": {"a": "x", "b": "y"}}}"#,
         ));
         fake.answer_decide_tool("two_field_tool", 0.95);
-        fake.answer_decide_needs_external_info(0.02); // confidently false — must not be enough
+        fake.answer_decide_needs_external_info(CONFIDENTLY_FALSE);
+        fake.answer_decide_pointed_at(0.95);
         let llm_url = serve(Arc::clone(&fake)).await;
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
@@ -3633,23 +3345,21 @@ mod tests {
         assert_eq!(tool.calls(), 1, "and the tool the decision named is called");
     }
 
-    // A follow-up's question is not always a question — see MAX_FAST_DISPATCH_QUESTION_CHARS's
-    // doc. A confident, schema-eligible tool pick must still not be fast-dispatched when the
-    // question itself is multi-line, and must still veto NoToolNeeded (today's flow decides).
     #[tokio::test]
     async fn a_multi_line_question_is_not_fast_dispatched_even_when_the_tool_otherwise_qualifies() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": {"name": "some_tool", "args": {"query": "population of Paris"}}}"#,
         ));
         fake.answer_decide_tool("some_tool", 0.9);
-        fake.answer_decide_needs_external_info(0.02);
+        fake.answer_decide_needs_external_info(CONFIDENTLY_FALSE);
+        fake.answer_decide_pointed_at(0.95);
         let llm_url = serve(Arc::clone(&fake)).await;
         let tool = Arc::new(FakeToolService::ok("{}"));
         let tool_url = serve_tool(Arc::clone(&tool)).await;
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
+            available_tools: vec![free_text_field_tool("some_tool", "query")],
             ..Default::default()
         }
         .to_json();
@@ -3690,11 +3400,11 @@ mod tests {
         let executor = LlmTaskExecutor::new(&llm_url, &tool_url).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
-            available_tools: vec![single_field_tool("some_tool", "query")],
+            available_tools: vec![free_text_field_tool("some_tool", "query")],
             ..Default::default()
         }
         .to_json();
-        let question = "x".repeat(MAX_FAST_DISPATCH_QUESTION_CHARS + 1);
+        let question = "x".repeat(MAX_CHARS_SENT_TO_A_TOOL_VERBATIM + 1);
 
         executor
             .execute("llm", &config, &json!({"question": question}), "e:llm:0")
@@ -3708,16 +3418,6 @@ mod tests {
         );
     }
 
-    // Real network on loopback (the fake server, the TCP and HTTP/2 handshake), virtual time for
-    // the deadline itself — the same idiom as `services/chat/src/intent.rs`'s matching test.
-    // Isolated to `decide_fast_path` itself, not the whole `execute` flow: chaining the two further
-    // real `Complete` round trips `execute` would need after the fallback onto the same paused
-    // clock is exactly the kind of timer/I-O race `tokio::time::pause`'s docs warn about, and the
-    // property under test — the deadline bounds `Decide`, not `Complete` — does not need them.
-    // `a_failed_decide_falls_through_to_todays_flow_with_the_nudge_enabled` above already proves
-    // the fallback's nudge end to end for an outright `Decide` error; `Decide` treats a timeout
-    // identically to any other error (see `decide_fast_path`'s single `Err` arm), so between the
-    // two, both halves of "any `Decide` error or timeout falls through" are covered.
     #[tokio::test(start_paused = true)]
     async fn a_hung_decide_call_is_abandoned_within_its_own_deadline() {
         let fake = Arc::new(FakeLlmRouter::always(
@@ -3725,7 +3425,7 @@ mod tests {
         ));
         fake.hang_decide(Arc::new(tokio::sync::Barrier::new(2)));
         let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
         let config = LlmNodeConfig {
             tool_calling: true,
             ..Default::default()
@@ -3753,16 +3453,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_fast_path_is_only_tried_on_the_first_generative_call_of_a_turn() {
+    async fn a_later_iteration_is_not_re_scoped_but_its_answer_is_still_checked() {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": null, "reply": "done"}"#,
         ));
-        // Armed as if the fast path would fire, to prove it is never even asked here.
-        fake.answer_decide_needs_external_info(0.02);
+        fake.answer_decide_tool("a_source", 0.99);
+        fake.answer_decide_grounded(&[0.95]);
         let url = serve(Arc::clone(&fake)).await;
-        let executor = LlmTaskExecutor::new(&url, UNREACHABLE).expect("client");
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
-        executor
+        let output = executor
             .execute(
                 "llm",
                 &json!({"tool_calling": true}),
@@ -3773,9 +3473,14 @@ mod tests {
             .expect("execute");
 
         assert_eq!(
-            fake.decide_calls(),
-            0,
-            "a later iteration already has tool results and must not re-ask Decide"
+            output["reply"],
+            json!("done"),
+            "the scope decision does not run again — a turn that has already fetched is past it"
+        );
+        assert_eq!(
+            fake.received.lock().expect("lock").len(),
+            1,
+            "and it answers in one generative call, not by re-entering the fast path"
         );
     }
 }
