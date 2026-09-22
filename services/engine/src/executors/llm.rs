@@ -1396,31 +1396,6 @@ fn composed_call(output: &Value) -> Option<ToolCall> {
 mod tests {
     use super::*;
 
-    const LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR: Duration = Duration::from_millis(1500);
-    const LLM_ROUTER_COMPLETION_REQUEST_TIMEOUT_MIRROR: Duration = Duration::from_secs(60);
-
-    #[test]
-    fn the_engines_outer_decide_deadline_stays_strictly_above_llm_routers_inner_one() {
-        assert!(
-            DECIDE_CALL_TIMEOUT > LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR,
-            "this node's outer Decide deadline is asserted as the grpc-timeout llm-router's \
-             server starts before its own adapter's inner one, so equal or shorter and the outer \
-             always wins the race, dropping llm-router's decision future and its audit write: \
-             {DECIDE_CALL_TIMEOUT:?} vs {LLM_ROUTER_DECIDE_REQUEST_TIMEOUT_MIRROR:?}"
-        );
-    }
-
-    #[test]
-    fn the_engines_outer_completion_deadline_stays_strictly_above_llm_routers_inner_one() {
-        assert!(
-            CALL_TIMEOUT > LLM_ROUTER_COMPLETION_REQUEST_TIMEOUT_MIRROR,
-            "the same race as the Decide pair above, and the same cost: equal deadlines mean the \
-             outer always wins, so llm-router's audit row is dropped for exactly the slow \
-             completion worth investigating: {CALL_TIMEOUT:?} vs \
-             {LLM_ROUTER_COMPLETION_REQUEST_TIMEOUT_MIRROR:?}"
-        );
-    }
-
     fn config_of(value: Value) -> LlmNodeConfig {
         LlmNodeConfig::parse(&value).expect("usable config")
     }

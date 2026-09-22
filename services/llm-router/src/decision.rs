@@ -9,6 +9,11 @@ use crate::provider::CallError;
 pub struct Decision {
     pub state: Value,
     pub questions: Vec<Question>,
+    /// When the caller said it would stop waiting, read off the protocol's timeout header. The
+    /// vendor call is bounded by what is left of it rather than by a constant this crate keeps in
+    /// step with the caller's by hand — the outer deadline always wins a tie, and the loser is the
+    /// audit row for the slow attempt worth investigating.
+    pub caller_stops_waiting_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Debug)]

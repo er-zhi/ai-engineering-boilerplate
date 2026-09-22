@@ -823,20 +823,6 @@ mod tests {
 
     const ACTIONABLE_LOW_ENOUGH_TO_CLARIFY: f64 = CLARIFY_WHEN_ACTIONABLE_BELOW - 0.1;
 
-    const LLM_ROUTERS_INNER_REQUEST_TIMEOUT_MIRRORED_BY_HAND: Duration =
-        Duration::from_millis(1500);
-
-    #[test]
-    fn the_outer_chat_deadline_stays_strictly_above_llm_routers_inner_one() {
-        assert!(
-            DECIDE_CALL_TIMEOUT > LLM_ROUTERS_INNER_REQUEST_TIMEOUT_MIRRORED_BY_HAND,
-            "Chat's outer Decide deadline must stay strictly above llm-router's own inner \
-             vendor-call timeout, or the outer one always wins the race and llm-router's audit \
-             row for that attempt is silently never written: {DECIDE_CALL_TIMEOUT:?} vs \
-             {LLM_ROUTERS_INNER_REQUEST_TIMEOUT_MIRRORED_BY_HAND:?}"
-        );
-    }
-
     fn topics() -> Vec<TopicSummary> {
         vec![TopicSummary {
             id: 7,

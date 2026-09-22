@@ -9,6 +9,7 @@ pub mod error;
 pub mod execution_event;
 pub mod executors;
 pub mod lease;
+pub mod owned;
 pub mod partition;
 pub mod schedule_service;
 pub mod scheduler;

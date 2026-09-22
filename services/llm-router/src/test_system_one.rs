@@ -63,6 +63,7 @@ pub fn offer(name: &str, description: Option<&str>) -> ChoiceOption {
 
 pub fn decision(questions: Vec<Question>) -> Decision {
     Decision {
+        caller_stops_waiting_at: None,
         state: json!("Help! My payouts have been failing for 3 days."),
         questions,
     }

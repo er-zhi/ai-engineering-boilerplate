@@ -87,10 +87,13 @@ impl LlmRouterService for LlmRouter {
 impl SystemOneService for SystemOneApi {
     async fn decide(
         &self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         request: ServiceRequest<'_, DecideRequest>,
     ) -> ServiceResult<DecideResponse> {
-        let response = self.inner.decide(request.to_owned_message()).await?;
+        let response = self
+            .inner
+            .decide(request.to_owned_message(), ctx.deadline())
+            .await?;
         Response::ok(response)
     }
 

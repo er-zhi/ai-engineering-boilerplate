@@ -107,7 +107,11 @@ pub fn validated_decision(request: DecideRequest) -> Result<Decision, ConnectErr
     }
     within_request_budget(state_bytes, &questions)?;
 
-    Ok(Decision { state, questions })
+    Ok(Decision {
+        state,
+        questions,
+        caller_stops_waiting_at: None,
+    })
 }
 
 fn validated_id(id: &str, asked: &mut HashSet<String>) -> Result<(), ConnectError> {

@@ -36,9 +36,14 @@ impl<D: Decider, L: DecisionLog> Decisions<D, L> {
         Self { configured, log }
     }
 
-    pub async fn decide(&self, request: DecideRequest) -> Result<DecideResponse, ConnectError> {
+    pub async fn decide(
+        &self,
+        request: DecideRequest,
+        caller_stops_waiting_at: Option<Instant>,
+    ) -> Result<DecideResponse, ConnectError> {
         let (decider, model) = self.configured()?;
-        let decision = validated_decision(request)?;
+        let mut decision = validated_decision(request)?;
+        decision.caller_stops_waiting_at = caller_stops_waiting_at;
         let questions = i16::try_from(decision.questions.len()).unwrap_or(i16::MAX);
 
         let started = Instant::now();
@@ -266,7 +271,7 @@ mod tests {
         let service = decisions(Some(decider.clone()), log.clone());
 
         let response = service
-            .decide(deciding(vec![noul_question("is_urgent")]))
+            .decide(deciding(vec![noul_question("is_urgent")]), None)
             .await
             .unwrap();
 
@@ -299,7 +304,7 @@ mod tests {
         let service = decisions(Some(decider), log.clone());
 
         let error = service
-            .decide(deciding(vec![noul_question("is_urgent")]))
+            .decide(deciding(vec![noul_question("is_urgent")]), None)
             .await
             .unwrap_err();
 
@@ -333,7 +338,7 @@ mod tests {
         let service = decisions(Some(decider), log.clone());
 
         let error = service
-            .decide(deciding(vec![noul_question("is_urgent")]))
+            .decide(deciding(vec![noul_question("is_urgent")]), None)
             .await
             .unwrap_err();
 
@@ -354,7 +359,7 @@ mod tests {
         let service = decisions(Some(decider), log.clone());
 
         let error = service
-            .decide(deciding(vec![noul_question("is_urgent")]))
+            .decide(deciding(vec![noul_question("is_urgent")]), None)
             .await
             .unwrap_err();
 
@@ -384,7 +389,7 @@ mod tests {
             .map(|at| noul_question(&format!("question_{at}")))
             .collect();
 
-        let error = service.decide(deciding(too_many)).await.unwrap_err();
+        let error = service.decide(deciding(too_many), None).await.unwrap_err();
 
         assert_eq!(error.code, ErrorCode::InvalidArgument, "{error:?}");
         assert!(decider.asked().is_empty());
@@ -397,7 +402,7 @@ mod tests {
         let service = decisions(None, log.clone());
 
         let refused = service
-            .decide(deciding(vec![noul_question("is_urgent")]))
+            .decide(deciding(vec![noul_question("is_urgent")]), None)
             .await
             .unwrap_err();
         let unlisted = service.describe_models().await.unwrap_err();

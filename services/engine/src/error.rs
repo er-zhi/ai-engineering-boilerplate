@@ -12,6 +12,8 @@ pub enum EngineError {
     GraphNotFound(String, Option<i32>),
     #[error("execution not found: {0}")]
     ExecutionNotFound(uuid::Uuid),
+    #[error("execution {0} belongs to another user")]
+    NotYours(uuid::Uuid),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     /// The caller's request was fine; the execution it named is mid-tick and cannot be touched
@@ -34,6 +36,7 @@ impl From<EngineError> for ConnectError {
                 ConnectError::invalid_argument(error.to_string())
             }
             EngineError::Busy(_) => ConnectError::unavailable(error.to_string()),
+            EngineError::NotYours(_) => ConnectError::permission_denied(error.to_string()),
             EngineError::GraphNotFound(..) | EngineError::ExecutionNotFound(_) => {
                 ConnectError::not_found(error.to_string())
             }

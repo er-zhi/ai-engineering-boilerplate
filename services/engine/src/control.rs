@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::entity;
 use crate::error::EngineError;
+use crate::owned::OwnedExecution;
 use crate::service::{Service, to_execution};
 
 const RESUME_EVENT_STATE_KEY: &str = "resume_event";
@@ -33,7 +34,12 @@ impl Service {
         Ok(())
     }
 
-    pub async fn interrupt(&self, execution_id: Uuid, input_json: &str) -> Result<(), EngineError> {
+    pub async fn interrupt(
+        &self,
+        execution: OwnedExecution,
+        input_json: &str,
+    ) -> Result<(), EngineError> {
+        let execution_id = execution.id();
         let input: Value = serde_json::from_str(input_json)
             .map_err(|e| EngineError::InvalidRequest(e.to_string()))?;
         let execution = self.load_idle(execution_id).await?;
@@ -48,7 +54,12 @@ impl Service {
         .await
     }
 
-    pub async fn resume(&self, execution_id: Uuid, event_json: &str) -> Result<(), EngineError> {
+    pub async fn resume(
+        &self,
+        execution: OwnedExecution,
+        event_json: &str,
+    ) -> Result<(), EngineError> {
+        let execution_id = execution.id();
         let event: Value = serde_json::from_str(event_json)
             .map_err(|e| EngineError::InvalidRequest(e.to_string()))?;
         let mut execution = self.load_idle(execution_id).await?;
@@ -66,7 +77,8 @@ impl Service {
         self.persist(execution_id, next_step, &execution, &[]).await
     }
 
-    pub async fn cancel(&self, execution_id: Uuid) -> Result<(), EngineError> {
+    pub async fn cancel(&self, execution: OwnedExecution) -> Result<(), EngineError> {
+        let execution_id = execution.id();
         let mut execution = self.load_idle(execution_id).await?;
         let next_step = self.next_checkpoint_step(execution_id).await?;
         execution.status = engine_core::Status::Cancelled;
@@ -153,7 +165,10 @@ mod tests {
         .expect("seed");
 
         service
-            .interrupt(execution_id, r#"{"role": "user", "text": "hi"}"#)
+            .interrupt(
+                OwnedExecution::unchecked_for_test(execution_id),
+                r#"{"role": "user", "text": "hi"}"#,
+            )
             .await
             .expect("interrupt");
 
@@ -200,7 +215,9 @@ mod tests {
         .await
         .expect("seed");
 
-        let result = service.resume(execution_id, "{}").await;
+        let result = service
+            .resume(OwnedExecution::unchecked_for_test(execution_id), "{}")
+            .await;
 
         assert!(matches!(result, Err(EngineError::InvalidRequest(_))));
         let row = entity::execution::Entity::find_by_id(execution_id)
@@ -253,7 +270,9 @@ mod tests {
         .await
         .expect("seed");
 
-        let result = service.cancel(execution_id).await;
+        let result = service
+            .cancel(OwnedExecution::unchecked_for_test(execution_id))
+            .await;
 
         assert!(matches!(result, Err(EngineError::Busy(_))), "{result:?}");
         let connect: connectrpc::ConnectError = result.unwrap_err().into();
@@ -283,7 +302,10 @@ mod tests {
             .await
             .expect("start");
 
-        service.cancel(execution_id).await.expect("cancel");
+        service
+            .cancel(OwnedExecution::unchecked_for_test(execution_id))
+            .await
+            .expect("cancel");
 
         let execution = service.get_execution(execution_id).await.expect("get");
         assert_eq!(execution.status, engine_core::Status::Cancelled);

@@ -3,7 +3,7 @@
 pub mod answers;
 pub mod body;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::proto::llm_router::v1::ModelCard;
 use serde_json::Value;
@@ -48,15 +48,43 @@ pub struct SystemOne {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    ceiling: Duration,
 }
 
+/// What the server still has to do after the vendor answers: decode the response, write the audit
+/// row synchronously, and encode the reply. Taken off the caller's deadline so that work lands
+/// inside it rather than racing it.
+const ROOM_TO_RECORD_THE_ATTEMPT: Duration = Duration::from_millis(400);
+/// A caller whose deadline has all but expired still gets one attempt rather than a zero-length
+/// timeout, which `reqwest` reads as no timeout at all.
+const TOO_LITTLE_TIME_IS_STILL_ONE_ATTEMPT: Duration = Duration::from_millis(100);
+
 impl SystemOne {
-    pub fn new(base_url: String, api_key: String, timeout: Duration) -> Result<Self, String> {
+    /// How long this call may take: what is left of the caller's own deadline, less the margin the
+    /// audit write and the response envelope need after the vendor answers. Without a caller
+    /// deadline the ceiling below stands.
+    ///
+    /// Derived rather than declared. Two constants kept in step by hand is what this replaced, and
+    /// a tie goes to the outer deadline — which drops the whole decision future before the audit
+    /// row is written, losing exactly the slow attempt worth investigating.
+    fn within(&self, caller_stops_waiting_at: Option<Instant>) -> Duration {
+        let Some(deadline) = caller_stops_waiting_at else {
+            return self.ceiling;
+        };
+        deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(ROOM_TO_RECORD_THE_ATTEMPT)
+            .min(self.ceiling)
+            .max(TOO_LITTLE_TIME_IS_STILL_ONE_ATTEMPT)
+    }
+
+    pub fn new(base_url: String, api_key: String, ceiling: Duration) -> Result<Self, String> {
         let http = reqwest::Client::builder()
-            .timeout(timeout)
+            .timeout(ceiling)
             .build()
             .map_err(|error| format!("could not build the provider client: {error}"))?;
         Ok(Self {
+            ceiling,
             http,
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key,
@@ -80,6 +108,7 @@ impl SystemOne {
             .http
             .post(format!("{}{DECIDE_PATH}", self.base_url))
             .bearer_auth(&self.api_key)
+            .timeout(self.within(decision.caller_stops_waiting_at))
             .json(&decide_body(model, decision))
             .send()
             .await
@@ -217,7 +246,6 @@ mod tests {
     /// against the real constant, so this pins the value the two are kept in sync with by hand;
     /// Chat's own `intent.rs` tests pin the same value from its side. Keep both in sync with the
     /// real `chat::intent::DECIDE_CALL_TIMEOUT` when either changes.
-    const CHAT_DECIDE_CALL_TIMEOUT_MIRROR: Duration = Duration::from_secs(2);
 
     // A regression guard: this adapter's own timeout must stay of the same order as Chat's
     // `Decide` deadline, not drift back up toward completion's 60 s.
@@ -226,19 +254,52 @@ mod tests {
         assert_eq!(REQUEST_TIMEOUT, Duration::from_millis(1500));
     }
 
-    // The invariant the whole-branch review traced a lost audit row to: `connectrpc`'s server
-    // wraps this adapter's whole dispatch — including the vendor HTTP call `REQUEST_TIMEOUT`
-    // bounds — in Chat's own outer deadline, started strictly earlier than this adapter's own
-    // clock (see `REQUEST_TIMEOUT`'s doc comment). Equal or larger and the outer deadline always
-    // wins the race and drops the audit write; this pins that the inner must stay strictly below.
     #[test]
-    fn this_adapters_own_timeout_stays_strictly_below_chats_outer_decide_deadline() {
+    fn a_callers_deadline_bounds_the_vendor_call_below_itself() {
+        let ceiling = Duration::from_secs(60);
+        let adapter = SystemOne::new(String::new(), String::new(), ceiling).expect("client");
+        let caller_waits = Duration::from_secs(2);
+
+        let allowed = adapter.within(Some(Instant::now() + caller_waits));
+
         assert!(
-            REQUEST_TIMEOUT < CHAT_DECIDE_CALL_TIMEOUT_MIRROR,
-            "the inner vendor-call timeout must stay strictly below Chat's outer Decide \
-             deadline, or the outer one always wins the race and the audit row for that \
-             attempt is silently never written: {REQUEST_TIMEOUT:?} vs \
-             {CHAT_DECIDE_CALL_TIMEOUT_MIRROR:?}"
+            allowed < caller_waits,
+            "the caller's deadline wraps this whole dispatch and starts earlier, so a tie goes \
+             to the outer one — and it drops the decision future before the audit row is \
+             written, losing the slow attempt worth investigating: {allowed:?} vs {caller_waits:?}"
+        );
+        assert!(allowed >= TOO_LITTLE_TIME_IS_STILL_ONE_ATTEMPT);
+    }
+
+    #[test]
+    fn a_caller_with_no_deadline_gets_the_ceiling() {
+        let ceiling = Duration::from_millis(1500);
+        let adapter = SystemOne::new(String::new(), String::new(), ceiling).expect("client");
+
+        assert_eq!(adapter.within(None), ceiling);
+    }
+
+    #[test]
+    fn a_deadline_already_spent_still_buys_one_attempt() {
+        let adapter =
+            SystemOne::new(String::new(), String::new(), Duration::from_secs(60)).expect("client");
+
+        assert_eq!(
+            adapter.within(Some(Instant::now())),
+            TOO_LITTLE_TIME_IS_STILL_ONE_ATTEMPT,
+            "a zero-length timeout is read as no timeout at all, which is the opposite of what \
+             an expired deadline asks for"
+        );
+    }
+
+    #[test]
+    fn a_caller_waiting_longer_than_the_ceiling_does_not_raise_it() {
+        let ceiling = Duration::from_millis(1500);
+        let adapter = SystemOne::new(String::new(), String::new(), ceiling).expect("client");
+
+        assert_eq!(
+            adapter.within(Some(Instant::now() + Duration::from_secs(600))),
+            ceiling
         );
     }
 

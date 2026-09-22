@@ -18,6 +18,7 @@ use connectrpc::{
 };
 use engine::executors::llm::LlmTaskExecutor;
 use engine::executors::tool::ToolTaskExecutor;
+use engine::owned::OwnedExecution;
 use engine::service::Service;
 use engine::tick::Tick;
 use engine::{
@@ -87,11 +88,11 @@ fn continued_execution_if_readable(execution_id: Option<&str>) -> Option<Uuid> {
 }
 
 impl EngineServiceImpl {
-    async fn refuse_another_users_execution(
+    async fn owned_by_the_caller(
         &self,
         ctx: &RequestContext,
         execution_id: Uuid,
-    ) -> Result<(), ConnectError> {
+    ) -> Result<OwnedExecution, ConnectError> {
         let owner = self
             .service
             .get_execution(execution_id)
@@ -99,12 +100,7 @@ impl EngineServiceImpl {
             .user_id
             .map(|owner| owner.0);
         let caller = principal::from_metadata(ctx.headers()).map(|p| p.user_id);
-        if owner.is_some() && owner != caller {
-            return Err(ConnectError::permission_denied(format!(
-                "execution {execution_id} belongs to another user"
-            )));
-        }
-        Ok(())
+        Ok(OwnedExecution::checked(execution_id, owner, caller)?)
     }
 }
 
@@ -158,11 +154,8 @@ impl EngineService for EngineServiceImpl {
     ) -> ServiceResult<InterruptResponse> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
-        self.refuse_another_users_execution(&ctx, execution_id)
-            .await?;
-        self.service
-            .interrupt(execution_id, &msg.input_json)
-            .await?;
+        let execution = self.owned_by_the_caller(&ctx, execution_id).await?;
+        self.service.interrupt(execution, &msg.input_json).await?;
         Response::ok(InterruptResponse::default())
     }
 
@@ -173,9 +166,8 @@ impl EngineService for EngineServiceImpl {
     ) -> ServiceResult<ResumeResponse> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
-        self.refuse_another_users_execution(&ctx, execution_id)
-            .await?;
-        self.service.resume(execution_id, &msg.event_json).await?;
+        let execution = self.owned_by_the_caller(&ctx, execution_id).await?;
+        self.service.resume(execution, &msg.event_json).await?;
         Response::ok(ResumeResponse::default())
     }
 
@@ -186,9 +178,8 @@ impl EngineService for EngineServiceImpl {
     ) -> ServiceResult<CancelResponse> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
-        self.refuse_another_users_execution(&ctx, execution_id)
-            .await?;
-        self.service.cancel(execution_id).await?;
+        let execution = self.owned_by_the_caller(&ctx, execution_id).await?;
+        self.service.cancel(execution).await?;
         Response::ok(CancelResponse::default())
     }
 
@@ -199,9 +190,8 @@ impl EngineService for EngineServiceImpl {
     ) -> ServiceResult<ExecutionProto> {
         let msg = request.to_owned_message();
         let execution_id = parse_uuid(&msg.execution_id, "execution_id")?;
-        self.refuse_another_users_execution(&ctx, execution_id)
-            .await?;
-        let execution = self.service.get_execution(execution_id).await?;
+        let owned = self.owned_by_the_caller(&ctx, execution_id).await?;
+        let execution = self.service.get_execution(owned.id()).await?;
         Response::ok(execution_to_proto(&execution))
     }
 
@@ -217,7 +207,7 @@ impl EngineService for EngineServiceImpl {
             .map(|s| parse_uuid(s, "execution_id"))
             .transpose()?;
         if let Some(id) = execution_id {
-            self.refuse_another_users_execution(&ctx, id).await?;
+            self.owned_by_the_caller(&ctx, id).await?;
         }
         let scope = match execution_id {
             Some(id) => stream::Scope::Execution(id),
