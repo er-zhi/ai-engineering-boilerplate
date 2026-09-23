@@ -30,6 +30,11 @@ pub enum TopicEventKind {
 
 impl TopicEventKind {
     #[must_use]
+    pub fn has_no_record_but_the_event_log(self) -> bool {
+        matches!(self, Self::ClarificationNeeded | Self::EngineBusy)
+    }
+
+    #[must_use]
     pub fn as_column(self) -> String {
         match serde_json::to_value(self) {
             Ok(serde_json::Value::String(spelling)) => spelling,

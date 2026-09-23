@@ -344,25 +344,16 @@ fn extra_tool_call_charge(value: &serde_json::Value) -> u32 {
     u32::from(value.get(crate::llm_output::FAST_TOOL_CALL_FIELD).is_some())
 }
 
-/// The same `FAST_TOOL_CALL_FIELD` `extra_tool_call_charge` reads, for the same reason: an `llm`
-/// node's own reducer writes its output under its own `state_key` (`"llm"` in every graph today),
-/// never under `TOOL_RESULT_STATE_KEY` — only the graph's separate `tool` node's `Append` reducer
-/// does that. A fast-dispatched call bypasses that node entirely, so without this its result would
-/// never reach `TOOL_RESULT_STATE_KEY` at all, and every prompt built after it — including the very
-/// next one, if the model calls a second tool the normal way — would render as if that first call
-/// had never happened (see `services/engine/src/executors/llm.rs`'s `build_prompt`, which renders
-/// only that key). Appending it here, unconditionally, keeps `TOOL_RESULT_STATE_KEY` the one place
-/// every tool result lands regardless of which path produced it.
 fn apply_fast_tool_call(execution: &mut Execution, value: &serde_json::Value) {
-    if let Some(result) = value
+    if let Some(record) = value
         .get(crate::llm_output::FAST_TOOL_CALL_FIELD)
-        .and_then(|call| call.get("result"))
+        .and_then(crate::llm_output::ToolRecord::read)
     {
         apply_reducer(
             &mut execution.state,
             crate::llm_output::TOOL_RESULT_STATE_KEY,
             crate::graph::Reducer::Append,
-            result.clone(),
+            record.to_json(),
         );
     }
 }
@@ -1104,14 +1095,8 @@ mod tests {
         assert_eq!(exec.budget.tool_calls_remaining, calls_before - 2);
     }
 
-    // The fast path's own `state_key` is `"llm"`, written by `Replace` (see `builder.rs`'s
-    // `agent_graph`) — never `TOOL_RESULT_STATE_KEY`, which only the graph's separate `tool` node's
-    // `Append` reducer writes. Without `apply_fast_tool_call`, a fast-dispatched result would be
-    // invisible to `build_prompt` and every render after it, which is why the model kept calling
-    // tools it had already gotten an answer from.
-    #[test]
-    fn a_fast_dispatched_tool_calls_result_reaches_tool_result_for_later_prompts() {
-        let g = graph(
+    fn a_graph_of_one_llm_node() -> Graph {
+        graph(
             vec![
                 Node::Task {
                     id: NodeId("a".into()),
@@ -1128,19 +1113,30 @@ mod tests {
                 condition: Condition::Always,
             }],
             "a",
-        );
-        let exec = execution("a");
+        )
+    }
+
+    fn weather_record(result: serde_json::Value) -> serde_json::Value {
+        json!({
+            "name": "weather",
+            "args": {"place": "Bishkek"},
+            "result": result,
+            "fetched_at": "2026-09-22T10:00:00+00:00",
+        })
+    }
+
+    #[test]
+    fn a_fast_dispatched_tool_call_lands_in_tool_result_as_the_whole_record() {
+        let fast_call = weather_record(json!({"temp": "68F"}));
 
         let (exec, _) = step(
-            &g,
-            exec,
+            &a_graph_of_one_llm_node(),
+            execution("a"),
             vec![ok(
                 "a",
                 json!({
                     "reply": "68F, fog",
-                    crate::llm_output::FAST_TOOL_CALL_FIELD: {
-                        "name": "weather", "args": {}, "result": {"temp": "68F"},
-                    },
+                    crate::llm_output::FAST_TOOL_CALL_FIELD: fast_call,
                 }),
             )],
             Utc::now(),
@@ -1148,47 +1144,27 @@ mod tests {
 
         assert_eq!(
             exec.state.get(crate::llm_output::TOOL_RESULT_STATE_KEY),
-            Some(&json!([{"temp": "68F"}])),
-            "the fast-dispatched result must land in tool_result, the one key every later prompt reads"
+            Some(&json!([fast_call])),
+            "the record lands with its name, what was asked for and when it was fetched, so a \
+             follow-up that carries it still knows what it answers and whether it is fresh"
         );
     }
 
-    // A fast dispatch can follow a tool result the normal `llm` → `tool` loop already appended (or
-    // precede one a later iteration appends) — either way its result joins the same array in order,
-    // not overwrite it, so the whole call history stays visible to every later prompt.
     #[test]
-    fn a_fast_dispatched_tool_calls_result_appends_after_any_earlier_ones() {
-        let g = graph(
-            vec![
-                Node::Task {
-                    id: NodeId("a".into()),
-                    kind: "llm".into(),
-                    config: json!({"state_key": "llm", "reducer": "Replace"}),
-                },
-                Node::End {
-                    id: NodeId("end".into()),
-                },
-            ],
-            vec![Edge {
-                from: NodeId("a".into()),
-                to: NodeId("end".into()),
-                condition: Condition::Always,
-            }],
-            "a",
-        );
+    fn a_fast_dispatched_tool_calls_record_appends_after_any_earlier_ones() {
+        let earlier = weather_record(json!({"first": true}));
+        let fast_call = weather_record(json!({"second": true}));
         let mut exec = execution("a");
-        exec.state = json!({"tool_result": [{"first": true}]});
+        exec.state = json!({"tool_result": [earlier]});
 
         let (exec, _) = step(
-            &g,
+            &a_graph_of_one_llm_node(),
             exec,
             vec![ok(
                 "a",
                 json!({
                     "reply": null,
-                    crate::llm_output::FAST_TOOL_CALL_FIELD: {
-                        "name": "weather", "args": {}, "result": {"second": true},
-                    },
+                    crate::llm_output::FAST_TOOL_CALL_FIELD: fast_call,
                 }),
             )],
             Utc::now(),
@@ -1196,7 +1172,8 @@ mod tests {
 
         assert_eq!(
             exec.state.get("tool_result"),
-            Some(&json!([{"first": true}, {"second": true}]))
+            Some(&json!([earlier, fast_call])),
+            "a fast lookup joins the history in order rather than overwriting it"
         );
     }
 

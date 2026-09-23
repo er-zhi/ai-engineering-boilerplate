@@ -136,6 +136,7 @@ pub enum WaitKind {
 pub enum Reducer {
     Replace,
     Append,
+    AppendEach,
     Merge,
 }
 

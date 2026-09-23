@@ -88,6 +88,8 @@
   const NOTIFICATION = `${EVENT_KIND_PREFIX}NOTIFICATION`;
   const TOPIC_PROGRESS = `${EVENT_KIND_PREFIX}TOPIC_PROGRESS`;
   const CLARIFICATION_NEEDED = `${EVENT_KIND_PREFIX}CLARIFICATION_NEEDED`;
+  const ENGINE_BUSY = `${EVENT_KIND_PREFIX}ENGINE_BUSY`;
+  const NOTICE_KINDS = new Set([CLARIFICATION_NEEDED, ENGINE_BUSY]);
 
   function readable(value, prefix) {
     const name = String(value || "");
@@ -155,11 +157,18 @@
     return out;
   }
 
-  async function* streamChatEvents() {
+  let currentStream = null;
+
+  function reopenStreamForTheNewSession() {
+    if (currentStream) currentStream.abort();
+  }
+
+  async function* streamChatEvents(signal) {
     const res = await fetch(`${SERVICE}/StreamEvents`, {
       method: "POST",
       headers: { "content-type": "application/connect+json", "connect-protocol-version": "1" },
       body: encodeEnvelope({}),
+      signal,
     });
     if (!res.ok || !res.body) throw new Error(`StreamEvents failed with ${res.status}`);
     const reader = res.body.getReader();
@@ -281,6 +290,8 @@
   // Page lifetime only: after a reload there is nothing to recover it from, and the transcript falls
   // back to the stored time and under-reports.
   const sentAtByTurn = new Map();
+
+  const noticesByTurn = new Map();
 
   function clockText(iso) {
     const at = new Date(iso);
@@ -407,9 +418,21 @@
     return entries;
   }
 
+  function noticeEntries(topics) {
+    return [...noticesByTurn.entries()].flatMap(([turnId, notice]) => {
+      const topic = notice.topicId ? rootTitleOf(topics, notice.topicId) : undefined;
+      const className = notice.kind === ENGINE_BUSY ? "error" : "";
+      return [
+        { at: sentAtByTurn.get(turnId) || notice.at, sequence: TURN_SEQUENCE, who: "you", text: notice.content, topic },
+        { at: notice.at, sequence: ACK_SEQUENCE, who: "assistant", text: notice.text, className, topic },
+      ];
+    });
+  }
+
   function transcriptEntries(topics) {
     const entries = userTurnEntries(topics);
     topics.forEach((topic) => entries.push(...topicEntries(topic)));
+    entries.push(...noticeEntries(topics));
     return entries.sort((a, b) => atMs(a.at) - atMs(b.at) || a.sequence - b.sequence);
   }
 
@@ -439,13 +462,18 @@
       }
       let payload = {};
       try { payload = JSON.parse(event.payloadJson || "{}"); } catch { payload = {}; }
-      if (event.kind === CLARIFICATION_NEEDED) {
-        // The user's own message never became a stored `chat.messages` row — a clarified turn
-        // starts no topic — so it only ever reaches the transcript through this payload. Without
-        // it, a reload rebuilds from `messages` and shows the assistant's reply with nothing above
-        // it.
-        appendMessage("you", payload.content || "", undefined, undefined, event.occurredAt);
-        appendMessage("assistant", payload.text || "", undefined, undefined, event.occurredAt);
+      if (NOTICE_KINDS.has(event.kind)) {
+        // Neither a clarified nor a busy turn becomes a stored `chat.messages` row, so the person's
+        // own message and the reply live only in this event. They are kept here and merged into
+        // every rebuild; after a page reload the stream's replay of the event log brings them back.
+        noticesByTurn.set(payload.turn_id || event.occurredAt, {
+          kind: event.kind,
+          topicId: event.topicId,
+          at: event.occurredAt,
+          content: payload.content || "",
+          text: payload.text || "",
+        });
+        renderTranscript();
         return;
       }
       if (event.kind === NOTIFICATION) {
@@ -525,8 +553,10 @@
     turnAnchorMs = null;
     // The turns those ids belonged to are gone, so nothing will ask for them again.
     sentAtByTurn.clear();
+    noticesByTurn.clear();
     topics = [];
     focusTopicId = null;
+    reopenStreamForTheNewSession();
     await loadSession();
   }
 
@@ -547,14 +577,19 @@
     let backoffMs = STREAM_RETRY_BASE_MS;
     for (;;) {
       debugLine("meta", "stream", "connecting…");
+      currentStream = new AbortController();
       let waitMs = STREAM_RETRY_BASE_MS;
       try {
-        for await (const event of streamChatEvents()) {
+        for await (const event of streamChatEvents(currentStream.signal)) {
           await renderEvent(event);
         }
         debugLine("meta", "stream", "ended cleanly");
         backoffMs = STREAM_RETRY_BASE_MS;
       } catch (err) {
+        if (currentStream.signal.aborted) {
+          backoffMs = STREAM_RETRY_BASE_MS;
+          continue;
+        }
         waitMs = backoffMs;
         backoffMs = Math.min(backoffMs * 2, STREAM_RETRY_MAX_MS);
         debugLine("err", "stream", `${err.message} — retrying in ${waitMs / 1000}s`);

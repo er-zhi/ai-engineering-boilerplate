@@ -61,6 +61,10 @@ fn from_environment(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+fn present(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 fn checked(
     raw: &Value,
     input_schema: &Value,
@@ -96,8 +100,6 @@ fn checked(
     Ok(set)
 }
 
-/// Everything one source must satisfy before the file is accepted. Every message here is written
-/// to follow the source's name, which the caller puts in front of it.
 fn check_source(
     source: &Source,
     declared: &[String],
@@ -126,7 +128,7 @@ fn check_source(
     // third party as an unauthenticated request whose reply nobody vouches for.
     for template in std::iter::once(&source.url).chain(source.headers.values()) {
         for name in secret_placeholders(template)? {
-            if lookup(&name).is_none() {
+            if present(lookup(&name)).is_none() {
                 return Err(format!(
                     "needs {name:?} from the environment, which is not set"
                 ));
@@ -188,11 +190,6 @@ fn scan(template: &str, secrets: bool) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
-/// Replaces every `${SOME_KEY}` with what the environment holds, and reports what it substituted so
-/// the caller can keep those values out of anything it goes on to say. A name the environment does
-/// not carry is an error rather than an empty string: a URL silently missing its credential reaches
-/// a third party as an unauthenticated request, and the reply to *that* is what the model would be
-/// asked to believe.
 fn fill_secrets(
     template: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -200,15 +197,13 @@ fn fill_secrets(
     let mut filled = template.to_owned();
     let mut used = Vec::new();
     for name in secret_placeholders(template)? {
-        let value =
-            lookup(&name).ok_or_else(|| format!("the environment does not carry {name:?}"))?;
+        let value = present(lookup(&name))
+            .ok_or_else(|| format!("the environment does not carry {name:?}"))?;
         filled = filled.replace(
             &format!("{SECRET_MARKER}{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}"),
             &value,
         );
-        if !value.is_empty() {
-            used.push(value);
-        }
+        used.push(value);
     }
     Ok((filled, used))
 }
@@ -542,6 +537,28 @@ mod tests {
         assert!(error.contains("SOME_KEY"), "{error}");
     }
 
+    #[test]
+    fn a_secret_set_to_an_empty_string_refuses_the_row_exactly_like_an_unset_one() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://e.test/?key=${SOME_KEY}", "pick": "value"}]
+        });
+        let error = checked(&raw, &schema_with(json!({})), &holding("SOME_KEY", ""))
+            .expect_err("compose.yaml sets this kind of variable as ${VAR:-}, present but empty");
+        assert!(error.contains("SOME_KEY"), "{error}");
+    }
+
+    #[test]
+    fn a_secret_set_to_whitespace_only_refuses_the_row_exactly_like_an_unset_one() {
+        let raw = json!({
+            "fan_out": 1, "take": 1,
+            "sources": [{"name": "one", "url": "https://e.test/?key=${SOME_KEY}", "pick": "value"}]
+        });
+        let error = checked(&raw, &schema_with(json!({})), &holding("SOME_KEY", "   "))
+            .expect_err("whitespace carries no credential any more than an empty string does");
+        assert!(error.contains("SOME_KEY"), "{error}");
+    }
+
     /// A pick addresses the reply, where nothing is substituted from the environment. Left to
     /// stand, a `${...}` there would quietly look for a key that is not in the reply.
     #[test]
@@ -568,6 +585,30 @@ mod tests {
         .expect("substitutes");
         assert_eq!(url, "https://e.test/?key=s3cret");
         assert_eq!(used, vec!["s3cret".to_owned()]);
+    }
+
+    #[test]
+    fn fill_secrets_refuses_a_name_the_environment_does_not_carry() {
+        let error = fill_secrets("https://e.test/?key=${SOME_KEY}", &holding_nothing)
+            .expect_err("an absent secret must refuse rather than send an unauthenticated request");
+        assert!(error.contains("SOME_KEY"), "{error}");
+    }
+
+    #[test]
+    fn fill_secrets_refuses_a_name_the_environment_carries_as_an_empty_string() {
+        let error = fill_secrets("https://e.test/?key=${SOME_KEY}", &holding("SOME_KEY", ""))
+            .expect_err("a set-but-empty secret must refuse exactly like an absent one");
+        assert!(error.contains("SOME_KEY"), "{error}");
+    }
+
+    #[test]
+    fn fill_secrets_refuses_a_name_the_environment_carries_as_whitespace_only() {
+        let error = fill_secrets(
+            "https://e.test/?key=${SOME_KEY}",
+            &holding("SOME_KEY", "   "),
+        )
+        .expect_err("a whitespace-only secret must refuse exactly like an absent one");
+        assert!(error.contains("SOME_KEY"), "{error}");
     }
 
     /// The reason the substituted values are reported at all: a source's failure text quotes the

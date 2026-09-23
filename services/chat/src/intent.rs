@@ -155,6 +155,7 @@ pub struct TopicSummary {
     pub title: String,
     pub status: Status,
     pub result_summary: Option<String>,
+    pub last_active_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,12 +296,9 @@ impl TopicIntent {
                     return Routing::Act(vec![Action::Continue { topic_id, question }]);
                 }
                 RouteOutcome::Fallback => {
-                    let question = self
-                        .question_that_stands_alone(&decided.answers, topics, message)
+                    return self
+                        .unplaced(&decided.answers, topics, focus, message)
                         .await;
-                    return Routing::Act(continue_focus_or_open_one_topic(
-                        topics, focus, &question,
-                    ));
                 }
                 RouteOutcome::ConfidentNew => {}
             }
@@ -332,17 +330,33 @@ impl TopicIntent {
         }])
     }
 
+    async fn unplaced(
+        &self,
+        answers: &[Answer],
+        topics: &[TopicSummary],
+        focus: Option<i64>,
+        message: &str,
+    ) -> Routing {
+        let question = self
+            .question_that_stands_alone(answers, topics, message)
+            .await;
+        let continued = if leans_on_the_conversation(answers) {
+            focus.or_else(|| most_recently_active(topics))
+        } else {
+            focus
+        };
+        Routing::Act(continue_focus_or_open_one_topic(
+            topics, continued, &question,
+        ))
+    }
+
     async fn question_that_stands_alone(
         &self,
         answers: &[Answer],
         topics: &[TopicSummary],
         message: &str,
     ) -> String {
-        if noul_below(
-            answers,
-            STANDS_ALONE_MESSAGE_ID,
-            REWRITE_WHEN_STANDS_ALONE_BELOW,
-        ) {
+        if leans_on_the_conversation(answers) {
             self.rewritten_against_the_conversation(topics, message)
                 .await
         } else {
@@ -724,6 +738,21 @@ fn find_choice<'a>(answers: &'a [Answer], id: &str) -> Option<&'a ChoiceAnswer> 
         })
 }
 
+fn leans_on_the_conversation(answers: &[Answer]) -> bool {
+    noul_below(
+        answers,
+        STANDS_ALONE_MESSAGE_ID,
+        REWRITE_WHEN_STANDS_ALONE_BELOW,
+    )
+}
+
+fn most_recently_active(topics: &[TopicSummary]) -> Option<i64> {
+    topics
+        .iter()
+        .max_by_key(|topic| topic.last_active_at)
+        .map(|topic| topic.id)
+}
+
 fn stands_alone_or_no_verdict_arrived(answers: &[Answer], id: &str) -> bool {
     find_noul(answers, id).is_none_or(|value| value > REWRITE_WHEN_STANDS_ALONE_BELOW)
 }
@@ -810,6 +839,7 @@ mod tests {
             title: "An earlier topic, still running".to_owned(),
             status: crate::entity::topic::Status::Running,
             result_summary: None,
+            last_active_at: chrono::Utc::now(),
         }]
     }
 
@@ -909,6 +939,7 @@ mod tests {
             title: "what is capital of Japan?".to_owned(),
             status: Status::Completed,
             result_summary: None,
+            last_active_at: chrono::Utc::now(),
         }];
 
         let Routing::Act(actions) = intent.route(&topics, None, "ok weather there?").await else {
@@ -931,33 +962,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_message_too_empty_to_route_is_still_resolved_against_the_conversation() {
+    async fn a_message_too_empty_to_route_that_leans_on_the_conversation_continues_its_latest_topic()
+     {
         let (url, calls) = crate::fakes::serve_decider_unsure_where_it_belongs(
             0.05,
-            "where was the humidity measured?",
+            "which place was that humidity reading taken for?",
         )
         .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let an_hour_ago = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        let topics = vec![
+            TopicSummary {
+                id: 6,
+                title: "what is the weather in Tokyo?".to_owned(),
+                status: Status::Completed,
+                result_summary: Some("22.49".to_owned()),
+                last_active_at: an_hour_ago,
+            },
+            TopicSummary {
+                id: 7,
+                title: "and the humidity in Tokyo?".to_owned(),
+                status: Status::Completed,
+                result_summary: Some("71".to_owned()),
+                last_active_at: chrono::Utc::now(),
+            },
+        ];
+
+        let Routing::Act(actions) = intent.route(&topics, None, "where?").await else {
+            panic!("expected actions");
+        };
+
+        let [Action::Continue { topic_id, question }] = actions.as_slice() else {
+            panic!("expected a continuation: {actions:?}");
+        };
+        assert_eq!(
+            *topic_id, 7,
+            "a message that only makes sense against the conversation is about its latest turn: \
+             opening an unrelated topic instead starts an execution that carries nothing, so the \
+             answer already fetched cannot be read"
+        );
+        assert_eq!(question, "which place was that humidity reading taken for?");
+        assert_eq!(calls.completions(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_topic_a_leaning_message_continues_is_the_last_one_talked_about_not_the_last_opened()
+     {
+        let (url, _calls) = crate::fakes::serve_decider_unsure_where_it_belongs(
+            0.05,
+            "where was that reading taken?",
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let an_hour_ago = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        let topics = vec![
+            TopicSummary {
+                id: 6,
+                title: "what is the weather in Tokyo?".to_owned(),
+                status: Status::Completed,
+                result_summary: Some("94%".to_owned()),
+                last_active_at: chrono::Utc::now(),
+            },
+            TopicSummary {
+                id: 7,
+                title: "what is BTC-USD trading at?".to_owned(),
+                status: Status::Completed,
+                result_summary: Some("87111.655".to_owned()),
+                last_active_at: an_hour_ago,
+            },
+        ];
+
+        let Routing::Act(actions) = intent.route(&topics, None, "where?").await else {
+            panic!("expected actions");
+        };
+
+        assert!(
+            matches!(actions.as_slice(), [Action::Continue { topic_id: 6, .. }]),
+            "the weather topic was opened first but answered last, so a bare follow-up is about it \
+             — continuing the price topic because it was opened later would carry nothing about \
+             where a reading was taken: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_too_empty_to_route_that_stands_alone_still_opens_its_own_topic() {
+        let (url, _calls) =
+            crate::fakes::serve_decider_unsure_where_it_belongs(0.95, "unused").await;
         let intent = TopicIntent::new(&url).expect("client");
         let topics = vec![TopicSummary {
             id: 7,
             title: "and the humidity in Tokyo?".to_owned(),
             status: Status::Completed,
             result_summary: Some("71".to_owned()),
+            last_active_at: chrono::Utc::now(),
         }];
 
-        let Routing::Act(actions) = intent.route(&topics, None, "where?").await else {
+        let Routing::Act(actions) = intent
+            .route(&topics, None, "what is BTC-USD trading at?")
+            .await
+        else {
             panic!("expected actions");
         };
 
-        let [Action::New { question, .. }] = actions.as_slice() else {
-            panic!("expected one new topic: {actions:?}");
-        };
-        assert_eq!(
-            question, "where was the humidity measured?",
-            "a message the router had too little confidence to place is exactly the kind that \
-             leans on the conversation, so falling back must not hand the raw words on"
+        assert!(
+            matches!(actions.as_slice(), [Action::New { .. }]),
+            "a message that names what it is about owes nothing to the last turn: {actions:?}"
         );
-        assert_eq!(calls.completions(), 1);
     }
 
     #[tokio::test]
@@ -973,6 +1083,7 @@ mod tests {
             title: "what is the weather in Tokyo?".to_owned(),
             status: Status::Completed,
             result_summary: Some("22.49".to_owned()),
+            last_active_at: chrono::Utc::now(),
         }];
 
         let Routing::Act(actions) = intent.route(&topics, Some(7), "where?").await else {
@@ -1196,6 +1307,7 @@ mod tests {
                 title: format!("Topic {id}"),
                 status: crate::entity::topic::Status::Running,
                 result_summary: None,
+                last_active_at: chrono::Utc::now(),
             })
             .collect()
     }

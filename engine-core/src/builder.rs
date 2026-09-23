@@ -141,7 +141,7 @@ pub fn agent_graph() -> Graph {
         .task(
             "tool",
             "tool",
-            serde_json::json!({"state_key": TOOL_RESULT_STATE_KEY, "reducer": Reducer::Append}),
+            serde_json::json!({"state_key": TOOL_RESULT_STATE_KEY, "reducer": Reducer::AppendEach}),
         )
         .end("end")
         .edge("llm", "tool", Condition::Truthy(llm_tool_call_pointer()))

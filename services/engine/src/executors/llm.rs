@@ -19,6 +19,7 @@ use connectrpc::client::HttpClient;
 use engine_core::{
     FAST_TOOL_CALL_FIELD, LlmOutput, PRIOR_MATERIAL_STATE_KEY, RENDERED_TOOL_RESULTS,
     TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall, ToolRecord,
+    first_shown,
 };
 use serde_json::{Value, json};
 
@@ -142,6 +143,9 @@ const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const MAX_CHARS_PER_RENDERED_TOOL_RESULT: usize = 12_000;
 const TRUNCATION_MARK: &str = "… (truncated)";
+const MAX_CHARS_OF_TOOL_RESULTS_SHOWN_AT_ONCE: usize =
+    RENDERED_TOOL_RESULTS * MAX_CHARS_PER_RENDERED_TOOL_RESULT;
+const MAX_CHARS_OF_WHAT_WAS_ASKED: usize = 1_000;
 
 const DECIDE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -268,6 +272,15 @@ pub fn build_prompt(config: &LlmNodeConfig, state: &Value) -> (String, String) {
 }
 
 pub fn build_prompt_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> (String, String) {
+    prompt_for(config, state, mode, &Material::for_mode(state, mode))
+}
+
+fn prompt_for(
+    config: &LlmNodeConfig,
+    state: &Value,
+    mode: Mode,
+    material: &Material,
+) -> (String, String) {
     let mut system = config
         .system_prompt
         .clone()
@@ -295,89 +308,145 @@ pub fn build_prompt_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> (S
     }
 
     let mut user = ExecutionInput::in_state(state).question;
-    for (index, result) in rendered_tool_results(state) {
-        user.push_str(&render_tool_result(index, result));
+    for shown in material.shown() {
+        user.push_str(&shown.in_the_prompt());
     }
     (system, user)
 }
 
-fn rendered_tool_results(state: &Value) -> impl Iterator<Item = (usize, &Value)> {
-    let prior = state
-        .get(PRIOR_MATERIAL_STATE_KEY)
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let fetched = state
-        .get(TOOL_RESULT_STATE_KEY)
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let carried_then_fetched: Vec<&Value> = prior.iter().chain(fetched.iter()).collect();
-    let first_rendered = carried_then_fetched
-        .len()
-        .saturating_sub(RENDERED_TOOL_RESULTS);
+pub(crate) struct Material {
+    pub(crate) carried: Vec<ToolRecord>,
+    pub(crate) fetched: Vec<ToolRecord>,
+}
+
+impl Material {
+    pub(crate) fn of(state: &Value) -> Self {
+        Self {
+            carried: ToolRecord::all_under(state, PRIOR_MATERIAL_STATE_KEY),
+            fetched: ToolRecord::all_under(state, TOOL_RESULT_STATE_KEY),
+        }
+    }
+
+    fn for_mode(state: &Value, mode: Mode) -> Self {
+        let material = Self::of(state);
+        match mode {
+            Mode::FromMaterial => material.only_what_was_carried_and_is_still_fresh(),
+            Mode::Loop | Mode::ComposeOnly => material,
+        }
+    }
+
+    pub(crate) fn only_what_was_carried_and_is_still_fresh(&self) -> Self {
+        let now = Utc::now();
+        Self {
+            carried: self
+                .carried
+                .iter()
+                .filter(|record| fetched_recently(record, now))
+                .cloned()
+                .collect(),
+            fetched: Vec::new(),
+        }
+    }
+
+    fn with_lookup(&self, record: ToolRecord) -> Self {
+        let mut fetched = self.fetched.clone();
+        fetched.push(record);
+        Self {
+            carried: self.carried.clone(),
+            fetched,
+        }
+    }
+
+    fn shown(&self) -> Vec<Shown<'_>> {
+        shown_of(&self.carried, &self.fetched)
+    }
+
+    pub(crate) fn rendered_carried(&self) -> Option<String> {
+        if self.carried.is_empty() {
+            return None;
+        }
+        Some(
+            shown_of(&self.carried, &[])
+                .iter()
+                .map(Shown::in_the_prompt)
+                .collect(),
+        )
+    }
+}
+
+struct Shown<'a> {
+    index: usize,
+    record: &'a ToolRecord,
+    carried_from_an_earlier_turn: bool,
+    chars: usize,
+}
+
+impl Shown<'_> {
+    fn in_the_prompt(&self) -> String {
+        rendered(
+            self.index,
+            &asked_for(self.record),
+            &self.record.result,
+            self.chars,
+        )
+    }
+
+    fn as_checked(&self) -> String {
+        let asked = if self.carried_from_an_earlier_turn {
+            asked_for(self.record)
+        } else {
+            String::new()
+        };
+        rendered(self.index, &asked, &self.record.result, self.chars)
+            .trim_start()
+            .to_owned()
+    }
+}
+
+fn shown_of<'a>(carried: &'a [ToolRecord], fetched: &'a [ToolRecord]) -> Vec<Shown<'a>> {
+    let carried_then_fetched: Vec<&ToolRecord> = carried.iter().chain(fetched).collect();
+    let first = first_shown(&carried_then_fetched);
+    let chars_each = MAX_CHARS_PER_RENDERED_TOOL_RESULT
+        .min(MAX_CHARS_OF_TOOL_RESULTS_SHOWN_AT_ONCE / (carried_then_fetched.len() - first).max(1));
     carried_then_fetched
         .into_iter()
         .enumerate()
-        .skip(first_rendered)
+        .skip(first)
+        .map(|(index, record)| Shown {
+            index,
+            record,
+            carried_from_an_earlier_turn: index < carried.len(),
+            chars: chars_each,
+        })
+        .collect()
 }
 
-fn fetched_recently(record: &Value, now: chrono::DateTime<Utc>) -> bool {
-    ToolRecord::read(record)
-        .and_then(|record| record.fetched_at)
-        .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
-        .is_some_and(|at| now - at.with_timezone(&Utc) < CARRIED_MATERIAL_GOES_STALE_AFTER)
+fn fetched_recently(record: &ToolRecord, now: chrono::DateTime<Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&record.fetched_at)
+        .is_ok_and(|at| now - at.with_timezone(&Utc) < CARRIED_MATERIAL_GOES_STALE_AFTER)
 }
 
-fn still_fresh(records: Option<&Value>) -> Value {
-    let Some(records) = records.and_then(Value::as_array) else {
-        return Value::Null;
-    };
-    let now = Utc::now();
-    Value::Array(
-        records
-            .iter()
-            .filter(|record| fetched_recently(record, now))
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn rendered_prior_material(state: &Value) -> Option<String> {
-    let records = state.get(PRIOR_MATERIAL_STATE_KEY)?.as_array()?;
-    if records.is_empty() {
-        return None;
+fn asked_for(record: &ToolRecord) -> String {
+    if record.args.is_null() {
+        return String::new();
     }
-    let first = records.len().saturating_sub(RENDERED_TOOL_RESULTS);
-    Some(
-        records
-            .iter()
-            .enumerate()
-            .skip(first)
-            .map(|(index, record)| render_tool_result(index, record))
-            .collect(),
+    format!(
+        " (asked for {})",
+        truncated_to(&record.args.to_string(), MAX_CHARS_OF_WHAT_WAS_ASKED)
     )
 }
 
-fn render_tool_result(index: usize, record: &Value) -> String {
-    let bare_output_without_the_call = (None, record);
-    let (asked, result) = match record.get("result") {
-        Some(result) => (record.get("args"), result),
-        None => bare_output_without_the_call,
-    };
-    let asked = asked.map_or_else(String::new, |args| format!(" (asked for {args})"));
+fn rendered(index: usize, asked: &str, result: &Value, chars: usize) -> String {
     match result.get(TOOL_RESULT_ERROR_KEY).and_then(Value::as_str) {
         Some(error) => format!(
             "\n\nTool result {index}{asked} — ERROR: {}",
-            truncated(error)
+            truncated_to(error, chars)
         ),
         None => format!(
             "\n\nTool result {index}{asked}: {}",
-            truncated(&result.to_string())
+            truncated_to(&result.to_string(), chars)
         ),
     }
-}
-
-fn truncated(text: &str) -> String {
-    truncated_to(text, MAX_CHARS_PER_RENDERED_TOOL_RESULT)
 }
 
 fn truncated_to(text: &str, chars: usize) -> String {
@@ -490,33 +559,28 @@ impl TaskExecutor for LlmTaskExecutor {
         );
         let config = LlmNodeConfig::parse(config)?;
 
-        if let Some(fast_result) = self.try_fast_path(&config, state, idempotency_key).await {
+        let material = Material::of(state);
+        if let Some(fast_result) = self
+            .try_fast_path(&config, state, &material, idempotency_key)
+            .await
+        {
             return fast_result;
         }
 
-        let request = complete_request_for(&config, state, Mode::Loop);
+        let request = complete_request_for(&config, state, Mode::Loop, &material);
         let output = self.complete_with_retries(&request).await?;
-        let material = everything_fetched_so_far(state);
 
         Ok(self.checked_against(&request, &material, output).await)
     }
 }
 
-fn everything_fetched_so_far(state: &Value) -> Value {
-    let of = |key: &str| {
-        state
-            .get(key)
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let mut records = of(PRIOR_MATERIAL_STATE_KEY);
-    records.extend(of(TOOL_RESULT_STATE_KEY));
-    Value::Array(records)
-}
-
-fn complete_request_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> CompleteRequest {
-    let (system_prompt, user_prompt) = build_prompt_for(config, state, mode);
+fn complete_request_for(
+    config: &LlmNodeConfig,
+    state: &Value,
+    mode: Mode,
+    material: &Material,
+) -> CompleteRequest {
+    let (system_prompt, user_prompt) = prompt_for(config, state, mode, material);
     let response_format = config
         .tool_calling
         .then_some(EnumValue::Known(ResponseFormat::JsonObject));
@@ -545,27 +609,42 @@ impl LlmTaskExecutor {
         &self,
         config: &LlmNodeConfig,
         state: &Value,
+        material: &Material,
         idempotency_key: &str,
     ) -> Option<Result<Value, TaskError>> {
-        if !config.tool_calling || !no_tool_results_yet(state) {
+        if !config.tool_calling || !material.fetched.is_empty() {
             return None;
         }
         let question = ExecutionInput::in_state(state).question;
-        let prior = rendered_prior_material(state);
+        let prior = material.rendered_carried();
         match self
             .decide_fast_path(config, &question, prior.as_deref())
             .await
         {
             FastPath::ToolCall { call, decide_usage } => Some(
-                self.run_fast_tool_call(config, state, &call, &decide_usage, idempotency_key)
-                    .await,
+                self.run_fast_tool_call(
+                    config,
+                    state,
+                    material,
+                    &call,
+                    &decide_usage,
+                    idempotency_key,
+                )
+                .await,
             ),
             FastPath::ComposeOnly { tool, decide_usage } => Some(
-                self.compose_tool_call(config, state, &tool, &decide_usage, idempotency_key)
-                    .await,
+                self.compose_tool_call(
+                    config,
+                    state,
+                    material,
+                    &tool,
+                    &decide_usage,
+                    idempotency_key,
+                )
+                .await,
             ),
             FastPath::FromMaterial { decide_usage } => Some(
-                self.answer_from_material(config, state, &decide_usage)
+                self.answer_from_material(config, state, material, &decide_usage)
                     .await,
             ),
             FastPath::Decline { decide_usage } => Some(Ok(decline(config, &decide_usage))),
@@ -576,14 +655,15 @@ impl LlmTaskExecutor {
         &self,
         config: &LlmNodeConfig,
         state: &Value,
+        material: &Material,
         decide_usage: &Value,
     ) -> Result<Value, TaskError> {
-        let material = still_fresh(state.get(PRIOR_MATERIAL_STATE_KEY));
-        if material.as_array().is_none_or(Vec::is_empty) {
+        let material = material.only_what_was_carried_and_is_still_fresh();
+        if material.carried.is_empty() {
             tracing::info!("what the earlier turn found has gone stale, declining instead");
             return Ok(decline(config, decide_usage));
         }
-        let request = complete_request_for(config, state, Mode::FromMaterial);
+        let request = complete_request_for(config, state, Mode::FromMaterial, &material);
         let output = self.complete_with_retries(&request).await?;
         let output = self.checked_against(&request, &material, output).await;
         Ok(merge_usage(decide_usage, without_tool_call(output)))
@@ -592,7 +672,7 @@ impl LlmTaskExecutor {
     async fn checked_against(
         &self,
         request: &CompleteRequest,
-        material: &Value,
+        material: &Material,
         output: Value,
     ) -> Value {
         let faults = match self.faults_in(material, &output).await {
@@ -615,7 +695,7 @@ impl LlmTaskExecutor {
         self.second_reply_checked_against(material, second).await
     }
 
-    async fn second_reply_checked_against(&self, material: &Value, second: Value) -> Value {
+    async fn second_reply_checked_against(&self, material: &Material, second: Value) -> Value {
         match self.faults_in(material, &second).await {
             Check::Ran(again) if !again.sound() => {
                 tracing::warn!(
@@ -655,9 +735,10 @@ impl LlmTaskExecutor {
         &self,
         config: &LlmNodeConfig,
         state: &Value,
+        material: &Material,
         tool: &str,
     ) -> Result<Value, TaskError> {
-        let request = complete_request_for(config, state, Mode::ComposeOnly);
+        let request = complete_request_for(config, state, Mode::ComposeOnly, material);
         let spent = self.complete_with_retries(&request).await?;
         if composed_call(&spent).is_some() {
             return Ok(spent);
@@ -727,7 +808,7 @@ impl LlmTaskExecutor {
             .map_or("", |tool| tool.input_schema_json.as_str())
     }
 
-    async fn faults_in(&self, material: &Value, output: &Value) -> Check {
+    async fn faults_in(&self, material: &Material, output: &Value) -> Check {
         let Some(reply) = output.get("reply").and_then(Value::as_str).filter(|reply| {
             !reply.is_empty() && output.get("tool_call").is_none_or(Value::is_null)
         }) else {
@@ -757,11 +838,12 @@ impl LlmTaskExecutor {
         &self,
         config: &LlmNodeConfig,
         state: &Value,
+        material: &Material,
         tool: &str,
         decide_usage: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TaskError> {
-        let spent = self.composed(config, state, tool).await?;
+        let spent = self.composed(config, state, material, tool).await?;
         let Some(call) = composed_call(&spent).filter(|call| in_catalog(config, call)) else {
             tracing::warn!(
                 tool,
@@ -778,34 +860,41 @@ impl LlmTaskExecutor {
         if let Some(asking) = self.asked_for_instead(config, state, &call).await {
             return Ok(merge_usage(decide_usage, merge_usage(&spent, asking)));
         }
-        let result = self.dispatch_tool_fast(&call, idempotency_key).await;
-        let state_with_result =
-            state_with_extra_tool_result(state, tool_record(&call, result.clone()));
-        let request = complete_request_for(config, &state_with_result, Mode::Loop);
+        let output = self
+            .answered_with_the_lookup(config, state, material, &call, idempotency_key)
+            .await?;
+        Ok(merge_usage(decide_usage, merge_usage(&spent, output)))
+    }
+
+    async fn answered_with_the_lookup(
+        &self,
+        config: &LlmNodeConfig,
+        state: &Value,
+        material: &Material,
+        call: &ToolCall,
+        idempotency_key: &str,
+    ) -> Result<Value, TaskError> {
+        let record = looked_up(call, self.dispatch_tool_fast(call, idempotency_key).await);
+        let material = material.with_lookup(record.clone());
+        let request = complete_request_for(config, state, Mode::Loop, &material);
         let output = self.complete_with_retries(&request).await?;
-        let material = everything_fetched_so_far(&state_with_result);
         let output = self.checked_against(&request, &material, output).await;
-        let output = merge_usage(decide_usage, merge_usage(&spent, output));
-        Ok(attach_fast_tool_call(output, &call, result))
+        Ok(attach_fast_tool_call(output, &record))
     }
 
     async fn run_fast_tool_call(
         &self,
         config: &LlmNodeConfig,
         state: &Value,
+        material: &Material,
         call: &ToolCall,
         decide_usage: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TaskError> {
-        let result = self.dispatch_tool_fast(call, idempotency_key).await;
-        let state_with_result =
-            state_with_extra_tool_result(state, tool_record(call, result.clone()));
-        let request = complete_request_for(config, &state_with_result, Mode::Loop);
-        let output = self.complete_with_retries(&request).await?;
-        let material = everything_fetched_so_far(&state_with_result);
-        let output = self.checked_against(&request, &material, output).await;
-        let output = merge_usage(decide_usage, output);
-        Ok(attach_fast_tool_call(output, call, result))
+        let output = self
+            .answered_with_the_lookup(config, state, material, call, idempotency_key)
+            .await?;
+        Ok(merge_usage(decide_usage, output))
     }
 
     async fn decide_fast_path(
@@ -875,9 +964,9 @@ fn decide_usage_value(decided: &DecideResponse) -> Value {
     json!({"usage": {"tokens_in": decided.tokens_in, "tokens_out": decided.tokens_out}})
 }
 
-fn attach_fast_tool_call(mut output: Value, call: &ToolCall, result: Value) -> Value {
+fn attach_fast_tool_call(mut output: Value, record: &ToolRecord) -> Value {
     if let Some(object) = output.as_object_mut() {
-        object.insert(FAST_TOOL_CALL_FIELD.to_owned(), tool_record(call, result));
+        object.insert(FAST_TOOL_CALL_FIELD.to_owned(), record.to_json());
     }
     output
 }
@@ -895,29 +984,8 @@ fn tool_result_value(response: &ExecuteResponse) -> Value {
     json!({ TOOL_RESULT_ERROR_KEY: message })
 }
 
-fn no_tool_results_yet(state: &Value) -> bool {
-    state
-        .get(TOOL_RESULT_STATE_KEY)
-        .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty)
-}
-
-fn tool_record(call: &ToolCall, result: Value) -> Value {
-    ToolRecord::of(call, result, Utc::now().to_rfc3339()).to_json()
-}
-
-fn state_with_extra_tool_result(state: &Value, result: Value) -> Value {
-    let mut state = state.clone();
-    let mut results: Vec<Value> = state
-        .get(TOOL_RESULT_STATE_KEY)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    results.push(result);
-    if let Some(object) = state.as_object_mut() {
-        object.insert(TOOL_RESULT_STATE_KEY.to_owned(), Value::Array(results));
-    }
-    state
+fn looked_up(call: &ToolCall, result: Value) -> ToolRecord {
+    ToolRecord::of(call, result, Utc::now().to_rfc3339())
 }
 
 fn decide_request(
@@ -1120,22 +1188,8 @@ fn instructed(id: &str, instructions: Value) -> Option<Question> {
     Some(question)
 }
 
-fn what_came_back(material: &Value) -> Vec<String> {
-    let records: Vec<&Value> = material
-        .as_array()
-        .map_or_else(|| vec![material], |records| records.iter().collect());
-    let first_read = records.len().saturating_sub(RENDERED_TOOL_RESULTS);
-    records
-        .into_iter()
-        .enumerate()
-        .skip(first_read)
-        .map(|(index, record)| {
-            let without_what_was_asked = record.get("result").unwrap_or(record);
-            render_tool_result(index, without_what_was_asked)
-                .trim_start()
-                .to_owned()
-        })
-        .collect()
+fn what_came_back(material: &Material) -> Vec<String> {
+    material.shown().iter().map(Shown::as_checked).collect()
 }
 
 fn each_within(texts: &[String], bytes: usize) -> Value {
@@ -1147,7 +1201,7 @@ fn each_within(texts: &[String], bytes: usize) -> Value {
     )
 }
 
-fn state_the_decider_takes(material: &Value, reply: &str) -> Option<Value> {
+fn state_the_decider_takes(material: &Material, reply: &str) -> Option<Value> {
     let read = what_came_back(material);
     let mut share = read.iter().map(String::len).max().unwrap_or(0);
     for _ in 0..TRIES_TO_FIT_THE_MATERIAL {
@@ -1163,7 +1217,7 @@ fn state_the_decider_takes(material: &Value, reply: &str) -> Option<Value> {
     None
 }
 
-fn reply_check_request(material: &Value, reply: &str) -> Option<DecideRequest> {
+fn reply_check_request(material: &Material, reply: &str) -> Option<DecideRequest> {
     let state = state_the_decider_takes(material, reply)?;
     let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
     request.questions = vec![
@@ -1548,7 +1602,7 @@ mod tests {
 
     #[test]
     fn build_prompt_folds_prior_tool_results_into_the_user_prompt() {
-        let state = json!({"question": "what is it?", "tool_result": ["62F, fog"]});
+        let state = json!({"question": "what is it?", "tool_result": [a_lookup_that_returned(json!("62F, fog")).to_json()]});
         let (_, user) = build_prompt(&config_of(json!({})), &state);
         assert!(user.contains("what is it?"));
         assert!(user.contains("62F, fog"));
@@ -1557,7 +1611,7 @@ mod tests {
     #[test]
     fn build_prompt_renders_only_a_bounded_tail_of_the_tool_result_log() {
         let results: Vec<Value> = (0..RENDERED_TOOL_RESULTS + 3)
-            .map(|index| json!(format!("result-{index}")))
+            .map(|index| a_lookup_that_returned(json!(format!("result-{index}"))).to_json())
             .collect();
         let last_index = results.len() - 1;
         let state = json!({"question": "q", "tool_result": results});
@@ -1579,7 +1633,7 @@ mod tests {
 
     #[test]
     fn build_prompt_truncates_one_oversized_tool_result() {
-        let state = json!({"question": "q", "tool_result": ["x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT * 2)]});
+        let state = json!({"question": "q", "tool_result": [a_lookup_that_returned(json!("x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT * 2))).to_json()]});
 
         let (_, user) = build_prompt(&config_of(json!({})), &state);
 
@@ -1596,10 +1650,10 @@ mod tests {
         let second_page = "beta ".repeat(900);
         let state = json!({
             "question": "q",
-            "tool_result": [[
+            "tool_result": [a_lookup_that_returned(json!([
                 {"title": "First", "url": "https://a.example", "snippet": "s", "text": first_page},
                 {"title": "Second", "url": "https://b.example", "snippet": "s", "text": second_page},
-            ]],
+            ])).to_json()],
         });
 
         let (_, user) = build_prompt(&config_of(json!({})), &state);
@@ -1631,16 +1685,266 @@ mod tests {
         }
     }
 
+    fn a_lookup_that_returned(result: Value) -> ToolRecord {
+        static EACH_ITS_OWN_STEP: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(0);
+        let step = EACH_ITS_OWN_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        a_lookup_in_step(
+            &(Utc::now() + chrono::TimeDelta::microseconds(step)).to_rfc3339(),
+            json!({}),
+            result,
+        )
+    }
+
+    fn a_lookup_in_step(fetched_at: &str, args: Value, result: Value) -> ToolRecord {
+        ToolRecord {
+            name: "weather_now".to_owned(),
+            args,
+            result,
+            fetched_at: fetched_at.to_owned(),
+        }
+    }
+
+    fn cut_that_came_back(checked: &str) -> &str {
+        checked
+            .split_once(": ")
+            .map(|(_, cut)| cut)
+            .expect("every entry names its index before what came back")
+    }
+
     #[test]
-    fn a_fetched_result_far_over_the_cap_still_leaves_a_state_the_decider_would_take() {
-        let one_ordinary_article = json!({
-            "name": "web_fetch",
-            "args": {"url": "https://example.com/a"},
-            "result": {"text": "x".repeat(80_000)},
+    fn every_lookup_of_a_batch_is_shown_and_the_batch_shares_the_usual_total() {
+        let earlier = a_lookup_that_returned(json!("an earlier lookup"));
+        let batch_step = Utc::now().to_rfc3339();
+        let batch: Vec<ToolRecord> = (0..8)
+            .map(|city| {
+                a_lookup_in_step(
+                    &batch_step,
+                    json!({"place": format!("city-{city}")}),
+                    json!(format!(
+                        "{city}{}",
+                        "x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT)
+                    )),
+                )
+            })
+            .collect();
+        let mut records = vec![earlier.to_json()];
+        records.extend(batch.iter().map(ToolRecord::to_json));
+        let state = json!({"question": "q", "tool_result": records});
+
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+
+        for city in 0..8 {
+            assert!(
+                user.contains(&format!("city-{city}")),
+                "a lookup of the latest step was hidden from the model: city-{city}"
+            );
+        }
+        assert!(!user.contains("an earlier lookup"), "{user}");
+        assert!(
+            user.chars().count()
+                < MAX_CHARS_OF_TOOL_RESULTS_SHOWN_AT_ONCE
+                    + 8 * (MAX_CHARS_OF_WHAT_WAS_ASKED + TRUNCATION_MARK.len() + 64),
+            "a batch shares the total a window of single lookups gets, it does not multiply it"
+        );
+    }
+
+    #[test]
+    fn the_check_cuts_each_lookup_of_a_batch_exactly_where_the_prompt_cut_it() {
+        let batch_step = Utc::now().to_rfc3339();
+        let batch: Vec<ToolRecord> = (0..8)
+            .map(|city| {
+                a_lookup_in_step(
+                    &batch_step,
+                    json!({"place": format!("city-{city}")}),
+                    json!("y".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT)),
+                )
+            })
+            .collect();
+        let state = json!({"question": "q", "tool_result": batch.iter().map(ToolRecord::to_json).collect::<Vec<_>>()});
+
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+        let checked = what_came_back(&Material::of(&state));
+
+        assert_eq!(
+            checked.len(),
+            8,
+            "the check reads every lookup the model saw"
+        );
+        for entry in &checked {
+            let cut = cut_that_came_back(entry);
+            assert!(
+                user.contains(&format!(": {cut}")),
+                "the check read a different cut than the prompt showed"
+            );
+            assert_eq!(
+                cut.chars().count(),
+                MAX_CHARS_OF_TOOL_RESULTS_SHOWN_AT_ONCE / 8 + TRUNCATION_MARK.chars().count(),
+                "each of eight lookups gets an eighth of the total, cut with the mark"
+            );
+        }
+    }
+
+    #[test]
+    fn the_already_found_path_shows_and_checks_the_same_fresh_records_under_the_same_indexes() {
+        let an_hour_ago = (Utc::now() - chrono::TimeDelta::hours(1)).to_rfc3339();
+        let stale = a_lookup_in_step(&an_hour_ago, json!({"place": "Osaka"}), json!("31C"));
+        let fresh = a_lookup_that_returned(json!("22C"));
+        let state = json!({
+            "question": "and the temperature?",
+            PRIOR_MATERIAL_STATE_KEY: [stale.to_json(), fresh.to_json()],
         });
 
-        let request = reply_check_request(&json!([one_ordinary_article]), "22.11 degrees")
-            .expect("the guard still has a request to send");
+        let (_, user) = build_prompt_for(&config_of(json!({})), &state, Mode::FromMaterial);
+        let checked =
+            what_came_back(&Material::of(&state).only_what_was_carried_and_is_still_fresh());
+
+        assert!(
+            !user.contains("31C") && !user.contains("Osaka"),
+            "material gone stale is not answered from, so the model is not shown it: {user}"
+        );
+        assert_eq!(checked.len(), 1, "{checked:?}");
+        assert!(
+            checked[0].starts_with("Tool result 0") && user.contains("Tool result 0"),
+            "the prompt and the check number the same record the same way: {user} / {checked:?}"
+        );
+        assert!(checked[0].contains("22C"), "{checked:?}");
+    }
+
+    #[test]
+    fn what_was_asked_for_is_bounded_and_says_where_it_was_cut() {
+        let over_asked = a_lookup_in_step(
+            &Utc::now().to_rfc3339(),
+            json!({"calls": "z".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT * 4)}),
+            json!({"error": "one turn may call at most 8 tools at once, got 400"}),
+        );
+        let state = json!({"question": "q", PRIOR_MATERIAL_STATE_KEY: [over_asked.to_json()]});
+
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+        let checked = what_came_back(&Material::of(&state)).join("");
+
+        for read in [&user, &checked] {
+            assert!(
+                read.matches('z').count() <= MAX_CHARS_OF_WHAT_WAS_ASKED,
+                "every requested call reached the prompt uncut"
+            );
+            assert!(
+                read.contains(&format!("{TRUNCATION_MARK})")),
+                "what was asked for says where it was cut: {read}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_result_stored_before_records_existed_is_shown_without_an_empty_request() {
+        let state = json!({"question": "q", "tool_result": ["62F, fog"]});
+
+        let (_, user) = build_prompt(&config_of(json!({})), &state);
+
+        assert!(
+            user.contains(r#"Tool result 0: "62F, fog""#),
+            "an execution in flight at the upgrade still sees what it fetched: {user}"
+        );
+    }
+
+    #[test]
+    fn a_fast_lookup_reaches_a_follow_up_fresh_and_showing_what_was_asked() {
+        let call = ToolCall {
+            name: "weather_now".to_owned(),
+            args: json!({"place": "Bishkek"}),
+        };
+        let record = looked_up(&call, json!({"temp": 13.11, "humidity": 64}));
+        let llm_output =
+            attach_fast_tool_call(json!({"tool_call": null, "reply": "13.11"}), &record);
+        let turn = engine_core::Execution {
+            id: engine_core::ExecutionId(uuid::Uuid::new_v4()),
+            graph_id: engine_core::GraphId("agent".to_owned()),
+            graph_version: 1,
+            user_id: None,
+            status: engine_core::Status::Running,
+            current_nodes: vec![engine_core::ActiveNode::plain(engine_core::NodeId(
+                "llm".to_owned(),
+            ))],
+            state: json!({"question": "what is the weather in Bishkek?"}),
+            iteration: 0,
+            max_iterations: 10,
+            deadline: None,
+            budget: engine_core::Budget::new(10_000, 100, std::time::Duration::from_secs(3600)),
+        };
+        let (earlier_turn, _) = engine_core::step(
+            &engine_core::agent_graph(),
+            turn,
+            vec![engine_core::NodeOutput {
+                node: engine_core::ActiveNode::plain(engine_core::NodeId("llm".to_owned())),
+                result: Ok(llm_output),
+            }],
+            Utc::now(),
+        );
+        let follow_up = json!({
+            "question": "which place was that reading for?",
+            PRIOR_MATERIAL_STATE_KEY: crate::service::carried_records(&earlier_turn.state),
+        });
+
+        assert_eq!(
+            Material::of(&follow_up)
+                .only_what_was_carried_and_is_still_fresh()
+                .carried,
+            vec![record],
+            "the fast lookup is carried whole and fresh, or the follow-up declines with the \
+             answer sitting in its state"
+        );
+        let shown = Material::of(&follow_up)
+            .rendered_carried()
+            .expect("the carried lookup is shown");
+        assert!(
+            shown.contains(r#"(asked for {"place":"Bishkek"})"#),
+            "which place the reading was for is only answerable if the model sees it: {shown}"
+        );
+    }
+
+    fn fetched_now(fetched: Vec<ToolRecord>) -> Material {
+        Material {
+            carried: Vec::new(),
+            fetched,
+        }
+    }
+
+    #[test]
+    fn what_an_earlier_turn_asked_for_is_part_of_what_a_follow_up_can_answer_from() {
+        let earlier = looked_up(
+            &ToolCall {
+                name: "weather_now".to_owned(),
+                args: json!({"place": "Tokyo"}),
+            },
+            json!({"values": [{"value": {"humidity": 93}}]}),
+        );
+        let material = Material {
+            carried: vec![earlier],
+            fetched: Vec::new(),
+        };
+
+        let checked = what_came_back(&material).join("\n");
+
+        assert!(
+            checked.contains("Tokyo"),
+            "asked which place a reading was taken for, the answer is what that earlier lookup \
+             asked for — the conversation established it, the model did not invent it: {checked}"
+        );
+    }
+
+    #[test]
+    fn a_fetched_result_far_over_the_cap_still_leaves_a_state_the_decider_would_take() {
+        let one_ordinary_article = looked_up(
+            &ToolCall {
+                name: "web_fetch".to_owned(),
+                args: json!({"url": "https://example.com/a"}),
+            },
+            json!({"text": "x".repeat(80_000)}),
+        );
+
+        let request =
+            reply_check_request(&fetched_now(vec![one_ordinary_article]), "22.11 degrees")
+                .expect("the guard still has a request to send");
 
         let state = serde_json::to_value(&request).expect("a request serializes")["state"].clone();
         let bytes = state.to_string().len();
@@ -1666,7 +1970,7 @@ mod tests {
             "{}{near_the_end_of_what_the_model_read}",
             "x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT - 200)
         );
-        let material = json!([{"name": "kb_search", "args": {}, "result": {"text": passage}}]);
+        let material = fetched_now(vec![a_lookup_that_returned(json!({"text": passage}))]);
 
         let state = state_the_decider_takes(&material, "five minutes").expect("it fits");
 
@@ -1681,11 +1985,11 @@ mod tests {
 
     #[test]
     fn four_full_results_are_all_still_read_within_the_limit() {
-        let records: Vec<Value> = (0..RENDERED_TOOL_RESULTS)
-            .map(|index| json!({"result": {"text": format!("{index}{}", "y".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT))}}))
+        let records: Vec<ToolRecord> = (0..RENDERED_TOOL_RESULTS)
+            .map(|index| a_lookup_that_returned(json!({"text": format!("{index}{}", "y".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT))})))
             .collect();
 
-        let state = state_the_decider_takes(&json!(records), "a reply").expect("it fits");
+        let state = state_the_decider_takes(&fetched_now(records), "a reply").expect("it fits");
 
         assert!(state.to_string().len() <= STATE_BYTES_BEYOND_WHICH_THE_DECIDER_REFUSES);
         assert_eq!(
@@ -1698,7 +2002,9 @@ mod tests {
 
     #[test]
     fn the_material_a_check_reads_says_where_it_was_cut() {
-        let material = json!([{"result": "x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT * 3)}]);
+        let material = fetched_now(vec![a_lookup_that_returned(json!(
+            "x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT * 3)
+        ))]);
 
         let state = state_the_decider_takes(&material, "a reply").expect("it fits");
 
@@ -1720,9 +2026,7 @@ mod tests {
             name: "kb_search".to_owned(),
             args: json!({"query": "which courses exist?"}),
         };
-        let state = state_with_extra_tool_result(&json!({}), tool_record(&call, json!(hits)));
-
-        let read = what_came_back(&everything_fetched_so_far(&state));
+        let read = what_came_back(&fetched_now(vec![looked_up(&call, json!(hits))]));
 
         assert_eq!(
             read.len(),
@@ -1742,12 +2046,12 @@ mod tests {
             name: "weather_now".to_owned(),
             args: json!({"place": "Bishkek"}),
         };
-        let state = state_with_extra_tool_result(
-            &json!({}),
-            tool_record(&call, json!({"values": [{"value": {"temp": 13.11}}]})),
-        );
+        let material = Material::of(&json!({})).with_lookup(looked_up(
+            &call,
+            json!({"values": [{"value": {"temp": 13.11}}]}),
+        ));
 
-        let checked = what_came_back(&everything_fetched_so_far(&state)).join("\n");
+        let checked = what_came_back(&material).join("\n");
 
         assert!(
             checked.contains("13.11"),
@@ -1763,12 +2067,12 @@ mod tests {
 
     #[test]
     fn a_check_reads_no_more_of_the_log_than_the_prompt_showed() {
-        let records: Vec<Value> = (0..RENDERED_TOOL_RESULTS + 3)
-            .map(|index| json!({"result": format!("result-{index}")}))
+        let records: Vec<ToolRecord> = (0..RENDERED_TOOL_RESULTS + 3)
+            .map(|index| a_lookup_that_returned(json!(format!("result-{index}"))))
             .collect();
 
         assert_eq!(
-            what_came_back(&json!(records)).len(),
+            what_came_back(&fetched_now(records)).len(),
             RENDERED_TOOL_RESULTS,
             "a reply can only be grounded in the material the model was shown"
         );
@@ -1977,7 +2281,7 @@ mod tests {
     fn build_prompt_renders_a_tool_error_observation_so_the_model_can_recover() {
         let state = json!({
             "question": "what is it?",
-            "tool_result": [{"error": "error sending request for url (https://example.invalid/)"}],
+            "tool_result": [a_lookup_that_returned(json!({"error": "error sending request for url (https://example.invalid/)"})).to_json()],
         });
         let (system, user) = build_prompt(&config_of(json!({"tool_calling": true})), &state);
         assert!(user.contains("ERROR"), "{user}");

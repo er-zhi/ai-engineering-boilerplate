@@ -2,9 +2,7 @@
 
 use chrono::Utc;
 use engine_core::{ActiveNode, Budget, CHECKPOINT_SCHEMA_VERSION, Checkpoint, Graph};
-use engine_core::{
-    PRIOR_MATERIAL_STATE_KEY, RENDERED_TOOL_RESULTS, TOOL_RESULT_STATE_KEY, ToolRecord,
-};
+use engine_core::{PRIOR_MATERIAL_STATE_KEY, TOOL_RESULT_STATE_KEY, ToolRecord, first_shown};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
@@ -76,46 +74,16 @@ impl Service {
     }
 }
 
-fn carried_records(state: &Value) -> Vec<Value> {
-    let of = |key: &str| {
-        state
-            .get(key)
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let mut records = of(PRIOR_MATERIAL_STATE_KEY);
-    records.extend(of(TOOL_RESULT_STATE_KEY));
-    prefer_the_record_that_carries_the_call(&mut records, state);
-    records.retain(reached_its_source);
-    let oldest_beyond_what_a_follow_up_inherits =
-        records.len().saturating_sub(RENDERED_TOOL_RESULTS);
-    records.split_off(oldest_beyond_what_a_follow_up_inherits)
-}
-
-fn prefer_the_record_that_carries_the_call(records: &mut Vec<Value>, state: &Value) {
-    let Some(with_the_call) = state
-        .get(engine_core::LLM_STATE_KEY)
-        .and_then(|llm| llm.get(engine_core::FAST_TOOL_CALL_FIELD))
-    else {
-        return;
-    };
-    let Some(full) = ToolRecord::read(with_the_call) else {
-        return;
-    };
-    let as_json = full.to_json();
-    let same_fetch = |record: &&mut Value| match ToolRecord::read(record) {
-        Some(typed) => typed.result == full.result,
-        None => **record == full.result,
-    };
-    match records.iter_mut().find(same_fetch) {
-        Some(written_without_the_call) => *written_without_the_call = as_json,
-        None => records.push(as_json),
-    }
-}
-
-fn reached_its_source(record: &Value) -> bool {
-    ToolRecord::read(record).is_none_or(|record| record.reached_its_source())
+pub(crate) fn carried_records(state: &Value) -> Vec<Value> {
+    let mut records = ToolRecord::all_under(state, PRIOR_MATERIAL_STATE_KEY);
+    records.extend(ToolRecord::all_under(state, TOOL_RESULT_STATE_KEY));
+    records.retain(ToolRecord::reached_its_source);
+    let oldest_beyond_what_a_follow_up_inherits = first_shown(&records);
+    records
+        .split_off(oldest_beyond_what_a_follow_up_inherits)
+        .iter()
+        .map(ToolRecord::to_json)
+        .collect()
 }
 
 fn execution_input(input_json: &str) -> Result<Value, EngineError> {

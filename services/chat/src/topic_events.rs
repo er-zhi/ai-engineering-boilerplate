@@ -16,22 +16,27 @@ impl TopicManager {
         self.publish_all(vec![event]).await;
     }
 
-    /// Tells the live subscribers first and writes the log second, and writes however many events
-    /// there are in one statement.
-    ///
-    /// Nobody rebuilds their own transcript from this log: an answer is durable once
-    /// `result_summary` is on its topic row, which a reload reads. The log is for replaying what
-    /// connected clients were told, so a subscriber hearing it a few milliseconds before it is
-    /// written is not a difference anyone can observe — while waiting for the write is
-    /// milliseconds the person spends staring at an answer the system already has.
-    ///
-    /// One statement rather than one per event, because `stored_events` replays in `Id` order: a
-    /// single multi-row insert keeps that order without the second event waiting for the first.
     pub(crate) async fn publish_all(&self, events: Vec<TopicEvent>) {
-        for event in &events {
+        if events
+            .iter()
+            .any(|event| event.kind.has_no_record_but_the_event_log())
+        {
+            self.store_events_logging_failure(&events).await;
+            self.tell_live_subscribers(&events);
+        } else {
+            self.tell_live_subscribers(&events);
+            self.store_events_logging_failure(&events).await;
+        }
+    }
+
+    fn tell_live_subscribers(&self, events: &[TopicEvent]) {
+        for event in events {
             self.events.publish(event.clone());
         }
-        if let Err(error) = self.store_events(&events).await {
+    }
+
+    async fn store_events_logging_failure(&self, events: &[TopicEvent]) {
+        if let Err(error) = self.store_events(events).await {
             tracing::error!(%error, count = events.len(), "failed to persist chat events");
         }
     }
@@ -197,5 +202,38 @@ mod tests {
             progress, 2,
             "the second watcher must not append the same Engine events again: {replay:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_notice_with_no_other_record_is_already_in_the_log_when_a_live_subscriber_hears_it() {
+        for kind in [
+            TopicEventKind::ClarificationNeeded,
+            TopicEventKind::EngineBusy,
+        ] {
+            let (_test, manager, _fake) = manager_with().await;
+            let session = manager
+                .session_of_user(Uuid::new_v4())
+                .await
+                .expect("session");
+            let mut live = manager.subscribe();
+
+            manager
+                .publish(TopicEvent::session_wide(session.id, kind))
+                .await;
+
+            let heard = live
+                .recv()
+                .await
+                .expect("the live subscriber hears the notice");
+            assert_eq!(heard.kind, kind);
+            let replay = manager.stored_events(&session).await.expect("replay");
+            assert!(
+                replay
+                    .iter()
+                    .any(|stored| stored.event_id == heard.event_id),
+                "{kind:?} must be written before it is sent live, or a client that replays in \
+                 between never sees it: {replay:?}"
+            );
+        }
     }
 }

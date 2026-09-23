@@ -262,7 +262,8 @@ mod tests {
             .await
             .expect("execute");
 
-        assert_eq!(output, json!({}));
+        assert_eq!(output[0]["name"], json!("web_search"));
+        assert_eq!(output[0]["result"], json!({}));
     }
 
     #[tokio::test]

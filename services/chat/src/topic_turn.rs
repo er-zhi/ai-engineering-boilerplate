@@ -314,6 +314,7 @@ fn summaries(topics: &[topic::Model]) -> Vec<TopicSummary> {
             title: topic.title.clone(),
             status: topic.status,
             result_summary: topic.result_summary.clone(),
+            last_active_at: topic.updated_at,
         })
         .collect()
 }

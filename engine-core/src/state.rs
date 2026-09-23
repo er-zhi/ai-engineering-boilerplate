@@ -1,4 +1,4 @@
-// Applies a node's output to execution state through one of three reducers.
+// Applies a node's output to execution state through one of four reducers.
 
 use serde_json::{Map, Value};
 
@@ -19,6 +19,15 @@ pub fn apply_reducer(state: &mut Value, key: &str, reducer: Reducer, value: Valu
             match entry {
                 Value::Array(items) => items.push(value),
                 other => *other = Value::Array(vec![other.take(), value]),
+            }
+        }
+        Reducer::AppendEach => {
+            let items = match value {
+                Value::Array(items) => items,
+                one => vec![one],
+            };
+            for item in items {
+                apply_reducer(state, key, Reducer::Append, item);
             }
         }
         Reducer::Merge => {
@@ -56,6 +65,34 @@ mod tests {
         let mut state = json!({});
         apply_reducer(&mut state, "messages", Reducer::Append, json!("hi"));
         assert_eq!(state, json!({"messages": ["hi"]}));
+    }
+
+    #[test]
+    fn append_each_adds_every_item_of_a_list_as_its_own_entry() {
+        let mut state = json!({"records": ["first"]});
+        apply_reducer(
+            &mut state,
+            "records",
+            Reducer::AppendEach,
+            json!(["second", "third"]),
+        );
+        assert_eq!(
+            state,
+            json!({"records": ["first", "second", "third"]}),
+            "several lookups made in one step are several entries, never one entry holding a list"
+        );
+    }
+
+    #[test]
+    fn append_each_adds_a_value_that_is_not_a_list_as_one_entry() {
+        let mut state = json!({});
+        apply_reducer(
+            &mut state,
+            "records",
+            Reducer::AppendEach,
+            json!({"one": 1}),
+        );
+        assert_eq!(state, json!({"records": [{"one": 1}]}));
     }
 
     #[test]

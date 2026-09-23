@@ -404,8 +404,10 @@ impl Service {
             slug,
             "tool execute (key logged, not enforced — no destructive side effect here yet, see the spec's Порты-equivalent note)"
         );
-        let Some(tool) = self.find_tool(caller, slug).await? else {
-            return Ok(ExecuteOutcome::Error(format!("no tool with slug {slug:?}")));
+        let Some(tool) = self.find_tool(caller, slug, Circulation::InUse).await? else {
+            return Ok(ExecuteOutcome::Error(
+                self.why_unavailable(caller, slug).await?,
+            ));
         };
         if crate::policy::check_policy(tool.risk) == crate::policy::PolicyDecision::RequiresApproval
         {
@@ -449,26 +451,46 @@ impl Service {
         )
     }
 
+    async fn why_unavailable(&self, caller: Option<Uuid>, slug: &str) -> Result<String, ToolError> {
+        let withdrawn = self
+            .find_tool(caller, slug, Circulation::Any)
+            .await?
+            .is_some();
+        Ok(if withdrawn {
+            format!("tool {slug:?} is not available")
+        } else {
+            format!("no tool with slug {slug:?}")
+        })
+    }
+
     async fn find_tool(
         &self,
         caller: Option<Uuid>,
         slug: &str,
+        circulation: Circulation,
     ) -> Result<Option<crate::entity::tool::Model>, ToolError> {
+        let named = |query: sea_orm::Select<Entity>| {
+            let query = query.filter(crate::entity::tool::Column::Slug.eq(slug));
+            match circulation {
+                Circulation::InUse => {
+                    query.filter(crate::entity::tool::Column::Status.eq(Status::Active))
+                }
+                Circulation::Any => query,
+            }
+        };
         if let Some(user_id) = caller {
-            let own = Entity::find()
-                .filter(crate::entity::tool::Column::UserId.eq(user_id))
-                .filter(crate::entity::tool::Column::Slug.eq(slug))
+            let own = named(Entity::find().filter(crate::entity::tool::Column::UserId.eq(user_id)))
                 .one(&self.db)
                 .await?;
             if own.is_some() {
                 return Ok(own);
             }
         }
-        Ok(Entity::find()
-            .filter(crate::entity::tool::Column::UserId.is_null())
-            .filter(crate::entity::tool::Column::Slug.eq(slug))
-            .one(&self.db)
-            .await?)
+        Ok(
+            named(Entity::find().filter(crate::entity::tool::Column::UserId.is_null()))
+                .one(&self.db)
+                .await?,
+        )
     }
 
     async fn run_system_tool(
@@ -566,6 +588,12 @@ impl Service {
             },
         )
     }
+}
+
+#[derive(Clone, Copy)]
+enum Circulation {
+    InUse,
+    Any,
 }
 
 fn claims_reserved_slug(user_id: Option<Uuid>, slug: &str) -> bool {
@@ -1200,11 +1228,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_users_unfinished_tool_does_not_shadow_the_system_tool_of_the_same_name() {
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
+        let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
+        let (test, service) = full_service_with(&llm_url, &kb_url).await;
+        seed_system_tools(&service, &test.db).await;
+        let user = Uuid::new_v4();
+        let system = Entity::find()
+            .filter(crate::entity::tool::Column::UserId.is_null())
+            .filter(crate::entity::tool::Column::Slug.eq(crate::slugs::KB_SEARCH))
+            .one(&test.db)
+            .await
+            .expect("query")
+            .expect("the system tool is seeded");
+        let mut draft: ActiveModel = system.into();
+        draft.id = sea_orm::ActiveValue::NotSet;
+        draft.user_id = Set(Some(user));
+        draft.status = Set(Status::Draft);
+        draft
+            .insert(&test.db)
+            .await
+            .expect("a draft of the user's own");
+
+        let outcome = service
+            .execute(
+                Some(user),
+                crate::slugs::KB_SEARCH,
+                r#"{"query": "borrow checker"}"#,
+                "e:kb_search:shadow",
+            )
+            .await
+            .expect("execute");
+
+        assert!(
+            matches!(outcome, ExecuteOutcome::Ok(_)),
+            "a tool the user has not finished is not in use, so the one in use by that name runs: \
+             {outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn execute_on_a_read_only_system_tool_runs_it() {
         let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
-        let (_test, service) = full_service_with(&llm_url, &kb_url).await;
-        seed_system_tools(&service).await;
+        let (test, service) = full_service_with(&llm_url, &kb_url).await;
+        seed_system_tools(&service, &test.db).await;
 
         let outcome = service
             .execute(
@@ -1223,8 +1291,8 @@ mod tests {
     async fn an_argument_the_tool_does_not_declare_is_refused_naming_the_one_it_takes() {
         let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
-        let (_test, service) = full_service_with(&llm_url, &kb_url).await;
-        seed_system_tools(&service).await;
+        let (test, service) = full_service_with(&llm_url, &kb_url).await;
+        seed_system_tools(&service, &test.db).await;
 
         let outcome = service
             .execute(
@@ -1263,13 +1331,12 @@ mod tests {
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         let user_id = Uuid::new_v4();
-        service
-            .create_tool(
-                Some(user_id),
-                a_tool("send_email", "Send Email", "Sends an email", Risk::Write),
-            )
-            .await
-            .expect("create");
+        create_listable_tool(
+            &service,
+            user_id,
+            a_tool("send_email", "Send Email", "Sends an email", Risk::Write),
+        )
+        .await;
 
         let outcome = service
             .execute(Some(user_id), "send_email", "{}", "e:mail:0")
@@ -1285,13 +1352,12 @@ mod tests {
         let kb_url = crate::tools::kb_client::test_support::serve_kb().await;
         let (_test, service) = full_service_with(&llm_url, &kb_url).await;
         let user_id = Uuid::new_v4();
-        service
-            .create_tool(
-                Some(user_id),
-                a_tool("custom_thing", "Custom", "d", Risk::ReadOnly),
-            )
-            .await
-            .expect("create");
+        create_listable_tool(
+            &service,
+            user_id,
+            a_tool("custom_thing", "Custom", "d", Risk::ReadOnly),
+        )
+        .await;
 
         let outcome = service
             .execute(Some(user_id), "custom_thing", "{}", "e:c:0")
@@ -1369,7 +1435,7 @@ mod tests {
             .expect("activate");
     }
 
-    async fn seed_system_tools(service: &Service) {
+    async fn seed_system_tools(service: &Service, db: &sea_orm::DatabaseConnection) {
         let mut kb_search = a_tool(
             crate::slugs::KB_SEARCH,
             "Knowledge base search",
@@ -1377,9 +1443,103 @@ mod tests {
             Risk::ReadOnly,
         );
         kb_search.input_schema = crate::args::input_schema::<crate::args::Search>();
-        service
+        let tool_id = service
             .create_tool(None, kb_search)
             .await
             .expect("seed kb_search");
+        activate_directly(db, tool_id).await;
+    }
+
+    async fn activate_directly(db: &sea_orm::DatabaseConnection, tool_id: i64) {
+        let row = Entity::find_by_id(tool_id)
+            .one(db)
+            .await
+            .expect("query")
+            .expect("row");
+        let mut active: ActiveModel = row.into();
+        active.status = Set(Status::Active);
+        active.update(db).await.expect("activate directly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_refuses_a_tool_that_was_never_activated() {
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
+        let (test, service) = service_with(&llm_url).await;
+        let tool_id = draft_tool(&service).await;
+        let row = crate::entity::tool::Entity::find_by_id(tool_id)
+            .one(&test.db)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.status, Status::Draft);
+
+        let outcome = service
+            .execute(Some(OWNER), "echo", "{}", "e:draft:0")
+            .await
+            .expect("execute");
+
+        let ExecuteOutcome::Error(message) = outcome else {
+            panic!("a tool that was never activated must not run: {outcome:?}");
+        };
+        assert!(message.contains("echo"), "{message}");
+        assert!(message.contains("not available"), "{message}");
+        assert!(!message.contains("no tool with slug"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_refuses_a_tool_that_was_withdrawn_after_being_active() {
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
+        let (test, service) = service_with(&llm_url).await;
+        let user_id = Uuid::new_v4();
+        create_listable_tool(
+            &service,
+            user_id,
+            a_tool("weather", "Weather", "Reports the weather", Risk::ReadOnly),
+        )
+        .await;
+        let active_row = crate::entity::tool::Entity::find()
+            .filter(crate::entity::tool::Column::Slug.eq("weather"))
+            .one(&test.db)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(active_row.status, Status::Active);
+        let mut withdrawing: ActiveModel = active_row.into();
+        withdrawing.status = Set(Status::Draft);
+        withdrawing.update(&test.db).await.expect("withdraw");
+
+        let outcome = service
+            .execute(Some(user_id), "weather", "{}", "e:weather:0")
+            .await
+            .expect("execute");
+
+        let ExecuteOutcome::Error(message) = outcome else {
+            panic!("a withdrawn tool must not run: {outcome:?}");
+        };
+        assert!(message.contains("weather"), "{message}");
+        assert!(message.contains("not available"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_still_runs_a_tool_that_is_active() {
+        let (llm_url, _completions) = serve_llm_counting_decisions(0.93).await;
+        let (_test, service) = service_with(&llm_url).await;
+        let user_id = Uuid::new_v4();
+        create_listable_tool(
+            &service,
+            user_id,
+            a_tool("custom_active", "Custom", "d", Risk::ReadOnly),
+        )
+        .await;
+
+        let outcome = service
+            .execute(Some(user_id), "custom_active", "{}", "e:active:0")
+            .await
+            .expect("execute");
+
+        assert!(
+            matches!(outcome, ExecuteOutcome::NotExecutable(_)),
+            "an active tool must reach execution instead of being refused as unavailable: {outcome:?}"
+        );
     }
 }

@@ -84,7 +84,14 @@ refusing or passing the wrong replies:
   judged ungrounded.
 - *Reading what was asked for.* With each record's arguments in the material, a weather question
   answered with the place name — the incident above — read as grounded, because the place was in
-  the arguments. What was asked for is not evidence of the answer.
+  the arguments. What this turn asked for is not evidence of the answer: it was composed this turn,
+  sometimes from the model's own knowledge ("the capital of Kyrgyzstan" became `Bishkek`).
+
+The arguments of a lookup carried from an earlier turn are the exception, and are read. Asked
+"which place was that reading taken for?", the answer is what that lookup asked for; with those
+arguments excluded, a correct "Tokyo" scored 0.03 and was refused three times in three. What an
+earlier turn asked for is something the conversation established, not something this reply
+invented.
 
 ## Reply: does it only undertake work
 

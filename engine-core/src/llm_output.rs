@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Borrow;
 
 pub const LLM_STATE_KEY: &str = "llm";
 pub const TOOL_RESULT_STATE_KEY: &str = "tool_result";
@@ -19,10 +20,9 @@ pub struct ToolRecord {
     pub name: String,
     #[serde(default)]
     pub args: Value,
-    #[serde(default)]
     pub result: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fetched_at: Option<String>,
+    #[serde(default)]
+    pub fetched_at: String,
 }
 
 impl ToolRecord {
@@ -32,13 +32,44 @@ impl ToolRecord {
             name: call.name.clone(),
             args: call.args.clone(),
             result,
-            fetched_at: Some(fetched_at),
+            fetched_at,
         }
     }
 
     #[must_use]
     pub fn read(stored: &Value) -> Option<Self> {
         serde_json::from_value(stored.clone()).ok()
+    }
+
+    #[must_use]
+    pub fn all_under(state: &Value, key: &str) -> Vec<Self> {
+        state
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|stored| {
+                        Self::read(stored)
+                            .unwrap_or_else(|| Self::stored_before_records_existed(stored))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn stored_before_records_existed(stored: &Value) -> Self {
+        Self {
+            name: String::new(),
+            args: Value::Null,
+            result: stored.clone(),
+            fetched_at: String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn made_in_the_same_step_as(&self, other: &Self) -> bool {
+        !self.fetched_at.is_empty() && self.fetched_at == other.fetched_at
     }
 
     #[must_use]
@@ -51,6 +82,18 @@ impl ToolRecord {
         self.result.get(TOOL_RESULT_ERROR_KEY).is_none()
     }
 }
+
+#[must_use]
+pub fn first_shown<R: Borrow<ToolRecord>>(records: &[R]) -> usize {
+    let latest_step = records
+        .chunk_by(|earlier, later| earlier.borrow().made_in_the_same_step_as(later.borrow()))
+        .next_back()
+        .map_or(0, <[R]>::len);
+    records
+        .len()
+        .saturating_sub(RENDERED_TOOL_RESULTS.max(latest_step))
+}
+
 const REPLY_FIELD: &str = "reply";
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -122,6 +165,70 @@ mod tests {
     fn a_state_with_no_llm_node_output_yet_reads_as_blank() {
         assert!(LlmOutput::in_state(&json!({})).is_blank());
         assert!(!LlmOutput::in_state(&json!({LLM_STATE_KEY: {"reply": "42"}})).is_blank());
+    }
+
+    fn fetched_at(at: &str) -> ToolRecord {
+        ToolRecord {
+            name: "weather_now".to_owned(),
+            args: json!({}),
+            result: json!({}),
+            fetched_at: at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn every_lookup_of_the_latest_step_is_shown_even_beyond_the_usual_window() {
+        let mut records = vec![fetched_at("2026-09-22T10:00:00Z")];
+        records.extend((0..RENDERED_TOOL_RESULTS + 2).map(|_| fetched_at("2026-09-22T10:01:00Z")));
+
+        assert_eq!(
+            first_shown(&records),
+            1,
+            "six cities looked up in one step are six records, and the model must see all six"
+        );
+    }
+
+    #[test]
+    fn the_window_over_single_lookups_stays_as_wide_as_it_always_was() {
+        let records: Vec<ToolRecord> = (0..RENDERED_TOOL_RESULTS + 3)
+            .map(|minute| fetched_at(&format!("2026-09-22T10:0{minute}:00Z")))
+            .collect();
+
+        assert_eq!(first_shown(&records), 3);
+    }
+
+    #[test]
+    fn a_result_stored_before_records_existed_is_still_read_as_what_came_back() {
+        let state = json!({"tool_result": [
+            "62F, fog",
+            {"error": "upstream down"},
+            {"name": "weather_now", "args": {"place": "Osh"}, "result": {"temp": 13}},
+        ]});
+
+        let records = ToolRecord::all_under(&state, "tool_result");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| &record.result)
+                .collect::<Vec<_>>(),
+            vec![
+                &json!("62F, fog"),
+                &json!({"error": "upstream down"}),
+                &json!({"temp": 13})
+            ],
+            "an execution checkpointed before the upgrade keeps every result it had already fetched"
+        );
+        assert_eq!(records[0].args, Value::Null);
+        assert!(!records[1].reached_its_source());
+        assert!(
+            records.iter().all(|record| record.fetched_at.is_empty()),
+            "nothing says when an old result was fetched, so it never passes as fresh"
+        );
+        assert!(
+            !records[0].made_in_the_same_step_as(&records[1]),
+            "every old entry was its own step"
+        );
     }
 
     #[test]
