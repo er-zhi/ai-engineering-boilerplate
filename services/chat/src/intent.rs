@@ -83,9 +83,11 @@ needs.
 further. \"what is the capital of Japan?\" then \"weather there?\" gives \"what is the weather in \
 the capital of Japan?\" — never \"in Tokyo\", which nobody said. Working out what they meant is \
 not your job, and working it out wrongly would be invisible from here.
-- A message can ask about the earlier answer itself rather than about its subject — \"where?\" \
-after a measurement asks which place it was for, not where that place is. Keep it a question about \
-the earlier answer, naming that answer's own words.
+- A bare question word — \"where?\", \"when?\", \"which one?\" — asks about the earlier lookup \
+itself, not about its subject. Rewrite it to ask that of the earlier question: after \"what is the \
+weather in Tokyo?\" answered \"22.49\", \"where?\" becomes \"which place was that weather \
+reading taken for?\". Never \"where is Tokyo?\", which asks about the subject, and never \"where \
+is 22.49?\", which asks about the figure.
 - If the earlier turns do not say what the reference points at, return the message unchanged.
 - Answer with the rewritten message and nothing else. No quotes, no explanation.
 ";
@@ -176,7 +178,7 @@ pub enum Routing {
     Act(Vec<Action>),
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct RawPlan {
     actions: Vec<serde_json::Value>,
 }
@@ -293,7 +295,12 @@ impl TopicIntent {
                     return Routing::Act(vec![Action::Continue { topic_id, question }]);
                 }
                 RouteOutcome::Fallback => {
-                    return Routing::Act(continue_focus_or_open_one_topic(topics, focus, message));
+                    let question = self
+                        .question_that_stands_alone(&decided.answers, topics, message)
+                        .await;
+                    return Routing::Act(continue_focus_or_open_one_topic(
+                        topics, focus, &question,
+                    ));
                 }
                 RouteOutcome::ConfidentNew => {}
             }
@@ -331,7 +338,11 @@ impl TopicIntent {
         topics: &[TopicSummary],
         message: &str,
     ) -> String {
-        if leans_on_the_conversation(answers, STANDS_ALONE_MESSAGE_ID) {
+        if noul_below(
+            answers,
+            STANDS_ALONE_MESSAGE_ID,
+            REWRITE_WHEN_STANDS_ALONE_BELOW,
+        ) {
             self.rewritten_against_the_conversation(topics, message)
                 .await
         } else {
@@ -458,9 +469,23 @@ impl TopicIntent {
 }
 
 fn split_judgement_questions(question_count: usize) -> Option<Vec<Question>> {
-    let mut asked = vec![covers_everything_question()?];
+    let mut asked = vec![noul_question(
+        COVERS_EVERYTHING_ID,
+        serde_json::json!(COVERS_EVERYTHING_INSTRUCTIONS),
+        COVERS_EVERYTHING_WHEN_TRUE,
+        COVERS_EVERYTHING_WHEN_FALSE,
+    )?];
     for at in 0..question_count {
-        asked.push(stands_alone_question(at)?);
+        let instructions_kept_in_order = serde_json::json!([
+            format!("About `questions[{at}]`, and nothing else:"),
+            STANDS_ALONE_INSTRUCTIONS,
+        ]);
+        asked.push(noul_question(
+            &format!("{STANDS_ALONE_PER_QUESTION_PREFIX}{at}"),
+            instructions_kept_in_order,
+            STANDS_ALONE_WHEN_TRUE,
+            STANDS_ALONE_WHEN_FALSE,
+        )?);
     }
     Some(asked)
 }
@@ -496,38 +521,6 @@ fn whole_message_scoped_to_title(message: &str, title: &str) -> String {
     format!("{message}\n\nAnswer only this part of it: {title}")
 }
 
-fn stands_alone_question_for_message() -> Option<Question> {
-    let mut question = instructed(
-        STANDS_ALONE_MESSAGE_ID,
-        serde_json::json!(STANDS_ALONE_MESSAGE_INSTRUCTIONS),
-    )?;
-    question.kind = Noul {
-        when_true: Some(STANDS_ALONE_WHEN_TRUE.to_owned()),
-        when_false: Some(STANDS_ALONE_WHEN_FALSE.to_owned()),
-        ..Default::default()
-    }
-    .into();
-    Some(question)
-}
-
-fn stands_alone_question(at: usize) -> Option<Question> {
-    let instructions_kept_in_order = serde_json::json!([
-        format!("About `questions[{at}]`, and nothing else:"),
-        STANDS_ALONE_INSTRUCTIONS,
-    ]);
-    let mut question = instructed(
-        &format!("{STANDS_ALONE_PER_QUESTION_PREFIX}{at}"),
-        instructions_kept_in_order,
-    )?;
-    question.kind = Noul {
-        when_true: Some(STANDS_ALONE_WHEN_TRUE.to_owned()),
-        when_false: Some(STANDS_ALONE_WHEN_FALSE.to_owned()),
-        ..Default::default()
-    }
-    .into();
-    Some(question)
-}
-
 fn answered_without_talking_about_itself(topic: &TopicSummary) -> bool {
     topic.status == Status::Completed
         && topic
@@ -557,20 +550,6 @@ fn recent_turns_newest_last(topics: &[TopicSummary]) -> Option<String> {
     }
     lines.reverse();
     Some(lines.join("\n"))
-}
-
-fn covers_everything_question() -> Option<Question> {
-    let mut question = instructed(
-        COVERS_EVERYTHING_ID,
-        serde_json::json!(COVERS_EVERYTHING_INSTRUCTIONS),
-    )?;
-    question.kind = Noul {
-        when_true: Some(COVERS_EVERYTHING_WHEN_TRUE.to_owned()),
-        when_false: Some(COVERS_EVERYTHING_WHEN_FALSE.to_owned()),
-        ..Default::default()
-    }
-    .into();
-    Some(question)
 }
 
 fn decision_state(topics: &[TopicSummary], focus: Option<i64>, message: &str) -> serde_json::Value {
@@ -604,9 +583,24 @@ fn build_request(
     if !topics.is_empty() {
         questions.push(route_question(topics, options_cap)?);
     }
-    questions.push(actionable_question()?);
-    questions.push(separate_themes_question()?);
-    questions.push(stands_alone_question_for_message()?);
+    questions.push(noul_question(
+        ACTIONABLE_ID,
+        serde_json::json!(ACTIONABLE_INSTRUCTIONS),
+        ACTIONABLE_WHEN_TRUE,
+        ACTIONABLE_WHEN_FALSE,
+    )?);
+    questions.push(noul_question(
+        SEPARATE_THEMES_ID,
+        serde_json::json!(SEPARATE_THEMES_INSTRUCTIONS),
+        SEPARATE_THEMES_WHEN_TRUE,
+        SEPARATE_THEMES_WHEN_FALSE,
+    )?);
+    questions.push(noul_question(
+        STANDS_ALONE_MESSAGE_ID,
+        serde_json::json!(STANDS_ALONE_MESSAGE_INSTRUCTIONS),
+        STANDS_ALONE_WHEN_TRUE,
+        STANDS_ALONE_WHEN_FALSE,
+    )?);
 
     let state = decision_state(topics, focus, message);
     let mut request: DecideRequest =
@@ -619,6 +613,22 @@ fn instructed(id: &str, instructions: serde_json::Value) -> Option<Question> {
     let mut question: Question =
         serde_json::from_value(serde_json::json!({ "instructions": instructions })).ok()?;
     question.id = id.to_owned();
+    Some(question)
+}
+
+fn noul_question(
+    id: &str,
+    instructions: serde_json::Value,
+    when_true: &str,
+    when_false: &str,
+) -> Option<Question> {
+    let mut question = instructed(id, instructions)?;
+    question.kind = Noul {
+        when_true: Some(when_true.to_owned()),
+        when_false: Some(when_false.to_owned()),
+        ..Default::default()
+    }
+    .into();
     Some(question)
 }
 
@@ -655,31 +665,6 @@ fn most_recent_topics_leaving_room_for_new(
     };
     let keep = cap.saturating_sub(1).min(topics.len());
     &topics[topics.len() - keep..]
-}
-
-fn actionable_question() -> Option<Question> {
-    let mut question = instructed(ACTIONABLE_ID, serde_json::json!(ACTIONABLE_INSTRUCTIONS))?;
-    question.kind = Noul {
-        when_true: Some(ACTIONABLE_WHEN_TRUE.to_owned()),
-        when_false: Some(ACTIONABLE_WHEN_FALSE.to_owned()),
-        ..Default::default()
-    }
-    .into();
-    Some(question)
-}
-
-fn separate_themes_question() -> Option<Question> {
-    let mut question = instructed(
-        SEPARATE_THEMES_ID,
-        serde_json::json!(SEPARATE_THEMES_INSTRUCTIONS),
-    )?;
-    question.kind = Noul {
-        when_true: Some(SEPARATE_THEMES_WHEN_TRUE.to_owned()),
-        when_false: Some(SEPARATE_THEMES_WHEN_FALSE.to_owned()),
-        ..Default::default()
-    }
-    .into();
-    Some(question)
 }
 
 enum RouteOutcome {
@@ -743,10 +728,6 @@ fn stands_alone_or_no_verdict_arrived(answers: &[Answer], id: &str) -> bool {
     find_noul(answers, id).is_none_or(|value| value > REWRITE_WHEN_STANDS_ALONE_BELOW)
 }
 
-fn leans_on_the_conversation(answers: &[Answer], id: &str) -> bool {
-    find_noul(answers, id).is_some_and(|value| value < REWRITE_WHEN_STANDS_ALONE_BELOW)
-}
-
 fn noul_above(answers: &[Answer], id: &str, threshold: f64) -> bool {
     find_noul(answers, id).is_some_and(|value| value > threshold)
 }
@@ -801,7 +782,7 @@ pub(crate) fn continue_focus_or_open_one_topic(
         Some(topic_id) if topics.iter().any(|topic| topic.id == topic_id) => {
             vec![Action::Continue {
                 topic_id,
-                question: String::new(),
+                question: message.to_owned(),
             }]
         }
         _ => vec![Action::New {
@@ -947,6 +928,66 @@ mod tests {
             1,
             "and it cost one call, on the turn that needed it"
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_too_empty_to_route_is_still_resolved_against_the_conversation() {
+        let (url, calls) = crate::fakes::serve_decider_unsure_where_it_belongs(
+            0.05,
+            "where was the humidity measured?",
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let topics = vec![TopicSummary {
+            id: 7,
+            title: "and the humidity in Tokyo?".to_owned(),
+            status: Status::Completed,
+            result_summary: Some("71".to_owned()),
+        }];
+
+        let Routing::Act(actions) = intent.route(&topics, None, "where?").await else {
+            panic!("expected actions");
+        };
+
+        let [Action::New { question, .. }] = actions.as_slice() else {
+            panic!("expected one new topic: {actions:?}");
+        };
+        assert_eq!(
+            question, "where was the humidity measured?",
+            "a message the router had too little confidence to place is exactly the kind that \
+             leans on the conversation, so falling back must not hand the raw words on"
+        );
+        assert_eq!(calls.completions(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_onto_a_focus_topic_carries_the_resolved_question_too() {
+        let (url, calls) = crate::fakes::serve_decider_unsure_where_it_belongs(
+            0.05,
+            "which place was that weather reading taken for?",
+        )
+        .await;
+        let intent = TopicIntent::new(&url).expect("client");
+        let topics = vec![TopicSummary {
+            id: 7,
+            title: "what is the weather in Tokyo?".to_owned(),
+            status: Status::Completed,
+            result_summary: Some("22.49".to_owned()),
+        }];
+
+        let Routing::Act(actions) = intent.route(&topics, Some(7), "where?").await else {
+            panic!("expected actions");
+        };
+
+        let [Action::Continue { question, .. }] = actions.as_slice() else {
+            panic!("expected a continuation: {actions:?}");
+        };
+        assert_eq!(
+            question, "which place was that weather reading taken for?",
+            "continuing a focus topic must carry the resolved question: paying for the rewrite and \
+             then handing on the raw words is the worst of both"
+        );
+        assert_eq!(calls.completions(), 1);
     }
 
     #[tokio::test]

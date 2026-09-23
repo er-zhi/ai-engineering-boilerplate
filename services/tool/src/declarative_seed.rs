@@ -46,16 +46,17 @@ pub fn read_rows(raw: &str) -> Result<Vec<DeclarativeRow>, String> {
         seen.push(&row.slug);
         crate::tools::declarative::parse_sources(&row.sources, &row.input_schema)
             .map_err(|error| format!("{}: {error}", row.slug))?;
-        checked_declarative_row(row).map_err(|error| format!("{}: {error}", row.slug))?;
+        new_tool_for(row).map_err(|error| format!("{}: {error}", row.slug))?;
     }
     Ok(rows)
 }
 
-/// Builds (and discards) the `NewTool` a row would become, purely for the validation
-/// `NewTool::checked` performs: non-empty slug/name/description within their length bounds,
-/// `input_schema` an object, and `timeout_seconds` within range. `create_and_activate_declarative_tool`
-/// builds the real one later; this call only ever needs its `Result`.
-fn checked_declarative_row(row: &DeclarativeRow) -> Result<(), String> {
+/// The `NewTool` a row becomes, built once here and again at load time. `read_rows` throws its copy
+/// away and keeps only the `Result`: that is where a row is checked against the very bounds a
+/// user-submitted tool faces — non-empty slug/name/description within their length bounds,
+/// `input_schema` an object, and `timeout_seconds` within range — before anything reaches the
+/// database.
+fn new_tool_for(row: &DeclarativeRow) -> Result<NewTool, String> {
     NewTool::checked(
         row.slug.clone(),
         row.name.clone(),
@@ -65,8 +66,7 @@ fn checked_declarative_row(row: &DeclarativeRow) -> Result<(), String> {
         Risk::ReadOnly,
         row.timeout_seconds,
     )
-    .map_err(|error| error.to_string())?;
-    Ok(())
+    .map_err(|error| error.to_string())
 }
 
 /// Upserts every row as an Active system tool. These are operator-supplied definitions, so they skip
@@ -122,16 +122,7 @@ async fn create_and_activate_declarative_tool(
     db: &DatabaseConnection,
     row: &DeclarativeRow,
 ) -> Result<(), String> {
-    let new_tool = NewTool::checked(
-        row.slug.clone(),
-        row.name.clone(),
-        row.description.clone(),
-        row.input_schema.clone(),
-        serde_json::from_str(DECLARATIVE_OUTPUT_SCHEMA).expect("a fixed literal always parses"),
-        Risk::ReadOnly,
-        row.timeout_seconds,
-    )
-    .map_err(|error| error.to_string())?;
+    let new_tool = new_tool_for(row)?;
     let tool_id = service
         .create_tool(None, new_tool)
         .await

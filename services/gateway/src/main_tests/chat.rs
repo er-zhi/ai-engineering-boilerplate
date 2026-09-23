@@ -6,32 +6,22 @@ use std::time::Duration;
 use buffa::EnumValue;
 use common::principal::Principal;
 use common::proto::chat::v1::{
-    ChatEvent, ChatEventKind, ChatService, ChatServiceClient, CreateTopicRequest,
-    CreateTopicResponse, GetSessionRequest, GetSessionResponse, ResetSessionRequest,
-    ResetSessionResponse, SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse,
-    StreamEventsRequest, TopicStatus,
+    ChatEvent, ChatEventKind, ChatService, CreateTopicRequest, CreateTopicResponse,
+    GetSessionRequest, GetSessionResponse, ResetSessionRequest, ResetSessionResponse,
+    SendTurnRequest, SendTurnResponse, SetFocusRequest, SetFocusResponse, StreamEventsRequest,
+    TopicStatus,
 };
-use common::proto::crawler::v1::CrawlerServiceClient;
-use common::proto::knowledge_base::v1::KnowledgeBaseServiceClient;
-use connectrpc::client::{CallOptions, ClientConfig, HttpClient};
+use connectrpc::client::CallOptions;
 use connectrpc::{
-    ConnectError, Protocol, RequestContext, Response, Router as ConnectRouter, ServiceRequest,
-    ServiceResult, ServiceStream,
+    ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
+    ServiceStream,
 };
 
-use super::start_gateway;
+use super::{
+    chat_client_to, start_gateway, unreachable_crawler_client, unreachable_knowledge_base_client,
+};
 use crate::auth::COOKIE_NAME;
-use crate::proxy::{CHAT_CALL_TIMEOUT, Gateway};
-
-fn unreachable_and_never_called<C>(build: impl Fn(HttpClient, ClientConfig) -> C) -> C {
-    build(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(CHAT_CALL_TIMEOUT)
-            .proto(),
-    )
-}
+use crate::proxy::Gateway;
 
 #[derive(Default)]
 struct FakeChat {
@@ -129,21 +119,11 @@ async fn start_fake_chat(service: Arc<FakeChat>) -> String {
     format!("http://{address}")
 }
 
-fn chat_client_to(url: &str, timeout: Duration) -> ChatServiceClient<HttpClient> {
-    ChatServiceClient::new(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new(url.parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(timeout)
-            .proto(),
-    )
-}
-
 async fn gateway_over(fake: Arc<FakeChat>, chat_timeout: Duration) -> String {
     let chat_url = start_fake_chat(fake).await;
     start_gateway(Gateway {
-        crawler: unreachable_and_never_called(CrawlerServiceClient::new),
-        knowledge_base: unreachable_and_never_called(KnowledgeBaseServiceClient::new),
+        crawler: unreachable_crawler_client(),
+        knowledge_base: unreachable_knowledge_base_client(),
         chat: chat_client_to(&chat_url, chat_timeout),
     })
     .await

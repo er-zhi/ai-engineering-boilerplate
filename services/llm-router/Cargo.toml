@@ -12,7 +12,7 @@ workspace = true
 axum = { workspace = true }
 buffa = { workspace = true }
 chrono = { workspace = true }
-common = { workspace = true }
+common = { workspace = true, features = ["partition"] }
 connectrpc = { workspace = true, features = ["axum"] }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }

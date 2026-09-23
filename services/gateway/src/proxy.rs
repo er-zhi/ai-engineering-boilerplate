@@ -1,9 +1,8 @@
 // Forwards Gateway RPCs to their owning internal services.
 
-use std::future::Future;
 use std::time::Duration;
 
-use axum::http::{Uri, header};
+use axum::http::Uri;
 use common::principal::{SESSION_ID_HEADER, USER_ID_HEADER};
 use common::proto::chat::v1::{
     ChatEvent, ChatService, ChatServiceClient, CreateTopicRequest, CreateTopicResponse,
@@ -24,7 +23,7 @@ use connectrpc::{
     ServiceStream,
 };
 
-use crate::auth::{COOKIE_NAME, cookie_value};
+use crate::auth::session_token;
 
 pub(crate) const CRAWLER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CRAWLER_CALL_ATTEMPTS: usize = 3;
@@ -72,11 +71,7 @@ impl Gateway {
 }
 
 fn chat_call_options(ctx: &RequestContext) -> Result<CallOptions, ConnectError> {
-    let session_token = ctx
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| cookie_value(cookies, COOKIE_NAME))
+    let session_token = session_token(ctx.headers())
         .ok_or_else(|| ConnectError::unauthenticated("no session cookie on the request"))?;
     CallOptions::default()
         .with_header(USER_ID_HEADER, SINGLE_TENANT_USER_ID)

@@ -39,7 +39,7 @@ use crate::adapters::KeyCheck;
 use crate::adapters::openai_compatible::OpenAiCompatible;
 use crate::adapters::system_one::{self, SystemOne};
 use crate::decisions::Decisions;
-use crate::log::{PartitionUpkeep, PgAuditLog};
+use crate::log::PgAuditLog;
 use crate::service::Router;
 use crate::tiers::Tiers;
 use crate::wire::tier_contracts;
@@ -142,7 +142,7 @@ fn from_environment(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-async fn maintain_partitions_periodically(log: impl PartitionUpkeep) {
+async fn maintain_partitions_periodically(log: PgAuditLog) {
     let mut interval = tokio::time::interval(PARTITION_MAINTENANCE_INTERVAL);
     // The first tick is immediate, and prepare_schema has just done this pass; the second is an hour away.
     interval.tick().await;
@@ -152,7 +152,7 @@ async fn maintain_partitions_periodically(log: impl PartitionUpkeep) {
     }
 }
 
-async fn maintain_partitions(log: &impl PartitionUpkeep) {
+async fn maintain_partitions(log: &PgAuditLog) {
     match log.maintain_partitions(chrono::Utc::now()).await {
         Ok(swept) if swept.is_empty() => {}
         Ok(swept) => tracing::info!(

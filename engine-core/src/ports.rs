@@ -1,7 +1,5 @@
-// Declares the two I/O seams between engine-core and its runtime.
-
-use crate::checkpoint::Checkpoint;
-use crate::ids::ExecutionId;
+// Declares the one I/O seam between engine-core and its runtime: persistence is not one of
+// them, because `step` is handed data and hands data back, and the service keeps the database.
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TaskError {
@@ -17,12 +15,4 @@ pub trait TaskExecutor: Send + Sync {
         state: &serde_json::Value,
         idempotency_key: &str,
     ) -> impl Future<Output = Result<serde_json::Value, TaskError>> + Send;
-}
-
-pub trait CheckpointStore: Send + Sync {
-    fn save(&self, checkpoint: &Checkpoint) -> impl Future<Output = Result<(), String>> + Send;
-    fn latest(
-        &self,
-        execution_id: ExecutionId,
-    ) -> impl Future<Output = Result<Option<Checkpoint>, String>> + Send;
 }

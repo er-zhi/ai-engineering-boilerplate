@@ -3,20 +3,19 @@
 use std::sync::Arc;
 
 use buffa::EnumValue;
-use common::proto::chat::v1::ChatServiceClient;
 use common::proto::knowledge_base::v1::{
-    DocumentRef, IngestRequest, IngestResponse, KnowledgeBaseService, KnowledgeBaseServiceClient,
-    PageType, ReadDocumentRequest, ReadDocumentResponse, SearchRequest, SearchResponse,
-    SearchResult,
+    DocumentRef, IngestRequest, IngestResponse, KnowledgeBaseService, PageType,
+    ReadDocumentRequest, ReadDocumentResponse, SearchRequest, SearchResponse, SearchResult,
 };
-use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{
-    ConnectError, ErrorCode, Protocol, RequestContext, Response, Router as ConnectRouter,
-    ServiceRequest, ServiceResult,
+    ConnectError, ErrorCode, RequestContext, Response, Router as ConnectRouter, ServiceRequest,
+    ServiceResult,
 };
 
-use super::start_gateway;
-use crate::proxy::{CHAT_CALL_TIMEOUT, Gateway, KNOWLEDGE_BASE_CALL_TIMEOUT};
+use super::{
+    knowledge_base_client_to, start_gateway, unreachable_chat_client, unreachable_crawler_client,
+};
+use crate::proxy::Gateway;
 
 struct FakeKnowledgeBase {
     ingested: std::sync::Mutex<Vec<IngestRequest>>,
@@ -112,35 +111,6 @@ async fn start_fake_knowledge_base(service: Arc<FakeKnowledgeBase>) -> String {
     format!("http://{address}")
 }
 
-fn crawler_client_to(url: &str) -> common::proto::crawler::v1::CrawlerServiceClient<HttpClient> {
-    common::proto::crawler::v1::CrawlerServiceClient::new(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new(url.parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .proto(),
-    )
-}
-
-fn knowledge_base_client_to(url: &str) -> KnowledgeBaseServiceClient<HttpClient> {
-    KnowledgeBaseServiceClient::new(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new(url.parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(KNOWLEDGE_BASE_CALL_TIMEOUT)
-            .proto(),
-    )
-}
-
-fn unreachable_chat_client() -> ChatServiceClient<HttpClient> {
-    ChatServiceClient::new(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(CHAT_CALL_TIMEOUT)
-            .proto(),
-    )
-}
-
 #[tokio::test]
 async fn search_forwards_the_complete_request_and_response_through_gateway() {
     let fake = fake_knowledge_base(None);
@@ -170,7 +140,7 @@ async fn search_upstream_error_propagates_through_gateway() {
     let fake = fake_knowledge_base(Some(ErrorCode::InvalidArgument));
     let knowledge_base_url = start_fake_knowledge_base(fake).await;
     let gateway = Gateway {
-        crawler: crawler_client_to("http://127.0.0.1:1"),
+        crawler: unreachable_crawler_client(),
         knowledge_base: knowledge_base_client_to(&knowledge_base_url),
         chat: unreachable_chat_client(),
     };
@@ -185,7 +155,7 @@ async fn ingest_is_never_forwarded_to_knowledge_base() {
     let fake = fake_knowledge_base(None);
     let knowledge_base_url = start_fake_knowledge_base(Arc::clone(&fake)).await;
     let gateway = Gateway {
-        crawler: crawler_client_to("http://127.0.0.1:1"),
+        crawler: unreachable_crawler_client(),
         knowledge_base: knowledge_base_client_to(&knowledge_base_url),
         chat: unreachable_chat_client(),
     };
@@ -201,7 +171,7 @@ async fn read_document_forwards_the_reference_and_page_options() {
     let fake = fake_knowledge_base(None);
     let knowledge_base_url = start_fake_knowledge_base(Arc::clone(&fake)).await;
     let gateway = Gateway {
-        crawler: crawler_client_to("http://127.0.0.1:1"),
+        crawler: unreachable_crawler_client(),
         knowledge_base: knowledge_base_client_to(&knowledge_base_url),
         chat: unreachable_chat_client(),
     };

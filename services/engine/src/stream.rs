@@ -16,7 +16,8 @@ use crate::execution_event;
 
 const CHANNEL_CAPACITY: usize = 64;
 const POLL_BATCH: u64 = 100;
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const WITHOUT_ANNOUNCEMENTS_ASK_EVERY: Duration = Duration::from_millis(200);
+const A_LOST_ANNOUNCEMENT_IS_FOUND_WITHIN: Duration = Duration::from_secs(15);
 const POLL_FAILED: &str = "engine could not read the execution event log";
 const EMPTY_PAYLOAD: &str = "{}";
 
@@ -68,6 +69,7 @@ async fn poll_forever(
     tx: mpsc::Sender<Result<ProtoEvent, ConnectError>>,
     wakeups: Wakeups,
 ) {
+    let mut announcements = wakeups.announcements();
     let mut last_id: i64 = 0;
     loop {
         let query = scope.filter(
@@ -87,7 +89,7 @@ async fn poll_forever(
             }
         };
         if rows.is_empty() {
-            wakeups.wait().await;
+            announcements.wait().await;
             continue;
         }
         for row in rows {
@@ -409,24 +411,31 @@ mod tests {
         let first = stream.next().await.expect("first").expect("ok");
         assert_eq!(first.payload_kind, ExecutionEventKind::ExecutionCompleted);
     }
+
+    #[tokio::test]
+    async fn an_announcement_made_while_the_poll_was_running_still_wakes_the_stream() {
+        let (announce, _) = tokio::sync::broadcast::channel(1);
+        let wakeups = Wakeups(Some(announce.clone()));
+        let mut announcements = wakeups.announcements();
+
+        announce
+            .send(())
+            .expect("the stream subscribed before its poll, so there is a receiver to announce to");
+
+        tokio::time::timeout(WITHOUT_ANNOUNCEMENTS_ASK_EVERY, announcements.wait())
+            .await
+            .expect(
+                "an announcement arriving while the query was in flight is held for the next wait \
+                 — subscribing after the poll instead would lose it, and the stream would then sit \
+                 out the whole safety net",
+            );
+    }
 }
 
-/// One `LISTEN` connection for the whole process, fanned out to every open stream.
-///
-/// The engine already announces its own work with `NOTIFY engine_tick` on every checkpoint commit,
-/// and `wakeup.rs` listens for it to drive ticks. This carries the same announcement to the event
-/// streams, so a client learns an execution moved on as soon as it did rather than at the next
-/// poll. One connection rather than one per stream: a session with three topics opens three.
-///
-/// The poll and its interval stay exactly as they were. A missed notification — the listener
-/// reconnecting, another process, a signal lost — costs the old latency and nothing else, which is
-/// why this can be a hint rather than a guarantee.
 #[derive(Clone)]
 pub struct Wakeups(Option<tokio::sync::broadcast::Sender<()>>);
 
 impl Wakeups {
-    /// Opens the listener and starts fanning out. A database that will not take a listener leaves
-    /// every stream on the interval, which is what they did before this existed.
     pub async fn listening(database_url: &str) -> Self {
         let mut listener = match sqlx::postgres::PgListener::connect(database_url).await {
             Ok(listener) => listener,
@@ -443,8 +452,7 @@ impl Wakeups {
         let sender = tx.clone();
         tokio::spawn(async move {
             while listener.recv().await.is_ok() {
-                // Ignored deliberately: no subscribers is the normal state between turns.
-                let _ = sender.send(());
+                let _no_open_stream_between_turns_is_normal = sender.send(());
             }
             tracing::warn!(
                 "the event-stream listener stopped; open streams fall back to the interval"
@@ -458,13 +466,23 @@ impl Wakeups {
         Self(None)
     }
 
-    /// Waits for the next announcement, or for `POLL_INTERVAL` — whichever comes first.
-    async fn wait(&self) {
-        let Some(tx) = &self.0 else {
-            tokio::time::sleep(POLL_INTERVAL).await;
+    fn announcements(&self) -> Announcements {
+        Announcements(
+            self.0
+                .as_ref()
+                .map(tokio::sync::broadcast::Sender::subscribe),
+        )
+    }
+}
+
+struct Announcements(Option<tokio::sync::broadcast::Receiver<()>>);
+
+impl Announcements {
+    async fn wait(&mut self) {
+        let Some(announced) = &mut self.0 else {
+            tokio::time::sleep(WITHOUT_ANNOUNCEMENTS_ASK_EVERY).await;
             return;
         };
-        let mut rx = tx.subscribe();
-        let _ = tokio::time::timeout(POLL_INTERVAL, rx.recv()).await;
+        let _ = tokio::time::timeout(A_LOST_ANNOUNCEMENT_IS_FOUND_WITHIN, announced.recv()).await;
     }
 }

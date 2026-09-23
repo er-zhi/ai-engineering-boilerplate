@@ -1,6 +1,6 @@
 // Persists checkpoints and execution events.
 
-use engine_core::{Checkpoint, CheckpointStore, Execution, ExecutionEvent, ExecutionId};
+use engine_core::{Checkpoint, Execution, ExecutionEvent, ExecutionId};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
     QueryFilter, QueryOrder, TransactionTrait,
@@ -35,8 +35,8 @@ impl PgCheckpointStore {
     }
 }
 
-impl CheckpointStore for PgCheckpointStore {
-    async fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
+impl PgCheckpointStore {
+    pub async fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
         checkpoint_to_active_model(checkpoint)
             .insert(&self.db)
             .await
@@ -44,7 +44,7 @@ impl CheckpointStore for PgCheckpointStore {
             .map_err(|e| storage_failure("save checkpoint", &e))
     }
 
-    async fn latest(&self, execution_id: ExecutionId) -> Result<Option<Checkpoint>, String> {
+    pub async fn latest(&self, execution_id: ExecutionId) -> Result<Option<Checkpoint>, String> {
         let model = checkpoint::Entity::find()
             .filter(checkpoint::Column::ExecutionId.eq(execution_id.0))
             .order_by_desc(checkpoint::Column::Step)

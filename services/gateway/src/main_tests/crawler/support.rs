@@ -1,23 +1,17 @@
-// A fake Crawler and the clients the Crawler passthrough tests drive it with.
+// A fake Crawler for the Crawler passthrough tests.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use buffa::EnumValue;
-use common::proto::chat::v1::ChatServiceClient;
 use common::proto::crawler::v1::{
-    CrawlerService, CrawlerServiceClient, GetCrawlJobRequest, GetCrawlJobResponse,
-    GetPageNeighborsRequest, GetPageNeighborsResponse, PageNeighbor, PageRelation,
-    StartCrawlRequest, StartCrawlResponse,
+    CrawlerService, GetCrawlJobRequest, GetCrawlJobResponse, GetPageNeighborsRequest,
+    GetPageNeighborsResponse, PageNeighbor, PageRelation, StartCrawlRequest, StartCrawlResponse,
 };
-use common::proto::knowledge_base::v1::KnowledgeBaseServiceClient;
-use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{
-    ConnectError, ErrorCode, Protocol, RequestContext, Response, Router as ConnectRouter,
-    ServiceRequest, ServiceResult,
+    ConnectError, ErrorCode, RequestContext, Response, Router as ConnectRouter, ServiceRequest,
+    ServiceResult,
 };
-
-use crate::proxy::{CHAT_CALL_TIMEOUT, CRAWLER_CALL_TIMEOUT, KNOWLEDGE_BASE_CALL_TIMEOUT};
 
 pub(super) struct FakeCrawler {
     pub(super) received: std::sync::Mutex<Option<GetPageNeighborsRequest>>,
@@ -101,34 +95,4 @@ pub(super) async fn start_fake_crawler(service: Arc<FakeCrawler>) -> String {
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{address}")
-}
-
-pub(super) fn client_to(url: &str) -> CrawlerServiceClient<HttpClient> {
-    CrawlerServiceClient::new(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new(url.parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(CRAWLER_CALL_TIMEOUT)
-            .proto(),
-    )
-}
-
-pub(super) fn unreachable_knowledge_base_client() -> KnowledgeBaseServiceClient<HttpClient> {
-    KnowledgeBaseServiceClient::new(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(KNOWLEDGE_BASE_CALL_TIMEOUT)
-            .proto(),
-    )
-}
-
-pub(super) fn unreachable_chat_client() -> ChatServiceClient<HttpClient> {
-    ChatServiceClient::new(
-        HttpClient::plaintext_http2_only(),
-        ClientConfig::new("http://127.0.0.1:1".parse().unwrap())
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(CHAT_CALL_TIMEOUT)
-            .proto(),
-    )
 }

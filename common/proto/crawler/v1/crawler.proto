@@ -44,7 +44,9 @@ message GetCrawlJobResponse {
   string base_url = 2;
   CrawlStatus status = 3;
   uint32 pages_crawled = 4;
-  uint32 pages_skipped = 5;
+  // 5 was pages_skipped: written as 0 at job creation and never incremented.
+  reserved 5;
+  reserved "pages_skipped";
 }
 
 enum PageRelation {

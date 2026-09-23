@@ -6,11 +6,18 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware;
 use axum::routing::get;
+use sea_orm::{EntityTrait, PaginatorTrait};
 use tower::ServiceExt;
 
 use super::*;
-use crate::auth::{COOKIE_NAME, hash_token};
+use crate::auth::{COOKIE_NAME, cookie_value, hash_token};
+use crate::entity::cache_entry;
 use crate::test_db;
+
+const EXPIRING_SESSION_KEY: &str = "expired";
+const SHORTEST_LIFETIME: Duration = Duration::from_millis(1);
+const SWEEP_DEADLINE: Duration = Duration::from_secs(10);
+const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 async fn auth() -> (Auth, common::test_db::TestDb) {
     let test = test_db::start().await;
@@ -124,24 +131,52 @@ async fn logout_without_a_cookie_is_still_idempotent() {
     );
 }
 
+async fn stored_session_rows(db: &sea_orm::DatabaseConnection) -> u64 {
+    cache_entry::Entity::find().count(db).await.unwrap()
+}
+
+async fn until<F>(condition: impl Fn() -> F) -> Result<(), tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(SWEEP_DEADLINE, async {
+        while !condition().await {
+            tokio::time::sleep(SWEEP_POLL_INTERVAL).await;
+        }
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_periodic_sweep_removes_expired_sessions_on_its_first_tick() {
-    let (auth, _test) = auth().await;
+    let (auth, test) = auth().await;
     auth.sessions
-        .set("expired", b"", Duration::from_millis(1))
+        .set(EXPIRING_SESSION_KEY, b"", SHORTEST_LIFETIME)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        stored_session_rows(&test.db).await,
+        1,
+        "the row must be in the table before the sweep runs, or an empty table afterwards proves \
+         nothing about the sweep"
+    );
+
+    let lifetime_ran_out = until(|| async {
+        auth.sessions
+            .get(EXPIRING_SESSION_KEY)
+            .await
+            .unwrap()
+            .is_none()
+    })
+    .await;
+    lifetime_ran_out
+        .expect("the session's lifetime must run out before the sweeper takes its only tick");
 
     let task = tokio::spawn(sweep_expired_sessions_periodically(auth.sessions.clone()));
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let swept = until(|| async { stored_session_rows(&test.db).await == 0 }).await;
     task.abort();
 
-    assert_eq!(
-        auth.sessions
-            .drop_expired(chrono::Utc::now())
-            .await
-            .unwrap(),
-        0
+    swept.expect(
+        "the sweeper must delete the expired row on its first tick, with nobody asking it to",
     );
 }

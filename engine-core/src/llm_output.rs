@@ -50,11 +50,6 @@ impl ToolRecord {
     pub fn reached_its_source(&self) -> bool {
         self.result.get(TOOL_RESULT_ERROR_KEY).is_none()
     }
-
-    #[must_use]
-    pub fn failure(&self) -> Option<&str> {
-        self.result.get(TOOL_RESULT_ERROR_KEY)?.as_str()
-    }
 }
 const REPLY_FIELD: &str = "reply";
 

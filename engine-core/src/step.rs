@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::event::{ExecutionEvent, ExecutionPayload};
 use crate::execution::{ActiveNode, Execution, Status};
-use crate::graph::{Condition, Graph, Node, evaluate_condition};
+use crate::graph::{Graph, Node, evaluate_condition};
 use crate::state::apply_reducer;
 
 const FAN_IN_TABLE: &str = "__fan_in";
@@ -260,9 +260,7 @@ fn expand_completed_fan_ins(
     for active in next {
         if matches!(graph.node(&active.node), Some(Node::FanIn { .. })) {
             for edge in graph.edges_from(&active.node) {
-                if !matches!(edge.condition, Condition::Failed)
-                    && evaluate_condition(&edge.condition, &execution.state)
-                {
+                if evaluate_condition(&edge.condition, &execution.state) {
                     expanded.push(ActiveNode::plain(edge.to.clone()));
                 }
             }
@@ -319,12 +317,9 @@ fn record_edges(
     let failed = output.result.is_err();
     let mut any_edge_fired = false;
     for edge in graph.edges_from(&output.node.node) {
-        let fires = if failed {
-            matches!(edge.condition, Condition::Failed)
-        } else {
-            !matches!(edge.condition, Condition::Failed)
-                && evaluate_condition(&edge.condition, &execution.state)
-        };
+        // A node that failed fires nothing: no edge condition can name failure, so a failed node
+        // ends its branch and the execution settles on it.
+        let fires = !failed && evaluate_condition(&edge.condition, &execution.state);
         if fires {
             any_edge_fired = true;
             next.push(ActiveNode::plain(edge.to.clone()));
@@ -403,7 +398,7 @@ fn reducer_of(config: &serde_json::Value) -> Option<crate::graph::Reducer> {
 mod tests {
     use super::*;
     use crate::budget::Budget;
-    use crate::graph::{Edge, Reducer, WaitKind};
+    use crate::graph::{Condition, Edge, Reducer, WaitKind};
     use crate::ids::{ExecutionId, GraphId, NodeId};
     use serde_json::json;
     use std::time::Duration;
@@ -467,7 +462,13 @@ mod tests {
         let (exec, events) = step(&g, exec, vec![ok("a", json!({"reply": "hi"}))], Utc::now());
 
         assert_eq!(exec.status, Status::Completed);
-        assert!(exec.current_nodes.is_empty());
+        assert!(
+            !exec
+                .current_nodes
+                .iter()
+                .any(|active| active.node == NodeId("after".into())),
+            "the unconditional edge out of the failed node must not have fired"
+        );
         assert!(
             events
                 .iter()
@@ -690,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_edge_recovers_from_a_failed_node() {
+    fn a_failed_node_ends_its_branch_and_settles_the_execution() {
         let g = graph(
             vec![
                 Node::Task {
@@ -699,15 +700,15 @@ mod tests {
                     config: json!({}),
                 },
                 Node::Task {
-                    id: NodeId("recover".into()),
+                    id: NodeId("after".into()),
                     kind: "noop".into(),
                     config: json!({}),
                 },
             ],
             vec![Edge {
                 from: NodeId("a".into()),
-                to: NodeId("recover".into()),
-                condition: Condition::Failed,
+                to: NodeId("after".into()),
+                condition: Condition::Always,
             }],
             "a",
         );
@@ -716,12 +717,21 @@ mod tests {
             node: ActiveNode::plain(NodeId("a".into())),
             result: Err("boom".into()),
         };
+
         let (exec, _) = step(&g, exec, vec![output], Utc::now());
 
-        assert_eq!(exec.status, Status::Ready);
         assert_eq!(
-            exec.current_nodes,
-            vec![ActiveNode::plain(NodeId("recover".into()))]
+            exec.status,
+            Status::Failed,
+            "no edge condition can name failure, so a failed node takes no edge — not even an \
+             unconditional one — and the execution settles on it"
+        );
+        assert!(
+            !exec
+                .current_nodes
+                .iter()
+                .any(|active| active.node == NodeId("after".into())),
+            "the unconditional edge out of the failed node must not have fired"
         );
     }
 

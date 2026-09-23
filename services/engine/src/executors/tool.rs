@@ -10,8 +10,6 @@ use engine_core::{
     LlmOutput, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, TaskError, TaskExecutor, ToolCall,
     ToolRecord, llm_tool_call_pointer,
 };
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -112,23 +110,11 @@ impl ToolTaskExecutor {
         calls: &[ToolCall],
         idempotency_key: &str,
     ) -> Result<Vec<CallOutcome>, TaskError> {
-        let mut running: FuturesUnordered<_> = calls
-            .iter()
-            .enumerate()
-            .map(|(index, call)| async move {
-                (
-                    index,
-                    self.call_tool(call, &format!("{idempotency_key}:{index}"))
-                        .await,
-                )
-            })
-            .collect();
-        let mut finished = Vec::with_capacity(calls.len());
-        while let Some((index, outcome)) = running.next().await {
-            finished.push((index, outcome?));
-        }
-        finished.sort_by_key(|(index, _)| *index);
-        Ok(finished.into_iter().map(|(_, outcome)| outcome).collect())
+        futures::future::try_join_all(calls.iter().enumerate().map(|(index, call)| async move {
+            self.call_tool(call, &format!("{idempotency_key}:{index}"))
+                .await
+        }))
+        .await
     }
 
     async fn call_tool(

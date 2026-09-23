@@ -31,7 +31,6 @@ pub struct CrawlJob {
     pub base_url: String,
     pub status: CrawlStatus,
     pub pages_crawled: u32,
-    pub pages_skipped: u32,
 }
 
 impl CrawlJob {

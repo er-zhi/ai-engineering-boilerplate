@@ -96,7 +96,6 @@ impl JobStore for MemoryJobs {
             base_url: base_url.to_owned(),
             status: CrawlStatus::Queued,
             pages_crawled: 0,
-            pages_skipped: 0,
         };
         rows.insert(job.id, (job.clone(), key.map(str::to_owned)));
         Ok(job)
@@ -151,15 +150,6 @@ impl EdgeStore for NoopEdges {
     ) -> Result<(), DbErr> {
         Ok(())
     }
-
-    async fn neighbors(
-        &self,
-        _start_url: &str,
-        _relation_types: Vec<crate::entity::page_edge::RelationType>,
-        _max_depth: u32,
-    ) -> Result<Vec<crate::graph::Neighbor>, DbErr> {
-        Ok(Vec::new())
-    }
 }
 
 type ReplacedEdges = Vec<(String, Vec<crate::links::Link>)>;
@@ -181,15 +171,6 @@ impl EdgeStore for RecordingEdges {
             .push((from_url.to_owned(), links));
         Ok(())
     }
-
-    async fn neighbors(
-        &self,
-        _start_url: &str,
-        _relation_types: Vec<crate::entity::page_edge::RelationType>,
-        _max_depth: u32,
-    ) -> Result<Vec<crate::graph::Neighbor>, DbErr> {
-        Ok(Vec::new())
-    }
 }
 
 #[derive(Clone, Default)]
@@ -202,15 +183,6 @@ impl EdgeStore for FailingEdges {
         _links: Vec<crate::links::Link>,
     ) -> Result<(), DbErr> {
         Err(DbErr::Custom("graph store is down".into()))
-    }
-
-    async fn neighbors(
-        &self,
-        _start_url: &str,
-        _relation_types: Vec<crate::entity::page_edge::RelationType>,
-        _max_depth: u32,
-    ) -> Result<Vec<crate::graph::Neighbor>, DbErr> {
-        Ok(Vec::new())
     }
 }
 

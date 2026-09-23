@@ -30,10 +30,19 @@ Compose rebuilds a changed Rust service and recopies changed Frontend files. The
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo check -p common --no-default-features
+cargo check -p common --all-features
 cargo nextest run --workspace
 cargo deny check
 cargo machete
 ```
+
+The two `common` checks stand at either end of its feature matrix. Every other command builds
+`common` only with the union of the features its consumers ask for, and a feature-gated module that
+is only ever built under one combination is a module nobody checks. `extract`, `partition` and
+`test-support` can each rot in the direction no service selects: the bare crate stops compiling
+because a gated module leaked into an ungated one, or two gates stop composing because each was only
+ever built alone. Both commands are cheap, and they are the only place those two ends are built.
 
 Docker must be running for database tests. Nextest starts one disposable Postgres fixture for the suite, while every test gets its own database so the tests remain isolated and parallel; the fixture is removed when nextest exits. `cargo test --workspace` also works if `cargo-nextest` is unavailable and falls back to a testcontainer per database test.
 

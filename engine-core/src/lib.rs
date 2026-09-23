@@ -28,6 +28,6 @@ pub use llm_output::{
     RENDERED_TOOL_RESULTS, TOOL_RESULT_ERROR_KEY, TOOL_RESULT_STATE_KEY, ToolCall, ToolRecord,
     llm_reply_pointer, llm_tool_call_pointer,
 };
-pub use ports::{CheckpointStore, TaskError, TaskExecutor};
+pub use ports::{TaskError, TaskExecutor};
 pub use state::apply_reducer;
 pub use step::{NodeOutput, interrupt, step};

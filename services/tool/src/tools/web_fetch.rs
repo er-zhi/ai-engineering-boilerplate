@@ -143,13 +143,7 @@ pub async fn get_guarded(
 ) -> Result<reqwest::Response, String> {
     let mut here = url.to_owned();
     for _ in 0..=MAX_REDIRECT_HOPS {
-        let mut request = client.get(&here).timeout(timeout);
-        // Carried across every hop: a source that needs to introduce itself needs to do so again
-        // after a redirect, and the guard has already checked where each hop leads.
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        let response = request
+        let response = hop_request(client, url, &here, headers, timeout)
             .send()
             .await
             .map_err(|e| readable_send_failure(&here, &e))?;
@@ -165,6 +159,52 @@ pub async fn get_guarded(
     Err(format!(
         "{url} redirected more than {MAX_REDIRECT_HOPS} times, so the chain was abandoned"
     ))
+}
+
+const HEADERS_BOUND_TO_THEIR_ORIGIN: [&str; 4] = [
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "www-authenticate",
+];
+
+fn is_bound_to_its_origin(name: &str) -> bool {
+    HEADERS_BOUND_TO_THEIR_ORIGIN
+        .iter()
+        .any(|bound| name.eq_ignore_ascii_case(bound))
+}
+
+fn origin_of(url: &str) -> Option<(String, String, u16)> {
+    let parsed = url::Url::parse(url).ok()?;
+    Some((
+        parsed.scheme().to_ascii_lowercase(),
+        parsed.host_str()?.to_ascii_lowercase(),
+        parsed.port_or_known_default()?,
+    ))
+}
+
+fn same_origin(one: &str, other: &str) -> bool {
+    match (origin_of(one), origin_of(other)) {
+        (Some(one), Some(other)) => one == other,
+        _ => false,
+    }
+}
+
+fn hop_request(
+    client: &reqwest::Client,
+    asked_for: &str,
+    here: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+) -> reqwest::RequestBuilder {
+    let still_on_the_origin_the_caller_asked_for = same_origin(asked_for, here);
+    let mut request = client.get(here).timeout(timeout);
+    for (name, value) in headers {
+        if still_on_the_origin_the_caller_asked_for || !is_bound_to_its_origin(name) {
+            request = request.header(name, value);
+        }
+    }
+    request
 }
 
 fn redirect_target(response: &reqwest::Response) -> Option<String> {
@@ -709,5 +749,212 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    const OPERATOR_TOKEN: &str = "Bearer live-key";
+
+    fn operator_headers() -> Vec<(String, String)> {
+        vec![
+            ("authorization".to_owned(), OPERATOR_TOKEN.to_owned()),
+            ("user-agent".to_owned(), "market-quote/1.0".to_owned()),
+        ]
+    }
+
+    fn header_names_on_the_hop(
+        asked_for: &str,
+        here: &str,
+        headers: &[(String, String)],
+    ) -> Vec<String> {
+        hop_request(&guarded_client(), asked_for, here, headers, TEST_TIMEOUT)
+            .build()
+            .expect("the hop request must build")
+            .headers()
+            .keys()
+            .map(|name| name.as_str().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_credential_bearing_header_is_dropped_once_a_hop_leaves_the_origin_asked_for() {
+        let names = header_names_on_the_hop(
+            "https://vendor.example/quote",
+            "https://cdn.vendor-assets.example/quote",
+            &operator_headers(),
+        );
+
+        assert!(
+            !names.iter().any(|name| name == "authorization"),
+            "a vendor's 301 to another host must not hand that host the operator's live token, \
+             since reqwest's own cross-origin stripping never runs under Policy::none(): {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_bearing_header_still_travels_on_a_same_origin_redirect() {
+        let asked_for = "https://vendor.example/quote";
+        let next = resolve(asked_for, "/v2/quote").expect("a path-only Location resolves");
+
+        let names = header_names_on_the_hop(asked_for, &next, &operator_headers());
+
+        assert!(
+            names.iter().any(|name| name == "authorization"),
+            "a vendor moving its own path is still the origin the credential was written for, \
+             so dropping the token there would break every source that authenticates: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_header_keeps_travelling_across_an_origin_change() {
+        let names = header_names_on_the_hop(
+            "https://vendor.example/quote",
+            "https://cdn.vendor-assets.example/quote",
+            &operator_headers(),
+        );
+
+        assert!(
+            names.iter().any(|name| name == "user-agent"),
+            "only credentials are origin-bound; MARKET_QUOTE_USER_AGENT depends on the agent \
+             still introducing us after a hop: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_header_is_recognised_whatever_case_the_operator_wrote_it_in() {
+        let shouted = vec![
+            ("Authorization".to_owned(), OPERATOR_TOKEN.to_owned()),
+            ("COOKIE".to_owned(), "session=abc".to_owned()),
+            ("Proxy-Authorization".to_owned(), OPERATOR_TOKEN.to_owned()),
+            ("WWW-Authenticate".to_owned(), "Basic".to_owned()),
+        ];
+
+        let names = header_names_on_the_hop(
+            "https://vendor.example/quote",
+            "https://elsewhere.example/quote",
+            &shouted,
+        );
+
+        assert!(
+            names.is_empty(),
+            "header names come from operator-written JSON, where the case is not guaranteed, \
+             so the match must be case-insensitive: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_downgrade_from_https_to_http_is_an_origin_change() {
+        let names = header_names_on_the_hop(
+            "https://vendor.example/quote",
+            "http://vendor.example/quote",
+            &operator_headers(),
+        );
+
+        assert!(
+            !names.iter().any(|name| name == "authorization"),
+            "a 302 that drops TLS would put the token on the wire in clear text, so the scheme \
+             is part of the origin: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_default_port_written_out_is_the_same_origin_as_the_implicit_one() {
+        let names = header_names_on_the_hop(
+            "https://vendor.example/quote",
+            "https://vendor.example:443/quote",
+            &operator_headers(),
+        );
+
+        assert!(
+            names.iter().any(|name| name == "authorization"),
+            "443 is what https already means, so spelling it out is the same origin, not a \
+             different one: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_port_change_alone_is_an_origin_change() {
+        let names = header_names_on_the_hop(
+            "https://vendor.example/quote",
+            "https://vendor.example:8443/quote",
+            &operator_headers(),
+        );
+
+        assert!(
+            !names.iter().any(|name| name == "authorization"),
+            "another port on the same host is another service, which the credential was not \
+             written for: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_that_comes_back_carries_the_credential_again_because_it_is_home() {
+        let asked_for = "https://vendor.example/quote";
+
+        let away =
+            header_names_on_the_hop(asked_for, "https://hop.example/quote", &operator_headers());
+        let home = header_names_on_the_hop(
+            asked_for,
+            "https://vendor.example/v2/quote",
+            &operator_headers(),
+        );
+
+        assert!(
+            !away.iter().any(|name| name == "authorization"),
+            "the middle of an a -> b -> a chain is still a third party: {away:?}"
+        );
+        assert!(
+            home.iter().any(|name| name == "authorization"),
+            "every hop is judged against the url the caller asked for, not against the hop before \
+             it, so returning home restores the credential and an origin that redirects to itself \
+             can never earn one: {home:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_header_the_caller_gave_reaches_the_origin_they_asked_for() {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let app = axum::Router::new().route(
+            "/page",
+            axum::routing::get(move |received: axum::http::HeaderMap| {
+                let recorded = recorded.clone();
+                async move {
+                    let mut noted = recorded.lock().expect("record the request headers");
+                    for (name, value) in &received {
+                        noted.push((
+                            name.as_str().to_owned(),
+                            value.to_str().unwrap_or_default().to_owned(),
+                        ));
+                    }
+                    drop(noted);
+                    axum::response::Html("<html><body>landing</body></html>")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let url = format!("http://{address}/page");
+
+        let response = get_guarded(&guarded_client(), &url, &operator_headers(), TEST_TIMEOUT)
+            .await
+            .expect("a page that does not redirect is returned");
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let noted = seen.lock().expect("read the recorded headers");
+        assert!(
+            noted
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == OPERATOR_TOKEN),
+            "the url the caller asked for is its own origin, so the credential must arrive \
+             untouched: {noted:?}"
+        );
+        assert!(
+            noted.iter().any(|(name, _)| name == "user-agent"),
+            "the operator's user agent must arrive too: {noted:?}"
+        );
     }
 }

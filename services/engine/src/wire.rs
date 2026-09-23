@@ -114,7 +114,6 @@ pub fn event_to_active_model(event: &ExecutionEvent) -> execution_event::ActiveM
 mod tests {
     use super::*;
     use engine_core::{ActiveNode, Event, ExecutionId, ExecutionPayload, NodeId};
-    use std::time::Duration;
 
     #[test]
     fn status_round_trips_through_columns() {
@@ -190,6 +189,5 @@ mod tests {
         ] {
             let _active = event_to_active_model(&event);
         }
-        let _ = Duration::ZERO;
     }
 }

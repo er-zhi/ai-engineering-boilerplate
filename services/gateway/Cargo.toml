@@ -13,7 +13,6 @@ common = { workspace = true }
 connectrpc = { workspace = true, features = ["axum", "client"] }
 axum = { workspace = true }
 chrono = { workspace = true }
-hyper-util = { workspace = true }
 rand = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }

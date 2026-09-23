@@ -72,6 +72,20 @@ without re-measuring.
 the pronoun turn, where `place: "there"` reached a village of that name, scored 0.96. That is why the
 argument guard above exists upstream of it.
 
+**What the guard reads.** The material a reply is checked against is what came back, rendered
+exactly as the model was shown it — the same window of recent results, the same per-result cut, and
+nothing the model did not see. Two ways of getting this wrong were found by the golden run, each
+refusing or passing the wrong replies:
+
+- *Reading less than the model.* A check capped at a fraction of what the prompt carried refused
+  correct knowledge-base answers drawn from later in a passage, as invented. Worse, a single
+  lookup whose result is itself a list of hits was windowed as if each hit were a lookup of its
+  own, which dropped hits from the front: a reply naming the first course the store returned was
+  judged ungrounded.
+- *Reading what was asked for.* With each record's arguments in the material, a weather question
+  answered with the place name — the incident above — read as grounded, because the place was in
+  the arguments. What was asked for is not evidence of the answer.
+
 ## Reply: does it only undertake work
 
 `PROMISE_ENOUGH_TO_REFUSE = 0.5` — `services/engine/src/executors/llm.rs`
@@ -98,6 +112,32 @@ Asked of the message on the routing decision. 12 messages:
 11 of 12 at 0.5. The twelfth is "thanks, that's helpful" at 0.09, which is correct — it does not
 stand alone as a request — and is settled earlier by the `actionable` question.
 
+## Message: resolving one that leans on the conversation
+
+`RESOLVE_SYSTEM_PROMPT`, `services/chat/src/intent.rs`
+
+Six (earlier turns, new message) pairs, run against the live router:
+
+| Message | Earlier turns | Rewritten to |
+|---|---|---|
+| "where?" | a temperature and a humidity, both for one place | "which place was that humidity reading taken for?" |
+| "where?" | one temperature | "which place was that weather reading taken for?" |
+| "and the humidity?" | a temperature for a place | "and the humidity in \<that place\>?" |
+| "ok what waether there?" | a declined capital question | "ok what waether in the capital of Japan?" |
+| "and tomorrow?" | an index level | "NASDAQ tomorrow?" |
+| a question already standing alone | a temperature | returned unchanged |
+
+**A rule rewritten on measurement.** The bare question words were the two failures. Told only that
+"a message can ask about the earlier answer itself rather than about its subject", the light model
+produced "where in Tokyo?" — a question about the subject — and "where is 14.11?", a question about
+the figure. Naming both of those as the mistakes, beside a worked rewrite, fixes both and leaves the
+other four untouched. The misspelling surviving the rewrite is correct: the rule is near-verbatim.
+
+**What this does not settle.** A rewritten question about an earlier lookup can only be answered
+from that lookup's material, and a turn that falls back to opening a topic of its own carries none:
+the `already_found` option is offered only where there is prior material, so the question reaches
+`none` and is declined. The rewrite is necessary and not sufficient.
+
 ## Material: can an earlier turn's records answer this
 
 The `already_found` option's description, `services/engine/src/executors/llm.rs`
@@ -109,6 +149,24 @@ declines.
 
 A bare "where?" reaches `none` at 0.23–0.51 under every wording — the question is too empty to route
 on. It is answered because Chat rewrites it against the session first.
+
+## Owed to the next version bump
+
+The split prompt's worked example names this deployment's own corpus:
+`EXAMPLE_QUESTION_1 = "What is Claude Code?"` and `EXAMPLE_QUESTION_2 = "Which Academy courses
+exist?"` in `services/chat/src/intent.rs`. What the example buys is structural — two themes sharing
+no noun, one "what is X" and one "which Y exist" — and any pair of that shape buys the same thing,
+so the subjects are a deployment leaking into the engine rather than something the prompt needs.
+
+They are not being swapped now, because an earlier version of this example taught the exact bug it
+now prevents: it showed two themes collapsing into one question and the model collapsed them. New
+wording is new behaviour, and behaviour here is not argued, it is measured. Swap the pair for a
+deployment-neutral one of the same shape on the next version bump, when every table above is being
+replayed anyway, and measure it with them.
+
+The reference-resolution rule in the same prompt — "the capital of Kyrgyzstan, and the weather
+there", and the explicit "never `in Bishkek`" — stays. Those are world facts illustrating how a
+reference is resolved; they name nothing this deployment holds.
 
 ## Latency, for the cost argument
 

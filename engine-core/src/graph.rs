@@ -152,7 +152,6 @@ pub enum Condition {
     Truthy(String),
     Eq(String, serde_json::Value),
     Exists(String),
-    Failed,
     Not(Box<Condition>),
     And(Vec<Condition>),
     Or(Vec<Condition>),
@@ -167,7 +166,6 @@ pub fn evaluate_condition(condition: &Condition, state: &serde_json::Value) -> b
             .pointer(pointer)
             .is_some_and(|value| value == expected),
         Condition::Exists(pointer) => state.pointer(pointer).is_some(),
-        Condition::Failed => false,
         Condition::Not(inner) => !evaluate_condition(inner, state),
         Condition::And(parts) => parts.iter().all(|part| evaluate_condition(part, state)),
         Condition::Or(parts) => parts.iter().any(|part| evaluate_condition(part, state)),

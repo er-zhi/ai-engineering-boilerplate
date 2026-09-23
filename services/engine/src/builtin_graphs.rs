@@ -1,6 +1,5 @@
 // Registers the graphs every engine ships with at startup.
 
-use crate::error::EngineError;
 use crate::service::Service;
 
 const RETRIEVAL_TOOL_SLUG_VAR: &str = "RAG_RETRIEVAL_TOOL_SLUG";
@@ -35,13 +34,11 @@ pub async fn register_all(service: &Service) {
             .await
         {
             Ok((_, version)) => tracing::info!(graph = name, version, "built-in graph registered"),
-            Err(error) => report(name, &error),
+            Err(error) => {
+                tracing::error!(graph = name, %error, "failed to register built-in graph")
+            }
         }
     }
-}
-
-fn report(graph: &str, error: &EngineError) {
-    tracing::error!(graph, %error, "failed to register built-in graph");
 }
 
 #[cfg(all(test, feature = "test-support"))]

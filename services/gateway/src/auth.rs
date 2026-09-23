@@ -1,5 +1,6 @@
 // Session tokens: generated, hashed for storage, and compared to the configured password without leaking timing.
 
+use axum::http::{HeaderMap, header};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -26,6 +27,13 @@ pub fn passwords_match(candidate: &str, expected: &str) -> bool {
         difference |= a ^ b;
     }
     difference == 0
+}
+
+pub fn session_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| cookie_value(cookies, COOKIE_NAME))
 }
 
 pub fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {

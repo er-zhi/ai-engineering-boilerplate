@@ -25,16 +25,15 @@ pub(crate) fn job_from(row: crawl_job::Model) -> CrawlJob {
         id: row.id,
         base_url: row.base_url,
         status: row.status.into(),
-        pages_crawled: stored_page_count(row.id, "pages_crawled", row.pages_crawled),
-        pages_skipped: stored_page_count(row.id, "pages_skipped", row.pages_skipped),
+        pages_crawled: stored_page_count(row.id, row.pages_crawled),
     }
 }
 
-fn stored_page_count(job_id: i64, column: &str, value: i32) -> u32 {
+fn stored_page_count(job_id: i64, value: i32) -> u32 {
     u32::try_from(value).unwrap_or_else(|error| {
         tracing::error!(
             job = job_id,
-            column,
+            column = "pages_crawled",
             value,
             "invalid crawl job counter: {error}"
         );
@@ -53,7 +52,6 @@ impl JobStore for PgJobs {
             base_url: Set(base_url.to_owned()),
             status: Set(Status::Queued),
             pages_crawled: Set(0),
-            pages_skipped: Set(0),
             idempotency_key: Set(idempotency_key.map(str::to_owned)),
             created_at: Set(now),
             updated_at: Set(now),

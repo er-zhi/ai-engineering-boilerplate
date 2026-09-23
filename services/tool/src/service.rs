@@ -304,7 +304,7 @@ impl Service {
 
         let criteria = criteria_for(tool.risk);
         let mut request: DecideRequest = serde_json::from_value(serde_json::json!({
-            "state": definition_state(&tool),
+            "state": definition_text(&tool),
         }))
         .map_err(|e| ToolError::InvalidRequest(format!("could not build the decision: {e}")))?;
         request.questions = criteria
@@ -636,10 +636,6 @@ fn decide_call_error(error: ConnectError) -> ToolError {
 }
 
 // What the decider is told about the tool under review.
-fn definition_state(tool: &crate::entity::tool::Model) -> Value {
-    Value::String(definition_text(tool))
-}
-
 fn definition_text(tool: &crate::entity::tool::Model) -> String {
     format!(
         "name: {}\ndescription: {}\ninput_schema: {}\noutput_schema: {}\nrisk: {:?}\ntimeout_seconds: {}",
@@ -859,16 +855,7 @@ mod tests {
     }
 
     async fn service_with(llm_url: &str) -> (crate::test_db::TestDb, Service) {
-        let test = crate::test_db::start().await;
-        let service = Service::new(
-            test.db.clone(),
-            llm_url,
-            "unused-in-these-tests".to_owned(),
-            "unused-in-these-tests".to_owned(),
-            "http://127.0.0.1:1",
-        )
-        .expect("service");
-        (test, service)
+        full_service_with(llm_url, "http://127.0.0.1:1").await
     }
 
     async fn full_service_with(llm_url: &str, kb_url: &str) -> (crate::test_db::TestDb, Service) {

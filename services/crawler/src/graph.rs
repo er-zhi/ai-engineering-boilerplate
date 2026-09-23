@@ -37,13 +37,6 @@ pub trait EdgeStore: Clone + Send + Sync + 'static {
         from_url: &str,
         links: Vec<Link>,
     ) -> impl Future<Output = Result<(), DbErr>> + Send;
-
-    fn neighbors(
-        &self,
-        start_url: &str,
-        relation_types: Vec<RelationType>,
-        max_depth: u32,
-    ) -> impl Future<Output = Result<Vec<Neighbor>, DbErr>> + Send;
 }
 
 #[derive(Clone)]
@@ -89,33 +82,8 @@ impl PgEdges {
             .await?;
         Ok(rows.into_iter().map(|row| (row.url.clone(), row)).collect())
     }
-}
 
-impl EdgeStore for PgEdges {
-    async fn replace_outbound(&self, from_url: &str, links: Vec<Link>) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
-        page_edge::Entity::delete_many()
-            .filter(page_edge::Column::FromUrl.eq(from_url))
-            .filter(page_edge::Column::RelationType.eq(RelationType::LinksTo))
-            .exec(&txn)
-            .await?;
-        if !links.is_empty() {
-            let discovered_at = Utc::now();
-            let rows = links.into_iter().map(|link| page_edge::ActiveModel {
-                from_url: Set(from_url.to_owned()),
-                to_url: Set(link.url),
-                relation_type: Set(RelationType::LinksTo),
-                anchor_text: Set(link.anchor_text),
-                metadata: Set(None),
-                discovered_at: Set(discovered_at),
-                ..Default::default()
-            });
-            page_edge::Entity::insert_many(rows).exec(&txn).await?;
-        }
-        txn.commit().await
-    }
-
-    async fn neighbors(
+    pub async fn neighbors(
         &self,
         start_url: &str,
         relation_types: Vec<RelationType>,
@@ -162,6 +130,31 @@ impl EdgeStore for PgEdges {
                 }
             })
             .collect())
+    }
+}
+
+impl EdgeStore for PgEdges {
+    async fn replace_outbound(&self, from_url: &str, links: Vec<Link>) -> Result<(), DbErr> {
+        let txn = self.db.begin().await?;
+        page_edge::Entity::delete_many()
+            .filter(page_edge::Column::FromUrl.eq(from_url))
+            .filter(page_edge::Column::RelationType.eq(RelationType::LinksTo))
+            .exec(&txn)
+            .await?;
+        if !links.is_empty() {
+            let discovered_at = Utc::now();
+            let rows = links.into_iter().map(|link| page_edge::ActiveModel {
+                from_url: Set(from_url.to_owned()),
+                to_url: Set(link.url),
+                relation_type: Set(RelationType::LinksTo),
+                anchor_text: Set(link.anchor_text),
+                metadata: Set(None),
+                discovered_at: Set(discovered_at),
+                ..Default::default()
+            });
+            page_edge::Entity::insert_many(rows).exec(&txn).await?;
+        }
+        txn.commit().await
     }
 }
 

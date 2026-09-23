@@ -68,10 +68,6 @@ impl KnowledgeBaseService for Ingestor {
     }
 }
 
-fn env(name: &str) -> Result<String, String> {
-    std::env::var(name).map_err(|_| format!("{name} is not set"))
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     common::logging::init();
@@ -87,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EMBEDDER_CALL_TIMEOUT,
     )?;
 
-    let database_url = env("DATABASE_URL")?;
+    let database_url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
     let db = Database::connect(&database_url).await?;
     db.get_schema_registry("knowledge_base::entity::*")
         .sync(&db)

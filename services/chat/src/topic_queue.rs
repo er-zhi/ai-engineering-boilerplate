@@ -41,6 +41,10 @@ impl TopicManager {
         let txn = self.session.db.begin().await?;
         let locked = lock_session(&txn, session_id).await?;
         let principal = principal_of(&locked);
+        if self.admission_status(&txn, session_id).await? != Status::Running {
+            txn.commit().await?;
+            return Ok(());
+        }
         let Some(next) = topic::Entity::find()
             .filter(topic::Column::SessionId.eq(session_id))
             .filter(topic::Column::Status.eq(Status::Queued))
@@ -207,7 +211,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_promotions_cannot_start_the_same_queued_topic_twice() {
+    async fn a_promotion_never_takes_a_session_past_the_running_limit() {
         let (_test, manager, fake) = manager_with().await;
         let user_id = Uuid::new_v4();
         for i in 0..MAX_CONCURRENT_TOPICS {
@@ -216,12 +220,64 @@ mod tests {
                 .await
                 .expect("create");
         }
+        for i in 0..2 {
+            let (_, status) = manager
+                .create_topic(user_id, None, format!("Q{i}"), serde_json::json!({}))
+                .await
+                .expect("create");
+            assert_eq!(status, Status::Queued);
+        }
+        let session_id = manager.session_of_user(user_id).await.expect("session").id;
+        let before = fake.start_execution_count();
+
+        manager
+            .promote_next_queued(session_id)
+            .await
+            .expect("promote");
+        manager
+            .promote_next_queued(session_id)
+            .await
+            .expect("promote");
+
+        assert_eq!(
+            fake.start_execution_count(),
+            before,
+            "nothing has finished, so a promotion must start nothing: promotion checks the limit \
+             it exists to keep rather than trusting its caller to have freed a slot"
+        );
+        let running = topic::Entity::find()
+            .filter(topic::Column::SessionId.eq(session_id))
+            .filter(topic::Column::Status.eq(Status::Running))
+            .count(manager.db())
+            .await
+            .expect("count");
+        assert_eq!(running, MAX_CONCURRENT_TOPICS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_promotions_cannot_start_the_same_queued_topic_twice() {
+        let (_test, manager, fake) = manager_with().await;
+        let user_id = Uuid::new_v4();
+        let mut running_ids = Vec::new();
+        for i in 0..MAX_CONCURRENT_TOPICS {
+            let (id, _) = manager
+                .create_topic(user_id, None, format!("T{i}"), serde_json::json!({}))
+                .await
+                .expect("create");
+            running_ids.push(id);
+        }
         let (queued_id, status) = manager
             .create_topic(user_id, None, "Overflow".into(), serde_json::json!({}))
             .await
             .expect("create");
         assert_eq!(status, Status::Queued);
         let session_id = manager.session_of_user(user_id).await.expect("session").id;
+        let mut settled: topic::ActiveModel = topic_row(&manager, running_ids[0]).await.into();
+        settled.status = Set(Status::Completed);
+        settled
+            .update(manager.db())
+            .await
+            .expect("one topic leaves, which is the only thing that frees a slot to promote into");
         let before = fake.start_execution_count();
 
         let (first, second) = tokio::join!(

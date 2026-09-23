@@ -76,16 +76,6 @@ impl EngineClient {
         })
     }
 
-    pub async fn start_execution(
-        &self,
-        principal: &Principal,
-        graph_id: &str,
-        input_json: &str,
-    ) -> Result<Uuid, String> {
-        self.start_continuing(principal, graph_id, input_json, None)
-            .await
-    }
-
     /// `continues` names the execution this one follows on from, so Engine can carry what that
     /// turn's sources returned into this one. Chat never sees that material: a follow-up like
     /// "where?" asks about it, and only Engine holds it.
@@ -341,7 +331,7 @@ mod tests {
         let client = EngineClient::new(&url).expect("client");
 
         let got = client
-            .start_execution(&a_principal(), "agent", r#"{"question": "hi"}"#)
+            .start_continuing(&a_principal(), "agent", r#"{"question": "hi"}"#, None)
             .await
             .expect("start");
 
@@ -447,7 +437,7 @@ mod tests {
         let principal = a_principal();
 
         client
-            .start_execution(&principal, "agent", "{}")
+            .start_continuing(&principal, "agent", "{}", None)
             .await
             .expect("start");
         client
@@ -463,7 +453,7 @@ mod tests {
         assert_eq!(
             seen.len(),
             3,
-            "start_execution, interrupt and stream_events"
+            "start_continuing, interrupt and stream_events"
         );
         for received in seen.iter() {
             assert_eq!(

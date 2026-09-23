@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response as HttpResponse};
 
-use crate::auth::{COOKIE_NAME, cookie_value, generate_token, hash_token, passwords_match};
+use crate::auth::{COOKIE_NAME, generate_token, hash_token, passwords_match, session_token};
 use crate::sessions::PgCacheStore;
 
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
@@ -36,12 +36,7 @@ pub async fn require_session(
     request: Request,
     next: Next,
 ) -> HttpResponse {
-    let token = request
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|header| cookie_value(header, COOKIE_NAME));
-    let Some(token) = token else {
+    let Some(token) = session_token(request.headers()) else {
         return unauthenticated(request.uri().path());
     };
 
@@ -118,11 +113,7 @@ pub async fn login_submit(
 }
 
 pub async fn logout(State(auth): State<Auth>, headers: HeaderMap) -> HttpResponse {
-    let token = headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|header| cookie_value(header, COOKIE_NAME));
-    if let Some(token) = token
+    if let Some(token) = session_token(&headers)
         && let Err(error) = auth.sessions.delete(&hash_token(token)).await
     {
         tracing::error!("could not delete a session on logout: {error:?}");

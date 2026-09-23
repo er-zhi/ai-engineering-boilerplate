@@ -38,21 +38,19 @@ fn public_ids_round_trip_and_garbage_does_not_parse() {
 }
 
 #[test]
-fn negative_stored_page_counts_are_reported_as_zero_without_panicking() {
+fn a_negative_stored_page_count_is_reported_as_zero_without_panicking() {
     let now = Utc::now();
     let job = job_from(crawl_job::Model {
         id: 42,
         base_url: "https://example.com".to_owned(),
         status: Status::Running,
         pages_crawled: -1,
-        pages_skipped: -2,
         idempotency_key: None,
         created_at: now,
         updated_at: now,
     });
 
     assert_eq!(job.pages_crawled, 0);
-    assert_eq!(job.pages_skipped, 0);
 }
 
 #[tokio::test]

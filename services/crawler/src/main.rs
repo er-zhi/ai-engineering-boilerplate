@@ -31,12 +31,12 @@ use connectrpc::{
     ConnectError, RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
 };
 
-use sea_orm::Database;
+use sea_orm::{ConnectionTrait, Database};
 
 use crate::crawl::Limits;
-use crate::entity::crawl_job::MAX_BASE_URL_CHARS;
+use crate::entity::crawl_job::{MAX_BASE_URL_CHARS, STATEMENTS_RUN_AFTER_SCHEMA_SYNC};
 use crate::entity::page_edge::RelationType;
-use crate::graph::{EdgeStore, MAX_REQUESTABLE_DEPTH, PgEdges};
+use crate::graph::{MAX_REQUESTABLE_DEPTH, PgEdges};
 use crate::job_store::PgJobs;
 use crate::jobs::{Jobs, MAX_CONCURRENT_CRAWLS, parse_job_id};
 use crate::knowledge_base::KnowledgeBaseClient;
@@ -115,7 +115,6 @@ impl CrawlerService for Crawler {
             base_url: job.base_url,
             status: EnumValue::Known(job.status),
             pages_crawled: job.pages_crawled,
-            pages_skipped: job.pages_skipped,
             ..Default::default()
         })
     }
@@ -348,6 +347,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.get_schema_registry("crawler::entity::*")
         .sync(&db)
         .await?;
+    for statement in STATEMENTS_RUN_AFTER_SCHEMA_SYNC {
+        db.execute_unprepared(statement).await?;
+    }
 
     let knowledge_base_url =
         std::env::var("KNOWLEDGE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8084".to_owned());
@@ -397,6 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::EdgeStore;
 
     #[tokio::test]
     async fn accepts_absolute_http_and_https_urls_on_public_hosts() {

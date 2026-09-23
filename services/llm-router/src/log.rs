@@ -45,15 +45,6 @@ pub trait DecisionLog: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), DbErr>> + Send;
 }
 
-// Retention belongs to the tables rather than to either class of call, so it is its own seam: one periodic
-// job opens the months ahead for all four audit tables and drops the payload months past retention.
-pub trait PartitionUpkeep: Clone + Send + Sync + 'static {
-    fn maintain_partitions(
-        &self,
-        now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<Swept, DbErr>> + Send;
-}
-
 #[derive(Clone)]
 pub struct PgAuditLog {
     db: DatabaseConnection,
@@ -62,6 +53,12 @@ pub struct PgAuditLog {
 impl PgAuditLog {
     pub fn new(db: DatabaseConnection) -> Self {
         Self { db }
+    }
+
+    // Retention belongs to the tables rather than to either class of call: one periodic job opens the
+    // months ahead for all four audit tables and drops the payload months past retention.
+    pub async fn maintain_partitions(&self, now: DateTime<Utc>) -> Result<Swept, DbErr> {
+        partition::maintain(&self.db, now).await
     }
 }
 
@@ -126,12 +123,6 @@ impl DecisionLog for PgAuditLog {
         .await?;
 
         both_rows_or_neither.commit().await
-    }
-}
-
-impl PartitionUpkeep for PgAuditLog {
-    async fn maintain_partitions(&self, now: DateTime<Utc>) -> Result<Swept, DbErr> {
-        partition::maintain(&self.db, now).await
     }
 }
 

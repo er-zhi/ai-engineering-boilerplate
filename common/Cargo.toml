@@ -9,20 +9,23 @@ publish.workspace = true
 workspace = true
 
 [features]
+extract = ["dep:dom_smoothie", "dep:sha2"]
+partition = ["dep:chrono", "dep:sea-orm"]
 test-support = ["dep:sea-orm", "dep:testcontainers"]
 
 [dependencies]
 buffa = { workspace = true }
 buffa-types = { workspace = true }
 connectrpc = { workspace = true }
-dom_smoothie = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true, optional = true }
+dom_smoothie = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 testcontainers = { workspace = true, optional = true }
 
 [build-dependencies]

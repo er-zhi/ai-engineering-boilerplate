@@ -323,6 +323,31 @@ mod tests {
     use super::*;
     use crate::fakes::*;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const WATCHER_DEADLINE: Duration = Duration::from_secs(10);
+    const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+    async fn topic_once_its_watcher_has_seen_the_armed_event(
+        manager: &Arc<TopicManager>,
+        topic_id: i64,
+    ) -> topic::Model {
+        let settled = tokio::time::timeout(WATCHER_DEADLINE, async {
+            loop {
+                let row = topic_row(manager, topic_id).await;
+                if row.status != Status::Running {
+                    return row;
+                }
+                tokio::time::sleep(WATCHER_POLL_INTERVAL).await;
+            }
+        })
+        .await;
+        settled.expect(
+            "the watcher spawned with the topic must reach the armed terminal event; a second \
+             watcher started by the test would finish the topic a second time and move focus \
+             again behind the assertions",
+        )
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_turn_with_nothing_to_act_on_starts_no_topic_and_says_so() {
@@ -564,8 +589,14 @@ mod tests {
             )
             .await
             .expect("create");
-        let execution_id = arm_completed_event(manager, fake, parent_id, PARENT_ANSWER).await;
-        manager.watch_topic(parent_id, execution_id).await;
+        arm_completed_event(manager, fake, parent_id, PARENT_ANSWER).await;
+        let parent = topic_once_its_watcher_has_seen_the_armed_event(manager, parent_id).await;
+        assert_eq!(
+            parent.status,
+            Status::Completed,
+            "the parent must be finished before focus is placed back on it, so that no later \
+             completion can move focus off it again"
+        );
         manager
             .set_focus(user_id, parent_id)
             .await
@@ -648,9 +679,14 @@ mod tests {
         let starts_after_child = fake.start_execution_count();
         let interrupts_after_child = fake.interrupt_count();
 
-        let execution_id =
-            arm_completed_event(&manager, &fake, child_id, "VS Code and JetBrains.").await;
-        manager.watch_topic(child_id, execution_id).await;
+        arm_completed_event(&manager, &fake, child_id, "VS Code and JetBrains.").await;
+        let child = topic_once_its_watcher_has_seen_the_armed_event(&manager, child_id).await;
+        assert_eq!(
+            child.status,
+            Status::Completed,
+            "the child must have finished before the retry, or the retry is not the case this \
+             test names"
+        );
         assert_eq!(
             focus_of(&manager, user_id).await,
             Some(sibling_id),

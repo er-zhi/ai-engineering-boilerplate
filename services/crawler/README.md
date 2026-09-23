@@ -15,7 +15,7 @@ Crawls public websites with [spider-rs](https://github.com/spider-rs/spider), ex
 
 Jobs move from `QUEUED` to `RUNNING`, then `DONE` or `FAILED`. An optional `idempotency_key` returns the existing job when the same request is retried. At most two crawls execute concurrently; additional jobs remain queued. A PostgreSQL advisory lock ensures only one Crawler process owns the queue, and unfinished jobs are marked failed when a new owner takes over.
 
-The pipeline uses bounded channels with capacity one. If a stage loses a fetched page, the job fails instead of silently reporting incomplete success. `pages_skipped` is reserved for future crawl-side skipping and currently remains zero.
+The pipeline uses bounded channels with capacity one. If a stage loses a fetched page, the job fails instead of silently reporting incomplete success.
 
 The tokio worker pool is a fixed 8 threads rather than a CPU-derived count. `crawl_into`'s spider
 callback gets its backpressure from `block_in_place` plus a blocking send, and `block_in_place`

@@ -121,6 +121,7 @@ mod tests {
     use crate::executors::llm::LlmTaskExecutor;
     use crate::executors::tool::ToolTaskExecutor;
     use buffa::EnumValue;
+    use common::agent_replies::PROMISE_REFUSED;
     use common::proto::llm_router::v1::{
         CompleteRequest, CompleteResponse, DescribeTiersRequest, DescribeTiersResponse,
         LlmRouterService,
@@ -311,7 +312,12 @@ mod tests {
             .await
             .expect("execute");
 
-        assert_eq!(output["reply"], json!("ok"));
+        assert_eq!(
+            output["reply"],
+            json!(PROMISE_REFUSED),
+            "the turn ran without ever reaching the tool service, and no decider was there to \
+             check the reply, so the reply is not sent as it is"
+        );
     }
 
     #[tokio::test]

@@ -12,10 +12,8 @@ workspace = true
 axum = { workspace = true }
 buffa = { workspace = true }
 chrono = { workspace = true }
-common = { workspace = true }
+common = { workspace = true, features = ["extract"] }
 connectrpc = { workspace = true, features = ["axum", "client"] }
-hyper-util = { workspace = true }
-pgvector = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }

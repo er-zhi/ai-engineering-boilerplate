@@ -46,12 +46,6 @@ impl TopicEventKind {
     }
 }
 
-impl std::fmt::Display for TopicEventKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.as_column())
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopicEvent {
     pub event_id: Uuid,

@@ -10,7 +10,9 @@ use common::proto::crawler::v1::{
 };
 use connectrpc::ErrorCode;
 
-use super::start_gateway;
+use super::{
+    crawler_client_to, start_gateway, unreachable_chat_client, unreachable_knowledge_base_client,
+};
 use crate::proxy::Gateway;
 
 #[path = "crawler/support.rs"]
@@ -22,12 +24,12 @@ async fn get_page_neighbors_forwards_the_complete_request_and_response() {
     let fake_crawler = fake_crawler(0, ErrorCode::Unavailable);
     let crawler_url = start_fake_crawler(Arc::clone(&fake_crawler)).await;
     let gateway = Gateway {
-        crawler: client_to(&crawler_url),
+        crawler: crawler_client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
         chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
-    let client = client_to(&gateway_url);
+    let client = crawler_client_to(&gateway_url);
     let sent = GetPageNeighborsRequest {
         url: "https://example.com/start".to_owned(),
         allowed_relation_types: vec![
@@ -57,12 +59,12 @@ async fn get_crawl_job_is_forwarded_through_gateway() {
     let fake_crawler = fake_crawler(0, ErrorCode::Unavailable);
     let crawler_url = start_fake_crawler(fake_crawler).await;
     let gateway = Gateway {
-        crawler: client_to(&crawler_url),
+        crawler: crawler_client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
         chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
-    let client = client_to(&gateway_url);
+    let client = crawler_client_to(&gateway_url);
     let response = client
         .get_crawl_job(GetCrawlJobRequest::default())
         .await
@@ -76,12 +78,12 @@ async fn get_page_neighbors_retries_transient_failures_until_success() {
     let fake_crawler = fake_crawler(2, ErrorCode::Unavailable);
     let crawler_url = start_fake_crawler(Arc::clone(&fake_crawler)).await;
     let gateway = Gateway {
-        crawler: client_to(&crawler_url),
+        crawler: crawler_client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
         chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
-    let client = client_to(&gateway_url);
+    let client = crawler_client_to(&gateway_url);
     let response = client
         .get_page_neighbors(GetPageNeighborsRequest::default())
         .await
@@ -96,12 +98,12 @@ async fn get_page_neighbors_does_not_retry_permanent_failures() {
     let fake_crawler = fake_crawler(1, ErrorCode::InvalidArgument);
     let crawler_url = start_fake_crawler(Arc::clone(&fake_crawler)).await;
     let gateway = Gateway {
-        crawler: client_to(&crawler_url),
+        crawler: crawler_client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
         chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
-    let client = client_to(&gateway_url);
+    let client = crawler_client_to(&gateway_url);
     let error = client
         .get_page_neighbors(GetPageNeighborsRequest::default())
         .await
@@ -122,12 +124,12 @@ async fn start_crawl_is_never_retried_even_on_a_transient_failure() {
     });
     let crawler_url = start_fake_crawler(Arc::clone(&fake_crawler)).await;
     let gateway = Gateway {
-        crawler: client_to(&crawler_url),
+        crawler: crawler_client_to(&crawler_url),
         knowledge_base: unreachable_knowledge_base_client(),
         chat: unreachable_chat_client(),
     };
     let gateway_url = start_gateway(gateway).await;
-    let client: CrawlerServiceClient<_> = client_to(&gateway_url);
+    let client: CrawlerServiceClient<_> = crawler_client_to(&gateway_url);
     let error = client
         .start_crawl(StartCrawlRequest::default())
         .await

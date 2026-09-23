@@ -177,6 +177,7 @@ const GROUNDED_WHEN_TRUE: &str =
     "every name, number and fact in the reply can be found in the material";
 const GROUNDED_WHEN_FALSE: &str =
     "the reply states a name, number or fact the material does not contain";
+const UNCHECKED_REFUSED: &str = PROMISE_REFUSED;
 const UNGROUNDED_CORRECTION: &str = r#" Nothing in what came back says it.
 Write the reply again using only the values in front of you, and do not repeat the refused words.
 The question names a subject; what came back holds what was measured about it, and the measurement
@@ -211,7 +212,17 @@ const MAX_SPAN_WORDS: usize = 3;
 const DECIDER_OPTION_CEILING: usize = 255;
 const MAX_SPAN_OPTIONS: usize = 200;
 const MAX_OPTION_NAME_BYTES: usize = 64;
+const MAX_OPTION_DESCRIPTION_BYTES: usize = 1_024;
+const STATE_BYTES_BEYOND_WHICH_THE_DECIDER_REFUSES: usize = 49_152;
+const STATE_BYTES_KEPT_FREE_FOR_THE_MESSAGE_AND_THE_REPLY: usize = 8_192;
+const WORST_CASE_BYTES_PER_CHAR_OF_JSON: usize = 4;
+const MAX_CHARS_OF_MATERIAL_IN_A_DECISION: usize = (STATE_BYTES_BEYOND_WHICH_THE_DECIDER_REFUSES
+    - STATE_BYTES_KEPT_FREE_FOR_THE_MESSAGE_AND_THE_REPLY)
+    / WORST_CASE_BYTES_PER_CHAR_OF_JSON;
+const TRIES_TO_FIT_THE_MATERIAL: usize = 8;
+const EACH_TRY_AIMS_AT_PERCENT_OF_THE_LIMIT: usize = 90;
 const _: () = assert!(MAX_SPAN_OPTIONS < DECIDER_OPTION_CEILING);
+const _: () = assert!(TRUNCATION_MARK.len() < MAX_OPTION_DESCRIPTION_BYTES);
 const MAX_ARGUMENTS_ASKED_ABOUT_AT_ONCE: usize = 4;
 
 fn shape_of(output: LlmOutput) -> String {
@@ -366,14 +377,32 @@ fn render_tool_result(index: usize, record: &Value) -> String {
 }
 
 fn truncated(text: &str) -> String {
-    if text.chars().count() <= MAX_CHARS_PER_RENDERED_TOOL_RESULT {
+    truncated_to(text, MAX_CHARS_PER_RENDERED_TOOL_RESULT)
+}
+
+fn truncated_to(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
         return text.to_owned();
     }
-    let kept: String = text
-        .chars()
-        .take(MAX_CHARS_PER_RENDERED_TOOL_RESULT)
-        .collect();
+    let kept: String = text.chars().take(chars).collect();
     format!("{kept}{TRUNCATION_MARK}")
+}
+
+fn clamped_to(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text.to_owned();
+    }
+    let kept =
+        &text[..last_char_boundary_within(text, bytes.saturating_sub(TRUNCATION_MARK.len()))];
+    format!("{kept}{TRUNCATION_MARK}")
+}
+
+fn last_char_boundary_within(text: &str, bytes: usize) -> usize {
+    let mut at = bytes.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 #[must_use]
@@ -465,7 +494,7 @@ impl TaskExecutor for LlmTaskExecutor {
             return fast_result;
         }
 
-        let request = complete_request(&config, state);
+        let request = complete_request_for(&config, state, Mode::Loop);
         let output = self.complete_with_retries(&request).await?;
         let material = everything_fetched_so_far(state);
 
@@ -484,10 +513,6 @@ fn everything_fetched_so_far(state: &Value) -> Value {
     let mut records = of(PRIOR_MATERIAL_STATE_KEY);
     records.extend(of(TOOL_RESULT_STATE_KEY));
     Value::Array(records)
-}
-
-fn complete_request(config: &LlmNodeConfig, state: &Value) -> CompleteRequest {
-    complete_request_for(config, state, Mode::Loop)
 }
 
 fn complete_request_for(config: &LlmNodeConfig, state: &Value, mode: Mode) -> CompleteRequest {
@@ -570,8 +595,10 @@ impl LlmTaskExecutor {
         material: &Value,
         output: Value,
     ) -> Value {
-        let Some(faults) = self.faults_in(material, &output).await else {
-            return output;
+        let faults = match self.faults_in(material, &output).await {
+            Check::NotNeeded => return output,
+            Check::CouldNotRun => return refused(output, UNCHECKED_REFUSED),
+            Check::Ran(faults) => faults,
         };
         let output = merge_usage(&faults.spent, output);
         if faults.sound() {
@@ -585,16 +612,24 @@ impl LlmTaskExecutor {
             return refused(output, faults.refusal());
         };
         let second = merge_usage(&output, second);
+        self.second_reply_checked_against(material, second).await
+    }
+
+    async fn second_reply_checked_against(&self, material: &Value, second: Value) -> Value {
         match self.faults_in(material, &second).await {
-            Some(again) if !again.sound() => {
+            Check::Ran(again) if !again.sound() => {
                 tracing::warn!(
                     ?again,
                     "the second reply did not hold up either, answering plainly"
                 );
                 refused(merge_usage(&again.spent, second), again.refusal())
             }
-            Some(again) => merge_usage(&again.spent, second),
-            None => second,
+            Check::Ran(again) => merge_usage(&again.spent, second),
+            Check::NotNeeded => second,
+            Check::CouldNotRun => {
+                tracing::warn!("the second reply could not be checked either, answering plainly");
+                refused(second, UNCHECKED_REFUSED)
+            }
         }
     }
 
@@ -692,22 +727,24 @@ impl LlmTaskExecutor {
             .map_or("", |tool| tool.input_schema_json.as_str())
     }
 
-    async fn faults_in(&self, material: &Value, output: &Value) -> Option<Faults> {
-        let reply = output
-            .get("reply")
-            .and_then(Value::as_str)
-            .filter(|reply| {
-                !reply.is_empty() && output.get("tool_call").is_none_or(Value::is_null)
-            })?;
-        let request = reply_check_request(material, reply)?;
-        let decided = match self.decider.decide(request).await {
-            Ok(response) => response.into_owned(),
-            Err(error) => {
-                tracing::warn!(%error, "could not check the reply, leaving it as it is");
-                return None;
-            }
+    async fn faults_in(&self, material: &Value, output: &Value) -> Check {
+        let Some(reply) = output.get("reply").and_then(Value::as_str).filter(|reply| {
+            !reply.is_empty() && output.get("tool_call").is_none_or(Value::is_null)
+        }) else {
+            return Check::NotNeeded;
         };
-        Some(Faults {
+        let Some(request) = reply_check_request(material, reply) else {
+            tracing::warn!(
+                "the reply and what came back do not fit in one decision, so the reply is not sent \
+                 unchecked"
+            );
+            return Check::CouldNotRun;
+        };
+        let Some(decided) = self.decided_once_more_on_error(request).await else {
+            tracing::warn!("could not check the reply, so it is not sent unchecked");
+            return Check::CouldNotRun;
+        };
+        Check::Ran(Faults {
             promises: find_noul(&decided.answers, PROMISE_ID)
                 .is_some_and(|value| value > PROMISE_ENOUGH_TO_REFUSE),
             ungrounded: find_noul(&decided.answers, GROUNDED_ID)
@@ -746,7 +783,8 @@ impl LlmTaskExecutor {
             state_with_extra_tool_result(state, tool_record(&call, result.clone()));
         let request = complete_request_for(config, &state_with_result, Mode::Loop);
         let output = self.complete_with_retries(&request).await?;
-        let output = self.checked_against(&request, &result, output).await;
+        let material = everything_fetched_so_far(&state_with_result);
+        let output = self.checked_against(&request, &material, output).await;
         let output = merge_usage(decide_usage, merge_usage(&spent, output));
         Ok(attach_fast_tool_call(output, &call, result))
     }
@@ -764,7 +802,8 @@ impl LlmTaskExecutor {
             state_with_extra_tool_result(state, tool_record(call, result.clone()));
         let request = complete_request_for(config, &state_with_result, Mode::Loop);
         let output = self.complete_with_retries(&request).await?;
-        let output = self.checked_against(&request, &result, output).await;
+        let material = everything_fetched_so_far(&state_with_result);
+        let output = self.checked_against(&request, &material, output).await;
         let output = merge_usage(decide_usage, output);
         Ok(attach_fast_tool_call(output, call, result))
     }
@@ -887,7 +926,10 @@ fn decide_request(
     rendered_prior: Option<&str>,
 ) -> Option<DecideRequest> {
     let state = match rendered_prior {
-        Some(rendered) => json!({"message": question, "already_found": rendered}),
+        Some(rendered) => json!({
+            "message": question,
+            "already_found": truncated_to(rendered, MAX_CHARS_OF_MATERIAL_IN_A_DECISION),
+        }),
         None => json!(question),
     };
     let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
@@ -1008,12 +1050,11 @@ fn question_set_for(
 ) -> Option<Vec<Question>> {
     let mut options: Vec<ChoiceOption> = candidates
         .iter()
-        .map(|(value, line)| ChoiceOption {
-            name: value.clone(),
-            description: line.clone(),
-            ..Default::default()
-        })
+        .filter_map(|(value, line)| offered(value, line.as_deref()))
         .collect();
+    if options.is_empty() {
+        return None;
+    }
     options.push(ChoiceOption {
         name: NO_VALUE_OPTION.to_owned(),
         description: Some("no option is that value".to_owned()),
@@ -1079,8 +1120,51 @@ fn instructed(id: &str, instructions: Value) -> Option<Question> {
     Some(question)
 }
 
+fn what_came_back(material: &Value) -> Vec<String> {
+    let records: Vec<&Value> = material
+        .as_array()
+        .map_or_else(|| vec![material], |records| records.iter().collect());
+    let first_read = records.len().saturating_sub(RENDERED_TOOL_RESULTS);
+    records
+        .into_iter()
+        .enumerate()
+        .skip(first_read)
+        .map(|(index, record)| {
+            let without_what_was_asked = record.get("result").unwrap_or(record);
+            render_tool_result(index, without_what_was_asked)
+                .trim_start()
+                .to_owned()
+        })
+        .collect()
+}
+
+fn each_within(texts: &[String], bytes: usize) -> Value {
+    Value::Array(
+        texts
+            .iter()
+            .map(|text| Value::String(clamped_to(text, bytes)))
+            .collect(),
+    )
+}
+
+fn state_the_decider_takes(material: &Value, reply: &str) -> Option<Value> {
+    let read = what_came_back(material);
+    let mut share = read.iter().map(String::len).max().unwrap_or(0);
+    for _ in 0..TRIES_TO_FIT_THE_MATERIAL {
+        let state = json!({"material": each_within(&read, share), "reply": reply});
+        let bytes = state.to_string().len();
+        if bytes <= STATE_BYTES_BEYOND_WHICH_THE_DECIDER_REFUSES {
+            return Some(state);
+        }
+        share = share * STATE_BYTES_BEYOND_WHICH_THE_DECIDER_REFUSES / bytes
+            * EACH_TRY_AIMS_AT_PERCENT_OF_THE_LIMIT
+            / 100;
+    }
+    None
+}
+
 fn reply_check_request(material: &Value, reply: &str) -> Option<DecideRequest> {
-    let state = json!({"material": material, "reply": reply});
+    let state = state_the_decider_takes(material, reply)?;
     let mut request: DecideRequest = serde_json::from_value(json!({ "state": state })).ok()?;
     request.questions = vec![
         noul_question(
@@ -1113,6 +1197,12 @@ fn noul_question(
     }
     .into();
     Some(question)
+}
+
+enum Check {
+    NotNeeded,
+    Ran(Faults),
+    CouldNotRun,
 }
 
 #[derive(Clone, Debug)]
@@ -1175,14 +1265,30 @@ fn refused(mut output: Value, reply: &str) -> Value {
     output
 }
 
+fn offered(name: &str, description: Option<&str>) -> Option<ChoiceOption> {
+    let a_name_the_model_could_not_echo_back =
+        name.is_empty() || name.len() > MAX_OPTION_NAME_BYTES;
+    if a_name_the_model_could_not_echo_back {
+        tracing::warn!(
+            name,
+            limit = MAX_OPTION_NAME_BYTES,
+            "a shortened name would dispatch to nothing, so this option is left out of the question"
+        );
+        return None;
+    }
+    Some(ChoiceOption {
+        name: name.to_owned(),
+        description: description
+            .filter(|line| !line.is_empty())
+            .map(|line| clamped_to(line, MAX_OPTION_DESCRIPTION_BYTES)),
+        ..Default::default()
+    })
+}
+
 fn tool_question(available_tools: &[CatalogEntry], has_prior: bool) -> Option<Question> {
     let mut options: Vec<ChoiceOption> = available_tools
         .iter()
-        .map(|tool| ChoiceOption {
-            name: tool.name.clone(),
-            description: (!tool.description.is_empty()).then(|| tool.description.clone()),
-            ..Default::default()
-        })
+        .filter_map(|tool| offered(&tool.name, Some(tool.description.as_str())))
         .collect();
     if has_prior {
         options.push(ChoiceOption {
@@ -1506,6 +1612,263 @@ mod tests {
         assert!(
             user.contains(second_page.trim()),
             "the second page's text must survive whole"
+        );
+    }
+
+    fn options_of(question: &Question) -> Vec<ChoiceOption> {
+        match question.kind.clone() {
+            Some(common::proto::llm_router::v1::question::Kind::Choice(choice)) => choice.options,
+            other => panic!("a choice question, not {other:?}"),
+        }
+    }
+
+    fn tool_described(name: &str, description: &str) -> CatalogEntry {
+        CatalogEntry {
+            name: name.to_owned(),
+            title: name.to_owned(),
+            description: description.to_owned(),
+            input_schema_json: json!({"type": "object"}).to_string(),
+        }
+    }
+
+    #[test]
+    fn a_fetched_result_far_over_the_cap_still_leaves_a_state_the_decider_would_take() {
+        let one_ordinary_article = json!({
+            "name": "web_fetch",
+            "args": {"url": "https://example.com/a"},
+            "result": {"text": "x".repeat(80_000)},
+        });
+
+        let request = reply_check_request(&json!([one_ordinary_article]), "22.11 degrees")
+            .expect("the guard still has a request to send");
+
+        let state = serde_json::to_value(&request).expect("a request serializes")["state"].clone();
+        let bytes = state.to_string().len();
+        assert!(
+            bytes > MAX_CHARS_PER_RENDERED_TOOL_RESULT,
+            "the check must read the whole of what the model was shown, not a slice of it"
+        );
+        assert!(
+            bytes <= STATE_BYTES_BEYOND_WHICH_THE_DECIDER_REFUSES,
+            "a state of {bytes} bytes is refused outright, which leaves the reply unchecked"
+        );
+        assert_eq!(
+            request.questions.len(),
+            2,
+            "and the promise and grounding guards both still run over it"
+        );
+    }
+
+    #[test]
+    fn a_passage_the_model_was_shown_in_full_is_checked_in_full() {
+        let near_the_end_of_what_the_model_read = "the cache lives for five minutes";
+        let passage = format!(
+            "{}{near_the_end_of_what_the_model_read}",
+            "x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT - 200)
+        );
+        let material = json!([{"name": "kb_search", "args": {}, "result": {"text": passage}}]);
+
+        let state = state_the_decider_takes(&material, "five minutes").expect("it fits");
+
+        assert!(
+            state
+                .to_string()
+                .contains(near_the_end_of_what_the_model_read),
+            "a reply drawn from late in a passage the model was shown whole must find it in what \
+             the guard reads — a guard shown less than the model refuses correct answers as invented"
+        );
+    }
+
+    #[test]
+    fn four_full_results_are_all_still_read_within_the_limit() {
+        let records: Vec<Value> = (0..RENDERED_TOOL_RESULTS)
+            .map(|index| json!({"result": {"text": format!("{index}{}", "y".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT))}}))
+            .collect();
+
+        let state = state_the_decider_takes(&json!(records), "a reply").expect("it fits");
+
+        assert!(state.to_string().len() <= STATE_BYTES_BEYOND_WHICH_THE_DECIDER_REFUSES);
+        assert_eq!(
+            state["material"].as_array().expect("an array").len(),
+            RENDERED_TOOL_RESULTS,
+            "when the whole window cannot fit, each result gives up its tail rather than one \
+             result being dropped"
+        );
+    }
+
+    #[test]
+    fn the_material_a_check_reads_says_where_it_was_cut() {
+        let material = json!([{"result": "x".repeat(MAX_CHARS_PER_RENDERED_TOOL_RESULT * 3)}]);
+
+        let state = state_the_decider_takes(&material, "a reply").expect("it fits");
+
+        let only = state["material"].as_array().expect("one record")[0]
+            .as_str()
+            .expect("a record is carried as the text the model read");
+        assert!(
+            only.ends_with(TRUNCATION_MARK),
+            "a silent cut reads to the model as the whole of what came back: {only:?}"
+        );
+    }
+
+    #[test]
+    fn a_result_that_is_itself_a_list_of_hits_is_read_as_one_result_with_every_hit_in_it() {
+        let hits: Vec<Value> = (0..RENDERED_TOOL_RESULTS + 1)
+            .map(|index| json!({"title": format!("course-{index}")}))
+            .collect();
+        let call = ToolCall {
+            name: "kb_search".to_owned(),
+            args: json!({"query": "which courses exist?"}),
+        };
+        let state = state_with_extra_tool_result(&json!({}), tool_record(&call, json!(hits)));
+
+        let read = what_came_back(&everything_fetched_so_far(&state));
+
+        assert_eq!(
+            read.len(),
+            1,
+            "one lookup is one result, however many hits it holds"
+        );
+        assert!(
+            read[0].contains("course-0"),
+            "the first hit reaches the guard: windowing the hits as if each were a lookup of its \
+             own drops them from the front, and a reply naming one is then judged invented"
+        );
+    }
+
+    #[test]
+    fn a_reply_that_only_echoes_what_was_asked_for_finds_nothing_to_stand_on() {
+        let call = ToolCall {
+            name: "weather_now".to_owned(),
+            args: json!({"place": "Bishkek"}),
+        };
+        let state = state_with_extra_tool_result(
+            &json!({}),
+            tool_record(&call, json!({"values": [{"value": {"temp": 13.11}}]})),
+        );
+
+        let checked = what_came_back(&everything_fetched_so_far(&state)).join("\n");
+
+        assert!(
+            checked.contains("13.11"),
+            "what came back is read: {checked}"
+        );
+        assert!(
+            !checked.contains("Bishkek"),
+            "what was asked for is not evidence: with it in the material, a weather question \
+             answered with the place name reads as grounded, which is the incident this guard \
+             exists for: {checked}"
+        );
+    }
+
+    #[test]
+    fn a_check_reads_no_more_of_the_log_than_the_prompt_showed() {
+        let records: Vec<Value> = (0..RENDERED_TOOL_RESULTS + 3)
+            .map(|index| json!({"result": format!("result-{index}")}))
+            .collect();
+
+        assert_eq!(
+            what_came_back(&json!(records)).len(),
+            RENDERED_TOOL_RESULTS,
+            "a reply can only be grounded in the material the model was shown"
+        );
+    }
+
+    #[test]
+    fn a_tool_description_over_the_deciders_limit_still_yields_a_question() {
+        let over_described =
+            tool_described("kb_search", &"d".repeat(MAX_OPTION_DESCRIPTION_BYTES * 8));
+
+        let question =
+            tool_question(&[over_described], false).expect("a question rather than a refusal");
+
+        let described = options_of(&question);
+        assert!(
+            described
+                .iter()
+                .filter_map(|option| option.description.as_ref())
+                .all(|line| line.len() <= MAX_OPTION_DESCRIPTION_BYTES),
+            "the decider refuses the whole call over one long description, declining every turn"
+        );
+        assert!(
+            described.iter().any(|option| option.name == "kb_search"),
+            "and the tool itself is still offered"
+        );
+    }
+
+    #[test]
+    fn a_description_cut_inside_a_multi_byte_character_keeps_whole_characters() {
+        let operator_wrote = "é".repeat(MAX_OPTION_DESCRIPTION_BYTES);
+
+        let clamped = clamped_to(&operator_wrote, MAX_OPTION_DESCRIPTION_BYTES);
+
+        assert!(
+            clamped.len() <= MAX_OPTION_DESCRIPTION_BYTES,
+            "clamped to {} bytes, over the limit",
+            clamped.len()
+        );
+        let kept = clamped
+            .strip_suffix(TRUNCATION_MARK)
+            .expect("a clamped description says it was clamped");
+        assert!(
+            operator_wrote.starts_with(kept),
+            "the kept text is the operator's own words, cut on a character boundary"
+        );
+        assert!(
+            kept.chars().all(|letter| letter == 'é'),
+            "no character was cut in half: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_slug_too_long_to_echo_back_is_left_out_rather_than_shortened() {
+        let too_long = "t".repeat(MAX_OPTION_NAME_BYTES + 1);
+        let catalog = vec![
+            tool_described(&too_long, "does a thing"),
+            tool_described("weather", "does another thing"),
+        ];
+
+        let question = tool_question(&catalog, false).expect("a question rather than a refusal");
+
+        let names: Vec<String> = options_of(&question)
+            .into_iter()
+            .map(|option| option.name)
+            .collect();
+        assert!(
+            !names.iter().any(|name| too_long.starts_with(name.as_str())),
+            "a shortened slug is a slug that dispatches to nothing: {names:?}"
+        );
+        assert!(
+            names.contains(&"weather".to_owned()),
+            "and the tools that can be dispatched are still offered: {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_argument_option_the_operator_over_described_is_clamped_too() {
+        let over_described = "d".repeat(MAX_OPTION_DESCRIPTION_BYTES * 2);
+        let candidates = vec![("algebra".to_owned(), Some(over_described))];
+
+        let asked =
+            question_set_for("lookup", "the course", &candidates).expect("a set of questions");
+
+        assert!(
+            options_of(&asked[0])
+                .iter()
+                .filter_map(|option| option.description.as_ref())
+                .all(|line| line.len() <= MAX_OPTION_DESCRIPTION_BYTES),
+            "an oneOf description the operator wrote is as unbounded as a tool description"
+        );
+    }
+
+    #[test]
+    fn an_argument_option_too_long_to_echo_back_leaves_no_question_at_all() {
+        let too_long = "v".repeat(MAX_OPTION_NAME_BYTES + 1);
+        let candidates = vec![(too_long, None)];
+
+        assert!(
+            question_set_for("lookup", "the course", &candidates).is_none(),
+            "a question offering nothing but the way to say none of these asks nothing"
         );
     }
 
@@ -2117,6 +2480,8 @@ mod tests {
         let fake = Arc::new(FakeLlmRouter::always(
             r#"{"tool_call": null, "reply": "62F and foggy."}"#,
         ));
+        fake.answer_decide_grounded(&[0.98]);
+        fake.answer_decide_promise(0.02);
         let url = serve(Arc::clone(&fake)).await;
         let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
@@ -2170,6 +2535,8 @@ mod tests {
     #[tokio::test]
     async fn execute_without_tool_calling_asks_for_no_response_format() {
         let fake = Arc::new(FakeLlmRouter::always("Four."));
+        fake.answer_decide_grounded(&[0.98]);
+        fake.answer_decide_promise(0.02);
         let url = serve(Arc::clone(&fake)).await;
         let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
 
@@ -3144,6 +3511,27 @@ mod tests {
 
         assert_eq!(output["reply"], json!("22.11"));
         assert_eq!(fake.calls(), 1, "and costs no second generative call");
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_check_could_not_run_on_is_not_sent_as_it_is() {
+        let fake = Arc::new(FakeLlmRouter::always(
+            r#"{"tool_call": null, "reply": "22.11 degrees"}"#,
+        ));
+        let url = serve(Arc::clone(&fake)).await;
+        let executor = LlmTaskExecutor::new(&url, UNREACHABLE_TOOL_SERVICE).expect("client");
+
+        let output = executor
+            .execute("llm", &json!({}), &json!({"question": "q"}), "e:llm:0")
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            output["reply"],
+            json!(UNCHECKED_REFUSED),
+            "a guard that could not run is not a guard that passed, and nothing here is answered \
+             from the model's own knowledge"
+        );
     }
 
     #[tokio::test]

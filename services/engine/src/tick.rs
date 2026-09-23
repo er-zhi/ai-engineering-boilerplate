@@ -3,9 +3,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use engine_core::{
-    ActiveNode, CheckpointStore, Execution, Graph, Node, NodeOutput, TaskExecutor, step,
-};
+use engine_core::{ActiveNode, Execution, Graph, Node, NodeOutput, TaskExecutor, step};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 

@@ -98,26 +98,13 @@ async fn log_in(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = client
         .post(format!("{base}/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!("password={}", urlencoded(password)))
+        .form(&[("password", password)])
         .send()
         .await?;
     if !response.status().is_success() && !response.status().is_redirection() {
         return Err(format!("could not log in: {}", response.status()).into());
     }
     Ok(())
-}
-
-fn urlencoded(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
 
 async fn run_case(client: &reqwest::Client, base: &str, case: &Case) -> Outcome {
@@ -145,17 +132,10 @@ async fn run_case(client: &reqwest::Client, base: &str, case: &Case) -> Outcome 
             .map(|results| outcome.results = results),
         "chat" => replay_a_conversation(client, base, &said)
             .await
-            .map(|turns| {
+            .map(|mut turns| {
                 // One message stays one topic list, so a judge reads the common case unchanged.
                 if turns.len() == 1 {
-                    outcome.topics = turns
-                        .into_iter()
-                        .next()
-                        .unwrap_or(TurnOutcome {
-                            said: String::new(),
-                            topics: Vec::new(),
-                        })
-                        .topics;
+                    outcome.topics = turns.remove(0).topics;
                 } else {
                     outcome.turns = turns;
                 }
@@ -209,13 +189,10 @@ async fn search_knowledge_base(
     .await?;
     Ok(body["results"]
         .as_array()
-        .map(|results| {
-            results
-                .iter()
-                .map(|result| result["title"].as_str().unwrap_or("<untitled>").to_owned())
-                .collect()
-        })
-        .unwrap_or_default())
+        .into_iter()
+        .flatten()
+        .map(|result| result["title"].as_str().unwrap_or("<untitled>").to_owned())
+        .collect())
 }
 
 async fn send_turn_and_wait(
@@ -234,12 +211,10 @@ async fn send_turn_and_wait(
 
     let topics_this_turn_opened: Vec<String> = sent["topicIds"]
         .as_array()
-        .map(|ids| {
-            ids.iter()
-                .filter_map(|id| id.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().map(str::to_owned))
+        .collect();
     let nothing_to_wait_for = topics_this_turn_opened.is_empty();
     if nothing_to_wait_for {
         return Ok(Vec::new());
@@ -257,10 +232,11 @@ async fn wait_until_every_topic_settles(
     loop {
         let session = rpc(client, base, "chat.v1.ChatService/GetSession", &json!({})).await?;
         let topics = topics_among(&session, opened);
-        let settled = topics.len() == opened.len()
-            && topics
-                .iter()
-                .all(|topic| note_if_settled(topic, started, &mut finished_at));
+        let stamped: Vec<bool> = topics
+            .iter()
+            .map(|topic| note_if_settled(topic, started, &mut finished_at))
+            .collect();
+        let settled = topics.len() == opened.len() && stamped.iter().all(|settled| *settled);
         if settled {
             return Ok(described(&topics, &finished_at));
         }
@@ -274,18 +250,15 @@ async fn wait_until_every_topic_settles(
 fn topics_among(session: &Value, opened: &[String]) -> Vec<Value> {
     session["topics"]
         .as_array()
-        .map(|topics| {
-            topics
-                .iter()
-                .filter(|topic| {
-                    topic["id"]
-                        .as_str()
-                        .is_some_and(|id| opened.iter().any(|wanted| wanted == id))
-                })
-                .cloned()
-                .collect()
+        .into_iter()
+        .flatten()
+        .filter(|topic| {
+            topic["id"]
+                .as_str()
+                .is_some_and(|id| opened.iter().any(|wanted| wanted == id))
         })
-        .unwrap_or_default()
+        .cloned()
+        .collect()
 }
 
 fn note_if_settled(

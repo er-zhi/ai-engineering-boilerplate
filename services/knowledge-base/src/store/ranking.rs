@@ -1,5 +1,6 @@
 // Fuses independent retrieval rankings and keeps the best passage per document.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use super::{Passage, Ranked};
@@ -21,12 +22,14 @@ pub fn fuse(ranked_lists: Vec<Vec<Passage>>) -> Vec<Ranked> {
         }
     }
     let mut ranked: Vec<Ranked> = fused.into_values().collect();
-    ranked.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.passage.chunk_id.cmp(&b.passage.chunk_id))
-    });
+    ranked.sort_by(best_score_first);
     ranked
+}
+
+fn best_score_first(a: &Ranked, b: &Ranked) -> Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| a.passage.chunk_id.cmp(&b.passage.chunk_id))
 }
 
 pub fn best_per_document(ranked: Vec<Ranked>, limit: usize) -> Vec<Ranked> {
@@ -61,10 +64,6 @@ pub fn fuse_with_document_titles(
             .into_values()
             .map(|(score, passage)| Ranked { passage, score }),
     );
-    ranked.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.passage.chunk_id.cmp(&b.passage.chunk_id))
-    });
+    ranked.sort_by(best_score_first);
     ranked
 }
